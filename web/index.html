@@ -637,8 +637,13 @@
       const sign = v > 0 ? "+" : "";
       return `${sign}${v.toFixed(2)}%`;
     }
+ 
+    <script src="/engine.js"></script>
+    <script src="/app.js"></script>
+    <link rel="stylesheet" href="/ui.css">
+    <link rel="stylesheet" href="/ui.css">
 
-    function pctClass(value){
+   function pctClass(value){
       const v = num(value, NaN);
       if(!Number.isFinite(v) || v === 0) return "neu";
       return v > 0 ? "pos" : "neg";
@@ -1019,7 +1024,11 @@
 
         // stamp
         const now = new Date();
-        apiStampEl.textContent = `API ${now.toLocaleTimeString("fr-FR",{hour:"2-digit",minute:"2-digit"})}`;
+        apiStampEl.textContent = `API ${now.toLocaleTimeString("fr-FR",{hour:"2-digit commit -m "fix: vercel routes/builds"
+git pushgit",minute:"2-digit"})}`;
+         git add vercel.json
+git commit -m "fix: vercel routes/builds"
+git push         
 
         // render
         render();

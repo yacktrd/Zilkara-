@@ -1,6 +1,9 @@
 import { loadAssets } from "./engine.js";
 
-async function init() {
+// AUTO LOAD ON START
+document.addEventListener("DOMContentLoaded", () => {
+    loadMarket();
+});
 
   const assets = await loadAssets();
 
