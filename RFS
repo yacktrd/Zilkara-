@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>RFS Crypto V1</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
+    h1 { margin: 0 0 10px; }
+    .meta { opacity: .7; margin-bottom: 16px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid #ddd; }
+    th { position: sticky; top: 0; background: #fff; }
+    .num { text-align: right; font-variant-numeric: tabular-nums; }
+    .badge { padding: 2px 8px; border: 1px solid #333; border-radius: 999px; display: inline-block; }
+    .tag { padding: 2px 8px; border: 1px solid #999; border-radius: 999px; display: inline-block; }
+    .pos { }
+    .neg { }
+    .small { font-size: 12px; opacity: .75; }
+  </style>
+</head>
+<body>
+  <h1>RFS Crypto — V1</h1>
+  <div class="meta">
+    Lecture structurelle (Stability / Rating / Market State). Pas de prédiction.
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Asset</th>
+        <th class="num">Price</th>
+        <th class="num">24h</th>
+        <th class="num">7d</th>
+        <th class="num">30d</th>
+        <th class="num">Stability</th>
+        <th>Rating</th>
+        <th>Market State</th>
+        <th>Trend</th>
+        <th>Structure</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+
+  <script>
+    const fmtPct = (v) => {
+      const sign = v > 0 ? "+" : "";
+      return `${sign}${v.toFixed(1)}%`;
+    };
+    const fmtNum = (v) => new Intl.NumberFormat("fr-FR").format(v);
+
+    async function main() {
+      const res = await fetch("../data/assets.json", { cache: "no-store" });
+      const data = await res.json();
+      const tbody = document.getElementById("rows");
+
+      tbody.innerHTML = data.map(a => `
+        <tr title="${a.asset}">
+          <td><strong>${a.asset}</strong></td>
+          <td class="num">${fmtNum(a.price)}</td>
+          <td class="num">${fmtPct(a.chg_24h_pct)}</td>
+          <td class="num">${fmtPct(a.chg_7d_pct)}</td>
+          <td class="num">${fmtPct(a.chg_30d_pct)}</td>
+          <td class="num">${a.stability}</td>
+          <td><span class="badge">${a.rating}</span></td>
+          <td><span class="tag">${a.market_state}</span></td>
+          <td>${a.trend}</td>
+          <td class="small">${a.structure}</td>
+        </tr>
+      `).join("");
+    }
+
+    main().catch(console.error);
+  </script>
+</body>
+</html>

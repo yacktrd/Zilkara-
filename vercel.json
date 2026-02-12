@@ -1,0 +1,16 @@
+{
+  "headers": [
+    {
+      "source": "/api/(.*)",
+      "headers": [
+        { "key": "Cache-Control", "value": "s-maxage=60, stale-while-revalidate=300" }
+      ]
+    }
+  ],
+  "rewrites": [
+    { "source": "/", "destination": "/web/index.html" },
+    { "source": "/app.js", "destination": "/web/app.js" },
+    { "source": "/ui.css", "destination": "/web/ui.css" },
+    { "source": "/manifest.json", "destination": "/web/manifest.json" }
+  ]
+}

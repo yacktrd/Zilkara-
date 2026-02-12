@@ -1,0 +1,35 @@
+[
+  {
+    "asset": "BTC",
+    "price": 60024.0,
+    "chg_24h_pct": 2.12,
+    "chg_7d_pct": -0.35,
+    "chg_30d_pct": -22.76,
+    "stability": 94,
+    "rating": "A",
+    "market_state": "Stable",
+    "trend": "Downtrend"
+  },
+  {
+    "asset": "ETH",
+    "price": 1783.14,
+    "chg_24h_pct": 0.17,
+    "chg_7d_pct": -0.74,
+    "chg_30d_pct": -32.37,
+    "stability": 91,
+    "rating": "A",
+    "market_state": "Stable",
+    "trend": "Downtrend"
+  },
+  {
+    "asset": "SOL",
+    "price": 0,
+    "chg_24h_pct": 0,
+    "chg_7d_pct": 0,
+    "chg_30d_pct": 0,
+    "stability": 0,
+    "rating": "D",
+    "market_state": "Volatile",
+    "trend": "Sideways"
+  }
+]
