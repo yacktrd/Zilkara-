@@ -2,18 +2,36 @@
 <html lang="fr">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="color-scheme" content="dark" />
-  <title>Zilkara - Market Scanner</title>
-  <link rel="stylesheet" href="/ui.css" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Zilkára — Market Scanner</title>
+
+  <style>
+    body {
+      background:#070c14;
+      color:white;
+      font-family:system-ui;
+      margin:0;
+      padding:20px;
+    }
+
+    .row {
+      display:flex;
+      justify-content:space-between;
+      padding:8px;
+      border-bottom:1px solid rgba(255,255,255,0.08);
+    }
+  </style>
 </head>
 
 <body>
-  <div id="app">
-    <div id="results"></div>
-  </div>
 
-  <!-- IMPORTANT: app.js est un module -->
-  <script type="module" src="/app.js"></script>
+<h2>Zilkára Market Scanner</h2>
+
+<div id="results">
+Chargement...
+</div>
+
+<script type="module" src="/app.js"></script>
+
 </body>
 </html>

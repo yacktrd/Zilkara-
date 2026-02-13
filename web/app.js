@@ -1,34 +1,49 @@
-import { loadAssets } from "./engine.js";
+mport { loadAssets } from "./engine.js";
 
-async function loadMarket() {
-  const results = document.getElementById("results");
-  if (!results) return;
+async function loadMarket(){
 
-  results.innerHTML = `<div style="opacity:.7;padding:16px">Chargement…</div>`;
+  const results =
+  document.getElementById("results");
 
-  try {
-    const assets = await loadAssets();
-    assets.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+  results.innerHTML =
+  "Chargement...";
 
-    results.innerHTML = assets.slice(0, 50).map(a => `
+  try{
+
+    const assets =
+    await loadAssets();
+
+    assets.sort(
+      (a,b)=>b.score-a.score
+    );
+
+    results.innerHTML =
+    assets.slice(0,50)
+    .map(a=>`
+
       <div class="row">
-        <span>${a.symbol ?? "-"}</span>
-        <span>${a.price ?? "-"}</span>
-        <span>${(a.change24h ?? 0).toFixed(2)}%</span>
-        <span>${a.score ?? "-"}</span>
+
+        <span>${a.symbol}</span>
+
+        <span>${a.price} €</span>
+
+        <span>${a.change24h.toFixed(2)}%</span>
+
+        <span>${a.score}</span>
+
       </div>
-    `).join("");
-  } catch (e) {
-    results.innerHTML = `
-      <div style="padding:16px;color:#ffb4b4">
-        Erreur chargement API.<br/>
-        ${String(e)}
-      </div>
-    `;
+
+    `)
+    .join("");
+
+  }
+  catch(e){
+
+    results.innerHTML =
+    "Erreur chargement API";
+
     console.error(e);
   }
 }
 
-document.addEventListener("DOMContentLoaded", () => {
-  loadMarket();
-});
+loadMarket();
