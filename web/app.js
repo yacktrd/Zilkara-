@@ -1,24 +1,34 @@
 import { loadAssets } from "./engine.js";
 
-async function init() {
+async function loadMarket() {
+  const results = document.getElementById("results");
+  if (!results) return;
 
-  const assets = await loadAssets();
+  results.innerHTML = `<div style="opacity:.7;padding:16px">Chargement…</div>`;
 
-  assets.sort((a, b) => b.score - a.score);
+  try {
+    const assets = await loadAssets();
+    assets.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
 
-  const container = document.getElementById("results");
-
-  container.innerHTML = assets
-    .slice(0, 50)
-    .map(a => `
+    results.innerHTML = assets.slice(0, 50).map(a => `
       <div class="row">
-        <span>${a.symbol}</span>
-        <span>${a.price}</span>
-        <span>${a.change24h.toFixed(2)}%</span>
-        <span>${a.score}</span>
+        <span>${a.symbol ?? "-"}</span>
+        <span>${a.price ?? "-"}</span>
+        <span>${(a.change24h ?? 0).toFixed(2)}%</span>
+        <span>${a.score ?? "-"}</span>
       </div>
-    `)
-    .join("");
+    `).join("");
+  } catch (e) {
+    results.innerHTML = `
+      <div style="padding:16px;color:#ffb4b4">
+        Erreur chargement API.<br/>
+        ${String(e)}
+      </div>
+    `;
+    console.error(e);
+  }
 }
 
-document.addEventListener("DOMContentLoaded", init);
+document.addEventListener("DOMContentLoaded", () => {
+  loadMarket();
+});
