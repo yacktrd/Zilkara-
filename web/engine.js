@@ -1,46 +1,46 @@
-export async function loadAssets() {
+// web/engine.js
+export async function loadAssets({ vs = "eur", perPage = 250, page = 1 } = {}) {
+  const url =
+    `https://api.coingecko.com/api/v3/coins/markets` +
+    `?vs_currency=${encodeURIComponent(vs)}` +
+    `&order=market_cap_desc` +
+    `&per_page=${perPage}` +
+    `&page=${page}` +
+    `&sparkline=false`;
 
-  const API_URL =
-  "https://api.coingecko.com/api/v3/coins/markets?vs_currency=eur&order=market_cap_desc&per_page=250&page=1";
-
-  const res = await fetch(API_URL, { cache:"no-store" });
-
-  if (!res.ok)
-    throw new Error("API error");
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
   const data = await res.json();
 
-  return data.map(asset => ({
+  return data.map((asset) => {
+    const chg24 = Number(asset.price_change_percentage_24h ?? 0);
+    const vol = Number(asset.total_volume ?? 0);
+    const cap = Number(asset.market_cap ?? 0);
 
-    symbol: asset.symbol.toUpperCase(),
-
-    price: asset.current_price,
-
-    change24h: asset.price_change_percentage_24h ?? 0,
-
-    volume: asset.total_volume ?? 0,
-
-    marketCap: asset.market_cap ?? 0,
-
-    score: calculateScore(asset)
-
-  }));
+    return {
+      symbol: String(asset.symbol || "").toUpperCase(),
+      name: asset.name,
+      rank: asset.market_cap_rank,
+      price: Number(asset.current_price ?? 0),
+      chg24,
+      score: calculateScore({ chg24, vol, cap }),
+    };
+  });
 }
 
-function calculateScore(asset){
-
+function calculateScore({ chg24, vol, cap }) {
   let score = 0;
 
-  const chg = asset.price_change_percentage_24h ?? 0;
+  // momentum
+  if (chg24 > 0) score += 25;
+  if (chg24 > 5) score += 25;
 
-  if (chg > 0) score += 25;
-  if (chg > 5) score += 25;
+  // volume strength
+  if (vol > 1_000_000_000) score += 25;
 
-  if ((asset.total_volume ?? 0) > 1_000_000_000)
-    score += 25;
-
-  if ((asset.market_cap ?? 0) > 10_000_000_000)
-    score += 25;
+  // market cap stability
+  if (cap > 10_000_000_000) score += 25;
 
   return score;
 }
