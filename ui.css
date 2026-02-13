@@ -1,105 +1,125 @@
-/* ui.css */
-
-:root{
-  --bg:#0b0f14;
-  --panel:#121821;
-  --border:#1f2733;
-  --text:#e6edf3;
-  --muted:#8b98a5;
-  --pos:#16c784;
-  --neg:#ea3943;
-  --accent:#2f81f7;
+/* --- topbar / chips / badge --- */
+.topbar{
+  display:flex;
+  align-items:flex-start;
+  justify-content:space-between;
+  gap:16px;
+  margin-bottom:14px;
+}
+.topbar-title h1{ margin:0; }
+.chips{
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  margin-top:10px;
+}
+.chip{
+  border:1px solid rgba(255,255,255,.12);
+  background:rgba(255,255,255,.06);
+  color:inherit;
+  padding:6px 10px;
+  border-radius:999px;
+  font-size:13px;
+}
+.badge{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  min-width:22px;
+  height:22px;
+  padding:0 8px;
+  margin-left:8px;
+  border-radius:999px;
+  background:rgba(255,255,255,.12);
+  font-size:12px;
 }
 
-body{
-  margin:0;
-  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial;
-  background:var(--bg);
-  color:var(--text);
-}
+/* --- buttons --- */
+.btn{ cursor:pointer; border-radius:12px; padding:10px 12px; border:1px solid rgba(255,255,255,.12); background:rgba(255,255,255,.06); color:inherit; }
+.btn-primary{ background:rgba(80,160,255,.22); border-color:rgba(80,160,255,.35); }
+.btn-ghost{ background:transparent; }
+.btn-chip{ border-radius:999px; }
 
-.wrap{
-  max-width:900px;
-  margin:auto;
-  padding:24px;
+/* --- bottom sheet --- */
+.no-scroll{ overflow:hidden; }
+.overlay{
+  position:fixed; inset:0;
+  background:rgba(0,0,0,.55);
+  z-index:50;
 }
-
-h1{
-  margin-bottom:16px;
+.sheet{
+  position:fixed; left:0; right:0; bottom:0;
+  max-height:86vh;
+  background:rgba(10,10,12,.98);
+  border-top-left-radius:18px;
+  border-top-right-radius:18px;
+  border:1px solid rgba(255,255,255,.10);
+  z-index:60;
+  overflow:auto;
+  padding:14px 14px 18px;
 }
+.hidden{ display:none; }
 
-.panel{
-  background:var(--panel);
-  border:1px solid var(--border);
-  border-radius:10px;
-  padding:16px;
-  margin-bottom:20px;
+.sheet-head{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  padding-bottom:12px;
+  border-bottom:1px solid rgba(255,255,255,.08);
 }
+.sheet-h{ font-size:18px; font-weight:700; }
+.sheet-sub{ font-size:12px; opacity:.7; margin-top:3px; }
 
-.panel-title{
-  margin-bottom:10px;
+.sheet-body{ padding-top:12px; }
+
+.block{ margin:14px 0; }
+.block-title{ font-weight:700; margin-bottom:10px; }
+.row{ display:flex; gap:10px; flex-wrap:wrap; }
+
+.field{ display:block; margin:12px 0; }
+.field-top{ display:flex; justify-content:space-between; gap:10px; margin-bottom:6px; }
+.hint{ font-size:12px; opacity:.6; margin-top:6px; }
+
+.toggle{ display:flex; align-items:center; gap:10px; margin:10px 0; }
+
+/* segmented */
+.segmented{
+  display:flex;
+  border:1px solid rgba(255,255,255,.10);
+  border-radius:12px;
+  overflow:hidden;
 }
-
-.presets{
-  margin-top:12px;
-}
-
-.presets button{
-  margin-right:8px;
-  padding:6px 12px;
+.seg{
+  flex:1;
+  padding:10px 0;
   background:transparent;
-  color:var(--text);
-  border:1px solid var(--border);
-  border-radius:6px;
-  cursor:pointer;
+  border:0;
+  color:inherit;
+  opacity:.75;
+}
+.seg.active{
+  background:rgba(255,255,255,.10);
+  opacity:1;
 }
 
-.presets button:hover{
-  background:var(--accent);
-}
-
-/* TABLE */
-
-.grid{
+/* results grid */
+.results .grid{
   display:grid;
-  grid-template-columns:
-    1fr
-    1.5fr
-    1fr
-    0.6fr;
-
+  grid-template-columns: 1fr 1.2fr 1fr .7fr;
   gap:10px;
+  align-items:center;
+}
+.results .header{
+  opacity:.7;
   padding:10px 0;
-  border-bottom:1px solid var(--border);
+  border-bottom:1px solid rgba(255,255,255,.10);
 }
-
-.header{
-  font-weight:600;
-  color:var(--muted);
-}
-
-.row:hover{
-  background:#111826;
-}
-
-.pos{
-  color:var(--pos);
-}
-
-.neg{
-  color:var(--neg);
-}
-
-.regime{
-  margin-bottom:10px;
-  color:var(--muted);
-}
-
-.error{
-  color:var(--neg);
-}
-
-.empty{
-  color:var(--muted);
+.results .row{
   padding:10px 0;
+  border-bottom:1px solid rgba(255,255,255,.06);
 }
+.mono{ font-variant-numeric: tabular-nums; }
+.pos{ color:#3bd671; }
+.neg{ color:#ff5a5a; }
+.muted{ opacity:.7; }

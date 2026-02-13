@@ -1,3 +1,4 @@
+<!-- index.html -->
 <!doctype html>
 <html lang="fr">
 <head>
@@ -7,23 +8,87 @@
   <title>Zilkara — Market Scanner</title>
   <link rel="stylesheet" href="./ui.css" />
 </head>
-
 <body>
   <div class="wrap">
     <h1>Zilkara — Market Scanner</h1>
-    <div class="controls">
-  <div class="rowc">
-    <label for="minScore"><b>Filtre score</b> — Minimum: <span id="minScoreValue">75</span></label>
-    <input id="minScore" type="range" min="0" max="100" value="75" step="1" />
-  </div>
 
-  <div class="presets">
-    <button type="button" data-preset="75">Radar (75)</button>
-    <button type="button" data-preset="60">Standard (60)</button>
-    <button type="button" data-preset="40">Large (40)</button>
-  </div>
-</div>
-    <div id="results">Chargement…</div>
+    <!-- Controls -->
+    <div class="panel">
+      <div class="row">
+        <label class="label" for="preset">Filtre score</label>
+        <select id="preset" class="select">
+          <option value="0">Tous (0)</option>
+          <option value="40">Large (≥ 40)</option>
+          <option value="50">Surveillance (≥ 50)</option>
+          <option value="60">Opportunités (≥ 60)</option>
+          <option value="75">Radar (≥ 75)</option>
+          <option value="90">Extrême (≥ 90)</option>
+        </select>
+      </div>
+
+      <div class="row">
+        <label class="label" for="refresh">Auto-refresh</label>
+        <select id="refresh" class="select">
+          <option value="0">Off</option>
+          <option value="15">15s</option>
+          <option value="30" selected>30s</option>
+          <option value="60">60s</option>
+          <option value="120">2 min</option>
+        </select>
+
+        <button id="btnRefresh" class="btn" type="button">Rafraîchir</button>
+      </div>
+
+      <details id="advanced" class="details">
+        <summary>Avancé</summary>
+
+        <div class="grid2">
+          <div class="row">
+            <label class="label" for="minScore">Min</label>
+            <input id="minScore" class="input" type="number" min="0" max="100" step="1" value="0" />
+          </div>
+
+          <div class="row">
+            <label class="label" for="maxScore">Max</label>
+            <input id="maxScore" class="input" type="number" min="0" max="100" step="1" value="100" />
+          </div>
+
+          <div class="row">
+            <label class="label" for="sortBy">Trier par</label>
+            <select id="sortBy" class="select">
+              <option value="score" selected>Score</option>
+              <option value="change24h">Variation 24h</option>
+              <option value="marketCap">MarketCap</option>
+              <option value="volume">Volume</option>
+              <option value="price">Prix</option>
+            </select>
+          </div>
+
+          <div class="row">
+            <label class="label" for="limit">Limite</label>
+            <select id="limit" class="select">
+              <option value="10">10</option>
+              <option value="25">25</option>
+              <option value="50" selected>50</option>
+              <option value="100">100</option>
+            </select>
+          </div>
+
+          <label class="check">
+            <input id="hideStables" type="checkbox" />
+            <span>Exclure stablecoins</span>
+          </label>
+        </div>
+      </details>
+
+      <div class="meta">
+        <span id="status">—</span>
+        <span id="updated">—</span>
+      </div>
+    </div>
+
+    <!-- Table -->
+    <div id="results" class="results"></div>
   </div>
 
   <script type="module" src="./app.js"></script>
