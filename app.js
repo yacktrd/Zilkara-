@@ -1,349 +1,307 @@
-// app.js
 import { loadAssets } from "./engine.js";
 
+/**
+ * Zilkara — Market Scanner (Front)
+ * - preset filter (dropdown)
+ * - advanced filters (min/max, sort, limit, hide stables)
+ * - auto refresh
+ * - table rendering (mobile readable)
+ */
+
 const els = {
-  results: document.getElementById("results"),
   preset: document.getElementById("preset"),
-  refresh: document.getElementById("refresh"),
-  btnRefresh: document.getElementById("btnRefresh"),
+  autoRefresh: document.getElementById("autoRefresh"),
+  refreshBtn: document.getElementById("refreshBtn"),
+
   advanced: document.getElementById("advanced"),
-  minScore: document.getElementById("minScore"),
-  maxScore: document.getElementById("maxScore"),
+  minSignal: document.getElementById("minSignal"),
+  maxSignal: document.getElementById("maxSignal"),
   sortBy: document.getElementById("sortBy"),
   limit: document.getElementById("limit"),
   hideStables: document.getElementById("hideStables"),
+
   status: document.getElementById("status"),
   updated: document.getElementById("updated"),
+  tbody: document.getElementById("tbody"),
 };
 
-const STORAGE_KEY = "zilkara:v1:filters";
+const PRESETS = {
+  all: { min: 0, max: 100 },
+  large: { min: 40, max: 100 },
+  standard: { min: 60, max: 100 },
+  radar: { min: 75, max: 100 },
+};
 
-let state = {
+const state = {
   assets: [],
-  lastFetchAt: 0,
   timer: null,
-  inflight: false,
-
-  // UI settings (defaults)
-  presetMin: 0,
-  refreshSec: 30,
-
-  minScore: 0,
-  maxScore: 100,
-  sortBy: "score",
-  limit: 50,
-  hideStables: false,
-
-  advancedOpen: false,
+  lastUpdateTs: 0,
 };
 
-const STABLES = new Set([
-  "USDT","USDC","DAI","TUSD","USDP","FDUSD","USDD","FRAX","EURC","USD1","USDE","PYUSD","LUSD","GUSD","USDS"
-]);
+init();
 
-function clampInt(v, min, max, fallback) {
-  const n = Number.parseInt(String(v), 10);
-  if (!Number.isFinite(n)) return fallback;
-  return Math.max(min, Math.min(max, n));
+function init() {
+  // IMPORTANT: filtre à 0 au chargement + auto-refresh off
+  if (els.preset) els.preset.value = "all";
+  if (els.autoRefresh) els.autoRefresh.value = "off";
+
+  applyPresetToAdvanced("all");
+  bindUI();
+  refresh(); // premier rendu immédiat
 }
 
-function nowLabel() {
-  const d = new Date();
-  return d.toLocaleString("fr-FR", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+function bindUI() {
+  // Preset -> applique min/max + refresh
+  els.preset?.addEventListener("change", () => {
+    applyPresetToAdvanced(els.preset.value);
+    refresh();
+  });
+
+  // Auto-refresh
+  els.autoRefresh?.addEventListener("change", () => {
+    setAutoRefresh(els.autoRefresh.value);
+  });
+
+  els.refreshBtn?.addEventListener("click", () => refresh());
+
+  // Avancé: toute modif relance un render (sans re-fetch)
+  // (et refetch si tu veux: tu peux remplacer renderOnly() par refresh())
+  const onAdvancedChange = () => renderOnly();
+
+  els.minSignal?.addEventListener("input", onAdvancedChange);
+  els.maxSignal?.addEventListener("input", onAdvancedChange);
+  els.sortBy?.addEventListener("change", onAdvancedChange);
+  els.limit?.addEventListener("change", onAdvancedChange);
+  els.hideStables?.addEventListener("change", onAdvancedChange);
 }
 
-function setStatus(msg) {
-  if (els.status) els.status.textContent = msg;
+function applyPresetToAdvanced(presetKey) {
+  const p = PRESETS[presetKey] ?? PRESETS.all;
+  if (els.minSignal) els.minSignal.value = String(p.min);
+  if (els.maxSignal) els.maxSignal.value = String(p.max);
 }
 
-function setUpdated() {
-  if (els.updated) els.updated.textContent = `MAJ: ${nowLabel()}`;
+function setAutoRefresh(value) {
+  clearInterval(state.timer);
+  state.timer = null;
+
+  if (!value || value === "off") {
+    setStatus("Auto-refresh: OFF");
+    return;
+  }
+
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    setStatus("Auto-refresh: OFF");
+    return;
+  }
+
+  setStatus(`Auto-refresh: ${seconds}s`);
+  state.timer = setInterval(() => {
+    refresh();
+  }, seconds * 1000);
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({
-    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"
-  }[c]));
+async function refresh() {
+  setStatus("Chargement…");
+
+  try {
+    const data = await loadAssets();
+
+    // Normalisation des champs attendus (robuste)
+    state.assets = (Array.isArray(data) ? data : []).map(a => normalizeAsset(a));
+    state.lastUpdateTs = Date.now();
+
+    renderOnly();
+  } catch (e) {
+    console.error(e);
+    setStatus(`Erreur API: ${safeText(e?.message ?? String(e))}`);
+    if (els.tbody) els.tbody.innerHTML = "";
+  }
 }
 
-function formatPrice(v) {
+function renderOnly() {
+  const raw = state.assets || [];
+  const filtered = applyFilters(raw);
+  renderTable(filtered);
+
+  const total = raw.length;
+  const shown = filtered.length;
+  const t = state.lastUpdateTs ? formatTime(state.lastUpdateTs) : "--:--:--";
+
+  const min = clampInt(Number(els.minSignal?.value ?? 0), 0, 100);
+  const max = clampInt(Number(els.maxSignal?.value ?? 100), 0, 100);
+  const sortBy = els.sortBy?.value ?? "signal";
+
+  setMeta(
+    `Filtre: min ${min} / max ${max} • Tri: ${sortBy} • Résultats: ${shown}/${total}`,
+    `MAJ: ${t}`
+  );
+}
+
+function applyFilters(list) {
+  const min = clampInt(Number(els.minSignal?.value ?? 0), 0, 100);
+  const max = clampInt(Number(els.maxSignal?.value ?? 100), 0, 100);
+  const limit = clampInt(Number(els.limit?.value ?? 50), 1, 250);
+  const sortBy = els.sortBy?.value ?? "signal";
+  const hideStables = Boolean(els.hideStables?.checked);
+
+  let out = list
+    .filter(a => a.signal >= min && a.signal <= max);
+
+  if (hideStables) {
+    out = out.filter(a => !isStablecoin(a.symbol, a.name));
+  }
+
+  out.sort((a, b) => compareBy(sortBy, a, b));
+
+  return out.slice(0, limit);
+}
+
+function renderTable(rows) {
+  if (!els.tbody) return;
+
+  els.tbody.innerHTML = rows.map(a => {
+    const changeClass = a.change24h >= 0 ? "pos" : "neg";
+    const changeText = (a.change24h >= 0 ? "+" : "") + a.change24h.toFixed(2) + "%";
+
+    return `
+      <tr>
+        <td class="sym">${escapeHtml(a.symbol)}</td>
+        <td class="num">${formatEUR(a.price)}</td>
+        <td class="${changeClass}">${escapeHtml(changeText)}</td>
+        <td class="sig">${escapeHtml(String(a.signal))}</td>
+      </tr>
+    `;
+  }).join("");
+}
+
+/* ---------------------------
+   Helpers
+--------------------------- */
+
+function normalizeAsset(a) {
+  const symbol = String(a?.symbol ?? "").toUpperCase().trim();
+  const name = String(a?.name ?? "").trim();
+
+  // prix
+  const price = num(a?.price ?? a?.current_price ?? 0);
+
+  // variation 24h
+  const change24h = num(
+    a?.change24h ??
+    a?.price_change_percentage_24h ??
+    a?.price_change_pct_24h ??
+    0
+  );
+
+  // signal (score renommé)
+  const signal = clampInt(
+    Number(a?.signal ?? a?.score ?? 0),
+    0,
+    100
+  );
+
+  // données utiles pour tri avancé
+  const marketCap = num(a?.marketCap ?? a?.market_cap ?? 0);
+  const volume = num(a?.volume ?? a?.total_volume ?? 0);
+
+  return { symbol, name, price, change24h, signal, marketCap, volume };
+}
+
+function compareBy(key, a, b) {
+  switch (key) {
+    case "signal":
+      return b.signal - a.signal;
+
+    case "change24h":
+      return b.change24h - a.change24h;
+
+    case "marketCap":
+      return b.marketCap - a.marketCap;
+
+    case "volume":
+      return b.volume - a.volume;
+
+    case "price":
+      return b.price - a.price;
+
+    case "symbol":
+      return a.symbol.localeCompare(b.symbol);
+
+    default:
+      return b.signal - a.signal;
+  }
+}
+
+function isStablecoin(symbol, name) {
+  const s = String(symbol || "").toUpperCase();
+  const n = String(name || "").toUpperCaseCaseSafe();
+
+  const stableSymbols = new Set([
+    "USDT","USDC","DAI","TUSD","FDUSD","USDE","USDP","BUSD","FRAX","PYUSD","USDD"
+  ]);
+
+  if (stableSymbols.has(s)) return true;
+
+  // heuristique simple
+  if (s.includes("USD")) return true;
+  if (n.includes("USD") && (n.includes("STABLE") || n.includes("TETHER") || n.includes("COIN"))) return true;
+
+  return false;
+}
+
+function formatEUR(v) {
   if (!Number.isFinite(v)) return "—";
   return new Intl.NumberFormat("fr-FR", { style: "currency", currency: "EUR" }).format(v);
 }
 
-function formatPct(v) {
-  if (!Number.isFinite(v)) return "—";
-  const sign = v > 0 ? "+" : "";
-  return `${sign}${v.toFixed(2)}%`;
+function formatTime(ts) {
+  const d = new Date(ts);
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+  return `${hh}:${mm}:${ss}`;
 }
 
-function pctClass(v) {
-  if (!Number.isFinite(v) || v === 0) return "";
-  return v > 0 ? "pos" : "neg";
+function setStatus(text) {
+  if (!els.status) return;
+  els.status.textContent = text;
 }
 
-function getEffectiveMinScore() {
-  // Important: au chargement, on veut min=0 sinon effet "ça marche pas".
-  // Donc on initialise preset=0 + minScore=0.
-  const presetMin = clampInt(state.presetMin, 0, 100, 0);
-  const advMin = clampInt(state.minScore, 0, 100, 0);
-  // Le filtre minimum doit être le max entre preset et avancé.
-  return Math.max(presetMin, advMin);
+function setMeta(left, right) {
+  if (els.status) els.status.textContent = left;
+  if (els.updated) els.updated.textContent = right;
 }
 
-function getEffectiveMaxScore() {
-  return clampInt(state.maxScore, 0, 100, 100);
+function clampInt(v, min, max) {
+  const n = Math.trunc(Number.isFinite(v) ? v : min);
+  return Math.max(min, Math.min(max, n));
 }
 
-function normalizeRanges() {
-  const min = getEffectiveMinScore();
-  let max = getEffectiveMaxScore();
-  if (max < min) max = min;
-  state.maxScore = max;
-  if (els.maxScore) els.maxScore.value = String(max);
+function num(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
 }
 
-function applyUIToState() {
-  state.presetMin = clampInt(els.preset?.value ?? 0, 0, 100, 0);
-  state.refreshSec = clampInt(els.refresh?.value ?? 30, 0, 3600, 30);
-
-  state.minScore = clampInt(els.minScore?.value ?? 0, 0, 100, 0);
-  state.maxScore = clampInt(els.maxScore?.value ?? 100, 0, 100, 100);
-
-  state.sortBy = String(els.sortBy?.value ?? "score");
-  state.limit = clampInt(els.limit?.value ?? 50, 1, 250, 50);
-  state.hideStables = Boolean(els.hideStables?.checked);
-
-  state.advancedOpen = Boolean(els.advanced?.open);
-  normalizeRanges();
+function escapeHtml(s) {
+  return String(s)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
 
-function applyStateToUI() {
-  if (els.preset) els.preset.value = String(state.presetMin);
-  if (els.refresh) els.refresh.value = String(state.refreshSec);
-
-  if (els.minScore) els.minScore.value = String(state.minScore);
-  if (els.maxScore) els.maxScore.value = String(state.maxScore);
-
-  if (els.sortBy) els.sortBy.value = state.sortBy;
-  if (els.limit) els.limit.value = String(state.limit);
-  if (els.hideStables) els.hideStables.checked = state.hideStables;
-
-  if (els.advanced) els.advanced.open = state.advancedOpen;
+function safeText(s) {
+  return String(s).slice(0, 200);
 }
 
-function saveState() {
-  const payload = {
-    presetMin: state.presetMin,
-    refreshSec: state.refreshSec,
-    minScore: state.minScore,
-    maxScore: state.maxScore,
-    sortBy: state.sortBy,
-    limit: state.limit,
-    hideStables: state.hideStables,
-    advancedOpen: state.advancedOpen,
-  };
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(payload)); } catch {}
+function StringToUpperSafe(x) {
+  return String(x ?? "").toUpperCase();
 }
 
-function loadState() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return;
-    const p = JSON.parse(raw);
-
-    state.presetMin = clampInt(p.presetMin ?? 0, 0, 100, 0);
-    state.refreshSec = clampInt(p.refreshSec ?? 30, 0, 3600, 30);
-
-    state.minScore = clampInt(p.minScore ?? 0, 0, 100, 0);
-    state.maxScore = clampInt(p.maxScore ?? 100, 0, 100, 100);
-
-    state.sortBy = String(p.sortBy ?? "score");
-    state.limit = clampInt(p.limit ?? 50, 1, 250, 50);
-    state.hideStables = Boolean(p.hideStables);
-
-    state.advancedOpen = Boolean(p.advancedOpen);
-
-    normalizeRanges();
-  } catch {}
-}
-
-function sortAssets(arr) {
-  const key = state.sortBy;
-
-  const get = (a) => {
-    if (key === "change24h") return Number(a.change24h) || 0;
-    if (key === "marketCap") return Number(a.marketCap) || 0;
-    if (key === "volume") return Number(a.volume) || 0;
-    if (key === "price") return Number(a.price) || 0;
-    return Number(a.score) || 0; // score
-  };
-
-  // Desc pour score/change/marketcap/volume, desc pour price aussi (plus haut en haut)
-  return arr.sort((a, b) => get(b) - get(a));
-}
-
-function filterAssets() {
-  const min = getEffectiveMinScore();
-  const max = getEffectiveMaxScore();
-
-  let out = state.assets.filter(a => {
-    const s = Number(a.score) || 0;
-    if (s < min || s > max) return false;
-    if (state.hideStables && STABLES.has(String(a.symbol || "").toUpperCase())) return false;
-    return true;
-  });
-
-  out = sortAssets(out);
-  return out.slice(0, state.limit);
-}
-
-function render() {
-  if (!els.results) return;
-
-  const filtered = filterAssets();
-  const min = getEffectiveMinScore();
-  const max = getEffectiveMaxScore();
-
-  // Header table
-  let html = `
-    <div class="table">
-      <div class="thead">
-        <div>Symbole</div>
-        <div>Prix</div>
-        <div>24h</div>
-        <div>Score</div>
-      </div>
-  `;
-
-  if (!filtered.length) {
-    html += `
-      <div class="empty">
-        Aucun signal pour score entre <b>${min}</b> et <b>${max}</b>.
-      </div>
-    `;
-  } else {
-    html += filtered.map(a => `
-      <div class="trow">
-        <div class="sym">${escapeHtml(a.symbol ?? "—")}</div>
-        <div class="price">${escapeHtml(formatPrice(Number(a.price)))}</div>
-        <div class="chg ${pctClass(Number(a.change24h))}">${escapeHtml(formatPct(Number(a.change24h)))}</div>
-        <div class="score">${escapeHtml(String(Number(a.score) || 0))}</div>
-      </div>
-    `).join("");
-  }
-
-  html += `</div>`;
-
-  els.results.innerHTML = html;
-
-  setStatus(
-    `Filtre: min ${min} / max ${max} • Tri: ${state.sortBy} • Résultats: ${filtered.length}/${state.assets.length}`
-  );
-}
-
-async function fetchMarket() {
-  if (state.inflight) return;
-  state.inflight = true;
-
-  try {
-    setStatus("Chargement marché…");
-    const assets = await loadAssets();
-
-    // Normalisation minimale (sécurité)
-    state.assets = (assets || []).map(a => ({
-      symbol: String(a.symbol || "").toUpperCase(),
-      price: Number(a.price),
-      change24h: Number(a.change24h),
-      volume: Number(a.volume) || 0,
-      marketCap: Number(a.marketCap) || 0,
-      score: Number(a.score) || 0,
-    }));
-
-    state.lastFetchAt = Date.now();
-    setUpdated();
-    render();
-  } catch (e) {
-    console.error(e);
-    if (els.results) {
-      els.results.innerHTML = `<div class="error">Erreur API: ${escapeHtml(String(e?.message || e))}</div>`;
-    }
-    setStatus("Erreur API");
-  } finally {
-    state.inflight = false;
-  }
-}
-
-function clearTimer() {
-  if (state.timer) {
-    clearInterval(state.timer);
-    state.timer = null;
-  }
-}
-
-function setupTimer() {
-  clearTimer();
-  const sec = clampInt(state.refreshSec, 0, 3600, 0);
-  if (sec <= 0) return;
-  state.timer = setInterval(fetchMarket, sec * 1000);
-}
-
-function wireEvents() {
-  const onChange = () => {
-    applyUIToState();
-    saveState();
-    setupTimer();
-    render();
-  };
-
-  els.preset?.addEventListener("change", onChange);
-  els.refresh?.addEventListener("change", onChange);
-
-  els.minScore?.addEventListener("input", onChange);
-  els.maxScore?.addEventListener("input", onChange);
-
-  els.sortBy?.addEventListener("change", onChange);
-  els.limit?.addEventListener("change", onChange);
-  els.hideStables?.addEventListener("change", onChange);
-
-  els.advanced?.addEventListener("toggle", onChange);
-
-  els.btnRefresh?.addEventListener("click", () => {
-    fetchMarket();
-  });
-}
-
-function initDefaultsFirstLoad() {
-  // Très important : éviter l'effet "ça marche pas".
-  // Si pas de state stocké, on force un filtre à 0 et max 100.
-  const hasStored = (() => {
-    try { return Boolean(localStorage.getItem(STORAGE_KEY)); } catch { return false; }
-  })();
-
-  if (!hasStored) {
-    state.presetMin = 0;
-    state.minScore = 0;
-    state.maxScore = 100;
-    state.refreshSec = 30;
-    state.sortBy = "score";
-    state.limit = 50;
-    state.hideStables = false;
-    state.advancedOpen = false;
-  }
-}
-
-function boot() {
-  initDefaultsFirstLoad();
-  loadState();
-  applyStateToUI();
-  wireEvents();
-
-  // sync state from UI (et normaliser)
-  applyUIToState();
-  saveState();
-
-  setupTimer();
-  fetchMarket(); // first load
-}
-
-boot();
+// petite util interne (évite crash si name undefined)
+String.prototype.toUpperCaseSafe = function () {
+  return String(this ?? "").toUpperCase();
+};
