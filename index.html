@@ -11,6 +11,18 @@
 <body>
   <div class="wrap">
     <h1>Zilkara — Market Scanner</h1>
+    <div class="controls">
+  <div class="rowc">
+    <label for="minScore"><b>Filtre score</b> — Minimum: <span id="minScoreValue">75</span></label>
+    <input id="minScore" type="range" min="0" max="100" value="75" step="1" />
+  </div>
+
+  <div class="presets">
+    <button type="button" data-preset="75">Radar (75)</button>
+    <button type="button" data-preset="60">Standard (60)</button>
+    <button type="button" data-preset="40">Large (40)</button>
+  </div>
+</div>
     <div id="results">Chargement…</div>
   </div>
 
