@@ -1,83 +1,383 @@
+<!-- index.html -->
 <!doctype html>
 <html lang="fr">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <meta name="color-scheme" content="dark" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark light" />
   <title>Zilkara — Market Scanner</title>
-  <link rel="stylesheet" href="./ui.css" />
+
+  <style>
+    :root{
+      --bg: #0b0c10;
+      --panel: rgba(255,255,255,.04);
+      --panel2: rgba(255,255,255,.06);
+      --text: rgba(255,255,255,.92);
+      --muted: rgba(255,255,255,.62);
+      --line: rgba(255,255,255,.10);
+      --accent: rgba(255,255,255,.85);
+      --danger: rgba(255,120,120,.95);
+      --ok: rgba(120,255,180,.90);
+      --warn: rgba(255,200,120,.92);
+      --radius: 14px;
+      --shadow: 0 10px 30px rgba(0,0,0,.35);
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      --serif: ui-serif, "New York", Georgia, "Times New Roman", Times, serif;
+      --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+    }
+
+    *{ box-sizing: border-box; }
+    html, body{ height: 100%; }
+    body{
+      margin: 0;
+      color: var(--text);
+      background: radial-gradient(1200px 800px at 30% -10%, rgba(255,255,255,.08), transparent 55%),
+                  radial-gradient(900px 700px at 90% 0%, rgba(255,255,255,.06), transparent 55%),
+                  var(--bg);
+      font-family: var(--sans);
+      letter-spacing: .2px;
+    }
+
+    a{ color: var(--accent); }
+    .wrap{
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 26px 18px 60px;
+    }
+
+    header{
+      margin-bottom: 18px;
+    }
+    h1{
+      font-family: var(--serif);
+      font-weight: 700;
+      letter-spacing: .4px;
+      margin: 0 0 6px 0;
+      font-size: clamp(30px, 5vw, 54px);
+      line-height: 1.03;
+    }
+    .subtitle{
+      color: var(--muted);
+      margin: 0 0 18px 0;
+      max-width: 72ch;
+      font-size: 15.5px;
+    }
+
+    .panel{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 14px;
+    }
+
+    .controls{
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+    }
+
+    .row{
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+      align-items: end;
+    }
+
+    @media (min-width: 720px){
+      .row{
+        grid-template-columns: 1.2fr .8fr .8fr;
+      }
+    }
+
+    label{
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin: 0 0 6px 0;
+    }
+
+    select, input, button{
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: rgba(0,0,0,.35);
+      color: var(--text);
+      outline: none;
+      font-size: 14px;
+    }
+
+    select:focus, input:focus{
+      border-color: rgba(255,255,255,.22);
+    }
+
+    button{
+      cursor: pointer;
+      background: rgba(255,255,255,.10);
+      border-color: rgba(255,255,255,.14);
+      font-weight: 650;
+      transition: transform .06s ease, background .15s ease;
+    }
+    button:hover{ background: rgba(255,255,255,.14); }
+    button:active{ transform: translateY(1px); }
+
+    .btnline{
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+    }
+    @media (min-width: 720px){
+      .btnline{
+        grid-template-columns: 1fr 1fr;
+      }
+    }
+
+    details{
+      margin-top: 8px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: rgba(0,0,0,.25);
+      overflow: hidden;
+    }
+    summary{
+      cursor: pointer;
+      padding: 10px 12px;
+      list-style: none;
+      user-select: none;
+      font-weight: 650;
+      color: rgba(255,255,255,.85);
+    }
+    summary::-webkit-details-marker{ display:none; }
+    .advanced{
+      padding: 12px;
+      border-top: 1px solid var(--line);
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+    }
+
+    @media (min-width: 720px){
+      .advanced{
+        grid-template-columns: 1fr 1fr 1fr;
+      }
+    }
+
+    .switch{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(0,0,0,.25);
+    }
+    .switch input{ width: auto; }
+    .switch span{ color: var(--muted); font-size: 13px; }
+
+    .meta{
+      margin-top: 12px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 12px;
+      display: grid;
+      gap: 6px;
+    }
+    .meta strong{ color: rgba(255,255,255,.82); font-weight: 650; }
+
+    .status{
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: rgba(0,0,0,.25);
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: center;
+    }
+    .status .left{ display:flex; flex-direction:column; gap:2px; }
+    .status .right{ text-align:right; font-family: var(--mono); font-size: 12px; color: var(--muted); }
+    .badge{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 700;
+      font-size: 12px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,.06);
+      color: rgba(255,255,255,.86);
+      width: fit-content;
+    }
+    .dot{
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: rgba(255,255,255,.35);
+    }
+    .dot.ok{ background: var(--ok); }
+    .dot.warn{ background: var(--warn); }
+    .dot.bad{ background: var(--danger); }
+
+    /* Table */
+    .tableWrap{
+      margin-top: 14px;
+      border-radius: var(--radius);
+      border: 1px solid var(--line);
+      overflow: hidden;
+      background: rgba(0,0,0,.25);
+    }
+
+    table{
+      width: 100%;
+      border-collapse: collapse;
+      font-variant-numeric: tabular-nums;
+    }
+    thead th{
+      position: sticky;
+      top: 0;
+      background: rgba(10,10,12,.92);
+      backdrop-filter: blur(10px);
+      border-bottom: 1px solid var(--line);
+      padding: 10px 10px;
+      font-size: 12px;
+      color: rgba(255,255,255,.72);
+      text-align: left;
+      z-index: 1;
+    }
+    tbody td{
+      padding: 11px 10px;
+      border-bottom: 1px solid rgba(255,255,255,.06);
+      vertical-align: middle;
+    }
+    tbody tr:hover{
+      background: rgba(255,255,255,.04);
+    }
+    .sym{
+      font-weight: 800;
+      letter-spacing: .4px;
+    }
+    .name{
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 2px;
+      max-width: 34ch;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .num{ text-align: right; font-family: var(--mono); }
+    .chg.pos{ color: var(--ok); }
+    .chg.neg{ color: var(--danger); }
+    .sig{
+      text-align: right;
+      font-family: var(--mono);
+      font-weight: 900;
+    }
+
+    /* Mobile: turn table rows into cards */
+    @media (max-width: 620px){
+      table, thead, tbody, th, td, tr{ display:block; }
+      thead{ display:none; }
+      tbody tr{
+        padding: 10px 12px;
+        border-bottom: 1px solid rgba(255,255,255,.08);
+      }
+      tbody td{
+        border: none;
+        padding: 6px 0;
+        display:flex;
+        justify-content: space-between;
+        gap: 14px;
+      }
+      tbody td::before{
+        content: attr(data-label);
+        color: rgba(255,255,255,.62);
+        font-size: 12px;
+        min-width: 90px;
+      }
+      .name{ max-width: 22ch; }
+    }
+
+    .footnote{
+      margin-top: 14px;
+      color: rgba(255,255,255,.50);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+  </style>
 </head>
 
 <body>
   <div class="wrap">
-    <header class="top">
+    <header>
       <h1>Zilkara — Market Scanner</h1>
-
-      <!-- Petit texte clair -->
-      <p class="hint">
+      <p class="subtitle">
         <strong>Signal</strong> = score technique (0–100) basé sur liquidité, taille, turnover et momentum (24h).
         Plus c’est élevé, plus l’actif est “propre” à surveiller.
       </p>
+    </header>
 
-      <!-- Barre principale (ergonomique, compacte) -->
-      <div class="toolbar">
-        <div class="field">
-          <label class="label" for="preset">Filtre signal</label>
-          <select id="preset" class="select">
-            <option value="all" selected>Tous (0)</option>
-            <option value="large">Large (40)</option>
-            <option value="standard">Standard (60)</option>
-            <option value="radar">Radar (75)</option>
+    <section class="panel controls" aria-label="Contrôles">
+      <div class="row">
+        <div>
+          <label for="preset">Filtre signal</label>
+          <select id="preset">
+            <option value="all">Tous</option>
+            <option value="large" selected>Large (≥ 40)</option>
+            <option value="pro">Pro (≥ 60)</option>
+            <option value="elite">Elite (≥ 75)</option>
+            <option value="custom">Custom (Avancé)</option>
           </select>
         </div>
 
-        <div class="field">
-          <label class="label" for="autoRefresh">Auto-refresh</label>
-          <div class="row">
-            <select id="autoRefresh" class="select">
-              <option value="off" selected>Off</option>
-              <option value="10">10s</option>
-              <option value="30">30s</option>
-              <option value="60">60s</option>
-              <option value="120">2m</option>
-              <option value="300">5m</option>
-            </select>
-            <button id="refreshBtn" class="btn" type="button">Rafraîchir</button>
-          </div>
+        <div>
+          <label for="autoRefresh">Auto-refresh</label>
+          <select id="autoRefresh">
+            <option value="0">Off</option>
+            <option value="10">10s</option>
+            <option value="30" selected>30s</option>
+            <option value="60">60s</option>
+            <option value="120">120s</option>
+          </select>
+        </div>
+
+        <div class="btnline">
+          <button id="btnRefresh" type="button">Rafraîchir</button>
+          <button id="btnRebuild" type="button" title="Reconstruit le cache côté serveur si ton endpoint /api/rebuild est actif">
+            Rebuild cache
+          </button>
         </div>
       </div>
 
-      <!-- Avancé -->
-      <details class="advanced" id="advanced">
+      <details id="advancedDetails">
         <summary>▶ Avancé</summary>
-
-        <div class="advancedGrid">
-          <div class="field">
-            <label class="label" for="minSignal">Min</label>
-            <input id="minSignal" class="input" type="number" min="0" max="100" step="1" value="0" />
+        <div class="advanced">
+          <div>
+            <label for="minSignal">Min</label>
+            <input id="minSignal" type="number" min="0" max="100" step="1" value="40" />
           </div>
-
-          <div class="field">
-            <label class="label" for="maxSignal">Max</label>
-            <input id="maxSignal" class="input" type="number" min="0" max="100" step="1" value="100" />
+          <div>
+            <label for="maxSignal">Max</label>
+            <input id="maxSignal" type="number" min="0" max="100" step="1" value="100" />
           </div>
-
-          <div class="field">
-            <label class="label" for="sortBy">Tri</label>
-            <select id="sortBy" class="select">
+          <div>
+            <label for="sortBy">Tri</label>
+            <select id="sortBy">
               <option value="signal" selected>Signal</option>
               <option value="change24h">Variation 24h</option>
-              <option value="marketCap">MarketCap</option>
+              <option value="marketCap">Market cap</option>
               <option value="volume">Volume</option>
               <option value="price">Prix</option>
               <option value="symbol">Symbole</option>
             </select>
           </div>
 
-          <div class="field">
-            <label class="label" for="limit">Limite</label>
-            <select id="limit" class="select">
-              <option value="10">10</option>
+          <div>
+            <label for="limit">Résultats</label>
+            <select id="limit">
               <option value="25">25</option>
               <option value="50" selected>50</option>
               <option value="100">100</option>
@@ -85,33 +385,50 @@
             </select>
           </div>
 
-          <label class="check">
-            <input id="hideStables" type="checkbox" />
-            <span>Exclure stablecoins</span>
-          </label>
+          <div class="switch" style="grid-column: 1 / -1;">
+            <input id="hideStables" type="checkbox" checked />
+            <span>Exclure stablecoins (USDT/USDC/DAI…)</span>
+          </div>
         </div>
       </details>
 
-      <!-- Statut -->
-      <div class="meta">
-        <span id="status"></span>
-        <span id="updated"></span>
+      <div class="status" role="status" aria-live="polite">
+        <div class="left">
+          <span class="badge" id="badge">
+            <span class="dot" id="dot"></span>
+            <span id="statusText">Prêt</span>
+          </span>
+          <span class="footnote" id="hint">
+            Si tu vois <code>cache_missing</code> : le serveur n’a pas généré de cache (rebuild non exécuté / pas de stockage).
+          </span>
+        </div>
+        <div class="right">
+          <div>MAJ: <span id="updated">—</span></div>
+          <div>Source: <span id="source">—</span></div>
+        </div>
       </div>
-    </header>
 
-    <!-- Table -->
-    <section class="tableWrap">
-      <table class="table">
-        <thead>
-          <tr>
-            <th>Symbole</th>
-            <th>Prix</th>
-            <th>24h</th>
-            <th>Signal</th>
-          </tr>
-        </thead>
-        <tbody id="tbody"></tbody>
-      </table>
+      <div class="tableWrap" aria-label="Résultats">
+        <table>
+          <thead>
+            <tr>
+              <th>Symbole</th>
+              <th style="text-align:right;">Prix</th>
+              <th style="text-align:right;">24h</th>
+              <th style="text-align:right;">Signal</th>
+            </tr>
+          </thead>
+          <tbody id="tbody">
+            <!-- rows injected -->
+          </tbody>
+        </table>
+      </div>
+
+      <div class="meta" id="meta"></div>
+
+      <p class="footnote">
+        Remarque : cette UI ne “conseille” rien. Elle affiche et filtre des métriques.
+      </p>
     </section>
   </div>
 

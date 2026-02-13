@@ -2,38 +2,38 @@
 import fs from "fs";
 import path from "path";
 
+const CACHE_FILE = "/tmp/cache/market.json";
+
 export default async function handler(req, res) {
+
   try {
-    const cacheDir = path.join(process.cwd(), "cache");
 
-    // Si le noyau n’a pas encore généré, fallback propre
-    if (!fs.existsSync(cacheDir)) {
-      return res.status(200).json({ ok: true, assets: [], source: "cache_missing" });
+    if (!fs.existsSync(CACHE_FILE)) {
+
+      return res.json({
+        ok: true,
+        assets: [],
+        source: "cache_missing"
+      });
+
     }
 
-    const files = fs.readdirSync(cacheDir).filter(f => f.endsWith(".json") && f !== "manifest.json");
-    const assets = [];
+    const raw = fs.readFileSync(CACHE_FILE, "utf-8");
 
-    for (const f of files) {
-      const p = path.join(cacheDir, f);
-      try {
-        const raw = fs.readFileSync(p, "utf8");
-        const obj = JSON.parse(raw);
-        assets.push(obj);
-      } catch {
-        // ignore fichier corrompu
-      }
-    }
+    const data = JSON.parse(raw);
 
-    // Tri par signal décroissant si présent
-    assets.sort((a, b) => (Number(b.signal) || 0) - (Number(a.signal) || 0));
-
-    return res.status(200).json({
+    return res.json({
       ok: true,
-      count: assets.length,
-      assets
+      assets: data.assets,
+      source: "cache"
     });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+
+  } catch (err) {
+
+    return res.status(500).json({
+      ok: false,
+      error: err.message
+    });
+
   }
 }

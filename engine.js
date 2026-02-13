@@ -1,10 +1,4 @@
-const API_URL =
-  "https://api.coingecko.com/api/v3/coins/markets" +
-  "?vs_currency=eur" +
-  "&order=market_cap_desc" +
-  "&per_page=250" +
-  "&page=1" +
-  "&sparkline=false";
+const API_URL = "/api/market";
 
 /* helpers */
 
@@ -13,18 +7,22 @@ function clamp(n, min, max) {
 }
 
 function logNorm(x, min, max) {
-  const lx = Math.log10(Math.max(x, 1));
+  if (!x || x <= 0) return 0;
+
+  const lx = Math.log10(x);
   const lmin = Math.log10(min);
   const lmax = Math.log10(max);
+
   return clamp((lx - lmin) / (lmax - lmin), 0, 1);
 }
 
 function isStable(symbol, name) {
-  const s = symbol.toUpperCase();
-  const n = name.toUpperCase();
+  const s = (symbol || "").toUpperCase();
+  const n = (name || "").toUpperCase();
 
   const stable = [
-    "USDT","USDC","DAI","TUSD","FDUSD","USDE","USDP","BUSD","FRAX","PYUSD","USDD"
+    "USDT","USDC","DAI","TUSD","FDUSD",
+    "USDE","USDP","BUSD","FRAX","PYUSD","USDD"
   ];
 
   return (
@@ -32,6 +30,8 @@ function isStable(symbol, name) {
     (s.includes("USD") && n.includes("STABLE"))
   );
 }
+
+/* SIGNAL CORE */
 
 function calculateSignal(asset) {
 
@@ -62,13 +62,42 @@ function calculateSignal(asset) {
       0.15 * momentumScore
     );
 
-  if (isStable(asset.symbol, asset.name))
+  if (isStable(asset.symbol, asset.name)) {
     signal *= 0.15;
+  }
 
   return Math.round(clamp(signal, 0, 100));
 }
 
-/* export principal */
+/* NORMALISATION */
+
+function normalizeAsset(asset) {
+
+  const signal = calculateSignal(asset);
+
+  return {
+
+    id: asset.id,
+    symbol: (asset.symbol || "").toUpperCase(),
+    name: asset.name || "",
+
+    price: asset.current_price ?? 0,
+
+    change24h:
+      asset.price_change_percentage_24h ?? 0,
+
+    marketCap:
+      asset.market_cap ?? 0,
+
+    volume:
+      asset.total_volume ?? 0,
+
+    signal
+
+  };
+}
+
+/* FETCH + CORE */
 
 export async function loadAssets() {
 
@@ -76,18 +105,24 @@ export async function loadAssets() {
     cache: "no-store"
   });
 
-  if (!res.ok)
-    throw new Error("API error");
+  if (!res.ok) {
+    throw new Error("API unavailable");
+  }
 
-  const data = await res.json();
+  const json = await res.json();
 
-  return data.map(asset => ({
-    symbol: asset.symbol.toUpperCase(),
-    name: asset.name,
-    price: asset.current_price,
-    change24h: asset.price_change_percentage_24h,
-    signal: calculateSignal(asset),
-    marketCap: asset.market_cap,
-    volume: asset.total_volume
-  }));
+  if (!json.ok) {
+    throw new Error(json.error || "API error");
+  }
+
+  const raw = json.assets || [];
+
+  const normalized =
+    raw.map(normalizeAsset);
+
+  normalized.sort(
+    (a, b) => b.signal - a.signal
+  );
+
+  return normalized;
 }
