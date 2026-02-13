@@ -1,6 +1,9 @@
+document.body.insertAdjacentHTML(
+  "beforeend",
+  "<div style='color:lime'>JS EXEC OK</div>"
+);
 import { loadAssets } from "./engine.js";
 
-document.body.insertAdjacentHTML("afterbegin", "<div style='color:lime'>JS OK</div>");
 async function loadMarket(){
 
     const results =
