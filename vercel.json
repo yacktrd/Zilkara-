@@ -1,0 +1,5 @@
+{
+  "crons": [
+    { "path": "/api/rebuild?token=REPLACE_ME", "schedule": "0 2 * * *" }
+  ]
+}
