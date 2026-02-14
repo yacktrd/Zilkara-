@@ -4,32 +4,30 @@ import assetsFile from "@/data/assets.json";
 
 export const runtime = "edge";
 
-const redis = Redis.fromEnv();
+const redis = new Redis({
+  url: process.env.KV_REST_API_URL,
+  token: process.env.KV_REST_API_TOKEN,
+});
 
-export async function POST(request) {
+export async function POST() {
   try {
-
-    // construire payload
     const payload = {
       updated: Date.now(),
-      assets: assetsFile.assets ?? []
+      assets: assetsFile.assets ?? [],
     };
 
-    // sauver dans KV
     await redis.set("assets_payload", payload);
 
     return NextResponse.json({
       ok: true,
       updated: payload.updated,
-      count: payload.assets.length
+      count: payload.assets.length,
     });
-
   } catch (error) {
-
-    return NextResponse.json({
-      ok: false,
-      error: error.message
-    }, { status: 500 });
-
+    return NextResponse.json(
+      { ok: false, error: String(error?.message || error) },
+      { status: 500 }
+    );
   }
 }
+
