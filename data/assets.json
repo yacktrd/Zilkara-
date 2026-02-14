@@ -1,35 +1,33 @@
-[
-  {
-    "asset": "BTC",
-    "price": 60024.0,
-    "chg_24h_pct": 2.12,
-    "chg_7d_pct": -0.35,
-    "chg_30d_pct": -22.76,
-    "stability": 94,
-    "rating": "A",
-    "market_state": "Stable",
-    "trend": "Downtrend"
-  },
-  {
-    "asset": "ETH",
-    "price": 1783.14,
-    "chg_24h_pct": 0.17,
-    "chg_7d_pct": -0.74,
-    "chg_30d_pct": -32.37,
-    "stability": 91,
-    "rating": "A",
-    "market_state": "Stable",
-    "trend": "Downtrend"
-  },
-  {
-    "asset": "SOL",
-    "price": 0,
-    "chg_24h_pct": 0,
-    "chg_7d_pct": 0,
-    "chg_30d_pct": 0,
-    "stability": 0,
-    "rating": "D",
-    "market_state": "Volatile",
-    "trend": "Sideways"
-  }
-]
+{
+  "updated": 1700000000000,
+  "assets": [
+    {
+      "symbol": "BTC",
+      "name": "Bitcoin",
+      "price": 58539,
+      "chg_24h_pct": 4.77,
+      "chg_7d_pct": 8.12,
+      "chg_30d_pct": 12.45,
+      "stability_score": 92,
+      "rating": "A",
+      "regime": "STABLE",
+      "similarity": 84,
+      "rupture_rate": 3,
+      "reason": "Faible fréquence de ruptures, régime stable."
+    },
+    {
+      "symbol": "ETH",
+      "name": "Ethereum",
+      "price": 1743,
+      "chg_24h_pct": 6.67,
+      "chg_7d_pct": 9.21,
+      "chg_30d_pct": 14.02,
+      "stability_score": 88,
+      "rating": "A",
+      "regime": "STABLE",
+      "similarity": 79,
+      "rupture_rate": 5,
+      "reason": "Structure stable avec volatilité contrôlée."
+    }
+  ]
+}
