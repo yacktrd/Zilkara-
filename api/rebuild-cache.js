@@ -1,57 +1,45 @@
-import { kv } from '@vercel/kv';
+import { kv } from '@vercel/kv'
 
 export default async function handler(req, res) {
+
   try {
 
-    const data = {
+    // Test connexion KV
+    await kv.set('zilkara:test', 'ok')
+
+    // Exemple cache
+    const cache = {
+      ok: true,
       updated: Date.now(),
-      source: "kv",
+      source: 'kv',
       assets: [
         {
           symbol: "BTC",
           name: "Bitcoin",
-          price: 58539,
-          chg_24h_pct: 4.77,
-          chg_7d_pct: 8.12,
-          chg_30d_pct: 12.45,
           stability_score: 92,
           rating: "A",
-          regime: "STABLE",
-          similarity: 84,
-          rupture_rate: 3,
-          reason: "Structure stable"
-        },
-        {
-          symbol: "ETH",
-          name: "Ethereum",
-          price: 1743,
-          chg_24h_pct: 6.67,
-          chg_7d_pct: 9.21,
-          chg_30d_pct: 14.02,
-          stability_score: 88,
-          rating: "A",
-          regime: "STABLE",
-          similarity: 79,
-          rupture_rate: 5,
-          reason: "Momentum propre"
+          regime: "STABLE"
         }
       ]
-    };
+    }
 
-    await kv.set("zilkara_cache", data);
+    await kv.set('zilkara:cache', cache)
 
     return res.status(200).json({
       ok: true,
-      source: "kv",
-      updated: data.updated
-    });
+      message: 'Cache rebuilt successfully',
+      source: 'kv'
+    })
 
-  } catch (e) {
+  } catch (err) {
+
+    console.error(err)
 
     return res.status(500).json({
       ok: false,
-      error: e.message
-    });
+      error: err.message
+    })
 
   }
+
 }
