@@ -5,9 +5,9 @@ export default function handler(req, res) {
 
   try {
 
-    const file = path.join(process.cwd(), "data", "state.json");
+    const filePath = path.join(process.cwd(), "data", "assets.json");
 
-    if (!fs.existsSync(file)) {
+    if (!fs.existsSync(filePath)) {
 
       return res.status(200).json({
         ok: true,
@@ -18,21 +18,24 @@ export default function handler(req, res) {
 
     }
 
-    const raw = fs.readFileSync(file, "utf8");
-
+    const raw = fs.readFileSync(filePath, "utf8");
     const json = JSON.parse(raw);
 
-    res.setHeader("Cache-Control", "s-maxage=10");
+    return res.status(200).json({
+      ok: true,
+      assets: json.assets || [],
+      updated: json.updated || null,
+      source: "file"
+    });
 
-    return res.status(200).json(json);
-
-  } catch (e) {
+  } catch (err) {
 
     return res.status(500).json({
       ok: false,
-      error: e.message
+      error: err.message
     });
 
   }
 
 }
+
