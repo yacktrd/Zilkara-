@@ -1,66 +1,48 @@
-import fs from "fs";
-import path from "path";
-
 const KV_URL = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 
-async function getFromKV() {
+async function readKV() {
+
+  if (!KV_URL || !KV_TOKEN) {
+    return null;
+  }
+
   try {
+
     const res = await fetch(`${KV_URL}/get/cache`, {
+      method: "GET",
       headers: {
         Authorization: `Bearer ${KV_TOKEN}`
       }
     });
 
-    const data = await res.json();
+    const json = await res.json();
 
-    if (data.result) {
-      return JSON.parse(data.result);
+    if (!json.result) {
+      return null;
     }
 
-    return null;
+    return JSON.parse(json.result);
 
-  } catch {
-    return null;
-  }
-}
-
-function getFromFile() {
-  try {
-    const filePath = path.join(process.cwd(), "data", "cache.json");
-    const raw = fs.readFileSync(filePath, "utf-8");
-    return JSON.parse(raw);
-  } catch {
+  } catch (e) {
     return null;
   }
 }
 
 export default async function handler(req, res) {
 
-  // PRIORITÉ KV
-  const kv = await getFromKV();
+  const kvData = await readKV();
 
-  if (kv) {
+  if (kvData) {
     return res.status(200).json({
       ok: true,
-      ...kv,
+      ...kvData,
       source: "kv"
-    });
-  }
-
-  // fallback file
-  const file = getFromFile();
-
-  if (file) {
-    return res.status(200).json({
-      ok: true,
-      ...file,
-      source: "file"
     });
   }
 
   return res.status(500).json({
     ok: false,
-    error: "no data available"
+    error: "KV empty or unreachable"
   });
 }
