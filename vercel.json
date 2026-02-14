@@ -1,5 +1,7 @@
 {
-  "crons": [
-    { "path": "/api/rebuild?token=REPLACE_ME", "schedule": "0 2 * * *" }
-  ]
+  "functions": {
+    "api/state.js": {
+      "includeFiles": "data/assets.json"
+    }
+  }
 }
