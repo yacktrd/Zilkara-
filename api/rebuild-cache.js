@@ -1,6 +1,0 @@
-export default async function handler(req, res) {
-  if (req.method !== "GET" && req.method !== "POST") {
-    return res.status(405).json({ ok: false, error: "Method Not Allowed" });
-  }
-  return res.status(404).json({ ok: false, error: "Use /api/rebuild (POST)" });
-}
