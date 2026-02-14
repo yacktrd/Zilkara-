@@ -8,6 +8,7 @@
     "lint": "node -e \"console.log('ok')\""
   },
   "dependencies": {
+    "@upstash/redis": "^1.36.2",
     "@vercel/kv": "^3.0.0"
   }
 }

@@ -1,26 +1,37 @@
 import { NextResponse } from "next/server";
-import { kv } from "@vercel/kv";
+import { Redis } from "@upstash/redis";
 import assetsFile from "@/data/assets.json";
 
 export const runtime = "edge";
 
+const redis = new Redis({
+  url: process.env.KV_REST_API_URL,
+  token: process.env.KV_REST_API_TOKEN,
+});
+
 export async function GET() {
-  // 1) tente KV
   try {
-    const cached = await kv.get("assets_payload");
-    if (cached && cached.assets && cached.assets.length) {
-      return NextResponse.json({ ok: true, ...cached, source: "kv" });
+    const cached = await redis.get("assets_payload");
+
+    if (cached && cached.assets?.length) {
+      return NextResponse.json({
+        ok: true,
+        ...cached,
+        source: "kv",
+      });
     }
   } catch (e) {
-    // on ignore et on fallback
+    console.error("KV error:", e);
   }
 
-  // 2) fallback fichier
   const payload = {
     updated: assetsFile.updated ?? Date.now(),
     assets: assetsFile.assets ?? [],
     source: "file",
   };
 
-  return NextResponse.json({ ok: true, ...payload });
+  return NextResponse.json({
+    ok: true,
+    ...payload,
+  });
 }

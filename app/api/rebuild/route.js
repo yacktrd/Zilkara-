@@ -1,37 +1,33 @@
 import { NextResponse } from "next/server";
-import { kv } from "@vercel/kv";
+import { Redis } from "@upstash/redis";
 import assetsFile from "@/data/assets.json";
 
 export const runtime = "edge";
 
+const redis = new Redis({
+  url: process.env.KV_REST_API_URL,
+  token: process.env.KV_REST_API_TOKEN,
+});
+
 export async function POST() {
   try {
-    if (!assetsFile || !assetsFile.assets) {
-      return NextResponse.json({
-        ok: false,
-        error: "No assets file"
-      }, { status: 500 });
-    }
-
     const payload = {
-      updated: assetsFile.updated ?? Date.now(),
-      assets: assetsFile.assets
+      updated: Date.now(),
+      assets: assetsFile.assets,
     };
 
-    await kv.set("assets_payload", payload);
+    await redis.set("assets_payload", payload);
 
     return NextResponse.json({
       ok: true,
       rebuilt: true,
-      count: payload.assets.length
+      count: payload.assets.length,
     });
 
   } catch (e) {
-
     return NextResponse.json({
       ok: false,
-      error: e.message
-    }, { status: 500 });
-
+      error: e.message,
+    });
   }
 }
