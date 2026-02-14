@@ -1,93 +1,38 @@
-// app/api/rebuild/route.js
-
-import { NextResponse } from "next/server";
 import { Redis } from "@upstash/redis";
-import assetsFile from "@/data/assets.json";
+import assetsFile from "../data/assets.json";
 
-// IMPORTANT : utiliser Node runtime (pas edge)
-export const runtime = "nodejs";
+export default async function handler(req, res) {
 
-// Création client Redis
-function getRedis() {
-  const url =
-    process.env.KV_REST_API_URL ||
-    process.env.UPSTASH_REDIS_REST_URL;
-
-  const token =
-    process.env.KV_REST_API_TOKEN ||
-    process.env.UPSTASH_REDIS_REST_TOKEN;
-
-  if (!url || !token) {
-    throw new Error("Missing Redis environment variables");
+  if (req.method !== "POST") {
+    return res.status(405).json({ ok: false });
   }
 
-  return new Redis({ url, token });
-}
-
-// Auth rebuild
-function getAuthToken(req) {
-  const bearer = req.headers.get("authorization") || "";
-
-  if (bearer.toLowerCase().startsWith("bearer ")) {
-    return bearer.slice(7).trim();
-  }
-
-  return (
-    req.headers.get("x-rebuild-token") ||
-    req.headers.get("x-api-key") ||
-    ""
-  ).trim();
-}
-
-export async function POST(req) {
   try {
-    // Vérification token
+
     const expected = process.env.REBUILD_TOKEN;
+    const provided =
+      req.headers.authorization?.replace("Bearer ", "") ||
+      req.headers["x-rebuild-token"];
 
-    if (!expected) {
-      return NextResponse.json(
-        { ok: false, error: "REBUILD_TOKEN missing" },
-        { status: 500 }
-      );
+    if (!expected || provided !== expected) {
+      return res.status(401).json({ ok: false });
     }
 
-    const provided = getAuthToken(req);
-
-    if (provided !== expected) {
-      return NextResponse.json(
-        { ok: false, error: "Unauthorized" },
-        { status: 401 }
-      );
-    }
-
-    // Création Redis
-    const redis = getRedis();
-
-    // Création payload
-    const assets = assetsFile?.assets ?? assetsFile ?? [];
-
-    const payload = {
-      updated: Date.now(),
-      assets,
-    };
-
-    // Sauvegarde KV
-    await redis.set("assets_payload", payload);
-
-    return NextResponse.json({
-      ok: true,
-      saved: true,
-      count: assets.length,
-      updated: payload.updated,
+    const redis = new Redis({
+      url: process.env.KV_REST_API_URL,
+      token: process.env.KV_REST_API_TOKEN,
     });
 
-  } catch (err) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: err?.message || "Rebuild failed",
-      },
-      { status: 500 }
-    );
+    const payload = {
+      updatedAt: Date.now(),
+      assets: assetsFile.assets || [],
+    };
+
+    await redis.set("assets_payload", payload);
+
+    return res.json({ ok: true });
+
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
   }
 }
