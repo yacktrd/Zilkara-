@@ -1,7 +1,15 @@
 {
   "functions": {
-    "api/state.js": {
-      "includeFiles": "data/assets.json"
+    "api/*.js": {
+      "runtime": "nodejs20.x"
     }
-  }
+  },
+  "headers": [
+    {
+      "source": "/api/(.*)",
+      "headers": [
+        { "key": "Cache-Control", "value": "no-store" }
+      ]
+    }
+  ]
 }

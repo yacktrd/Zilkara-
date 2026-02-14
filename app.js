@@ -1,98 +1,101 @@
-/* Zilkara — app.js
-   Front UI: fetch /api/state, apply local filters/sort, render aligned table, Binance affiliation links.
-   Requirements: index.html must contain the IDs referenced below.
-*/
 (() => {
   const $ = (id) => document.getElementById(id);
 
-  // ─────────────────────────────────────────────────────────────
-  // Binance affiliation (edit REF if needed)
-  // ─────────────────────────────────────────────────────────────
+  // ---- Binance affiliation
+  // Ref ID fourni : 1216069378
   const BINANCE_REF = "1216069378";
-  const BINANCE_JOIN_URL =
-    `https://www.binance.com/fr/register?ref=${encodeURIComponent(BINANCE_REF)}`;
+  const BINANCE_JOIN_URL = `https://www.binance.com/fr/register?ref=${encodeURIComponent(BINANCE_REF)}`;
   const BINANCE_TRADE_BASE = "https://www.binance.com/fr/trade/";
 
-  // Known stablecoins to optionally hide (UI toggle)
+  // ---- stablecoins to optionally hide / avoid trade button
   const STABLES = new Set([
-    "USDT", "USDC", "DAI", "TUSD", "FDUSD", "USDP", "USDD", "FRAX",
-    "LUSD", "EURC", "EURS", "USDE", "USDS"
+    "USDT","USDC","DAI","TUSD","FDUSD","USDP","USDD","FRAX","LUSD","EURC","EURS","USDE","USDS"
   ]);
 
-  // ─────────────────────────────────────────────────────────────
-  // UI refs (must match index.html IDs)
-  // ─────────────────────────────────────────────────────────────
+  // ---- UI refs (must match index.html)
   const els = {
-    // status
     statusText: $("statusText"),
+    statusNote: $("statusNote"),
     updated: $("updated"),
     source: $("source"),
     dot: $("dot"),
-    hint: $("hint"),
 
-    // buttons
     btnRefresh: $("btnRefresh"),
     btnRebuild: $("btnRebuild"),
 
-    // controls
     signalPreset: $("signalPreset"),
     autoRefresh: $("autoRefresh"),
     sortBy: $("sortBy"),
     sortDir: $("sortDir"),
     limit: $("limit"),
-    // accept either id="hideStables" or id="stableMode"
-    hideStables: $("hideStables") || $("stableMode"),
+    stableMode: $("stableMode"),
 
-    // affiliate links
-    binanceJoinTop: $("binanceJoinTop"),
-    binanceJoinBottom: $("binanceJoinBottom"),
+    rebuildToken: $("rebuildToken"),
 
-    // table
     tableBody: $("tableBody"),
+
+    binanceJoinTop: $("binanceJoinTop"),
+    binanceJoinBottom: $("binanceJoinBottom")
   };
 
-  // Wire affiliate links if present
+  // set affiliate links if present
   if (els.binanceJoinTop) els.binanceJoinTop.href = BINANCE_JOIN_URL;
   if (els.binanceJoinBottom) els.binanceJoinBottom.href = BINANCE_JOIN_URL;
 
-  // ─────────────────────────────────────────────────────────────
-  // Formatters
-  // ─────────────────────────────────────────────────────────────
-  const fmtEUR = new Intl.NumberFormat("fr-FR", {
-    style: "currency",
-    currency: "EUR",
-    maximumFractionDigits: 2,
-  });
+  // ---- formatters
+  const fmtEUR = new Intl.NumberFormat("fr-FR", { style:"currency", currency:"EUR", maximumFractionDigits: 2 });
+  const fmtPct = new Intl.NumberFormat("fr-FR", { maximumFractionDigits: 2 });
 
-  const fmtPct = new Intl.NumberFormat("fr-FR", {
-    maximumFractionDigits: 2,
-  });
-
-  const fmtInt = new Intl.NumberFormat("fr-FR", {
-    maximumFractionDigits: 0,
-  });
-
-  // ─────────────────────────────────────────────────────────────
-  // State
-  // ─────────────────────────────────────────────────────────────
+  // ---- state
   const state = {
-    raw: [],         // assets from API
-    view: [],        // filtered+sorted slice
-    timer: null,     // auto refresh interval
-    meta: { updated: null, source: "—" },
-    lastOk: null,
+    raw: [],
+    timer: null,
+    meta: { updated: null, source: "—" }
   };
 
-  // ─────────────────────────────────────────────────────────────
-  // Helpers
-  // ─────────────────────────────────────────────────────────────
+  function setDot(ok, mode = "idle") {
+    // mode: idle | loading | ok | bad
+    if (!els.dot) return;
+    if (mode === "loading") {
+      els.dot.style.background = "var(--warn)";
+      els.dot.style.boxShadow = "0 0 0 4px rgba(255,204,102,.12)";
+      return;
+    }
+    if (mode === "bad") {
+      els.dot.style.background = "var(--bad)";
+      els.dot.style.boxShadow = "0 0 0 4px rgba(255,90,90,.12)";
+      return;
+    }
+    if (ok) {
+      els.dot.style.background = "var(--good)";
+      els.dot.style.boxShadow = "0 0 0 4px rgba(56,209,122,.12)";
+    } else {
+      els.dot.style.background = "rgba(255,255,255,.35)";
+      els.dot.style.boxShadow = "0 0 0 4px rgba(255,255,255,.06)";
+    }
+  }
+
+  function setStatus(ok, text, meta, note = "") {
+    if (els.statusText) els.statusText.textContent = text || (ok ? "OK" : "Erreur");
+    if (els.statusNote) els.statusNote.textContent = note || "";
+    if (els.source) els.source.textContent = (meta && meta.source) ? meta.source : "—";
+    if (els.updated) {
+      if (meta && meta.updated) {
+        els.updated.textContent = new Date(meta.updated).toLocaleTimeString("fr-FR");
+      } else {
+        els.updated.textContent = "—";
+      }
+    }
+    setDot(!!ok, ok ? "ok" : "bad");
+  }
+
   function safeNum(x, fallback = 0) {
     const n = Number(x);
     return Number.isFinite(n) ? n : fallback;
   }
 
-  function escapeHtml(str) {
-    return String(str ?? "")
+  function escapeHtml(s) {
+    return String(s ?? "")
       .replaceAll("&", "&amp;")
       .replaceAll("<", "&lt;")
       .replaceAll(">", "&gt;")
@@ -100,409 +103,255 @@
       .replaceAll("'", "&#039;");
   }
 
-  function classForPct(v) {
-    const n = safeNum(v, 0);
-    if (n > 0) return "positive";
-    if (n < 0) return "negative";
-    return "neutral";
-  }
-
-  function fmtTimeFR(ms) {
-    if (!ms) return "—";
-    try {
-      return new Date(ms).toLocaleTimeString("fr-FR", { hour12: false });
-    } catch {
-      return "—";
+  function getRebuildToken() {
+    // localStorage as single source of truth
+    const v = (els.rebuildToken?.value || "").trim();
+    if (v) {
+      localStorage.setItem("zilkara_rebuild_token", v);
+      return v;
     }
+    return (localStorage.getItem("zilkara_rebuild_token") || "").trim();
   }
 
-  function setStatus(ok, text, meta = state.meta) {
-    state.lastOk = ok;
-
-    if (els.statusText) els.statusText.textContent = text || (ok ? "OK" : "Erreur");
-    if (els.source) els.source.textContent = meta?.source ?? "—";
-    if (els.updated) els.updated.textContent = meta?.updated ? fmtTimeFR(meta.updated) : "—";
-
-    if (els.dot) {
-      if (ok) {
-        els.dot.style.background = "var(--good, #38d17a)";
-        els.dot.style.boxShadow = "0 0 8px rgba(56,209,122,.25)";
-      } else {
-        els.dot.style.background = "var(--bad, #ff5a3a)";
-        els.dot.style.boxShadow = "0 0 8px rgba(255,90,58,.25)";
-      }
-    }
-
-    // Optional hint text (keep minimal)
-    if (els.hint) {
-      if (!ok) els.hint.textContent = "Problème de récupération des données.";
-      else els.hint.textContent = "";
-    }
+  function initTokenField() {
+    if (!els.rebuildToken) return;
+    const saved = (localStorage.getItem("zilkara_rebuild_token") || "").trim();
+    if (saved) els.rebuildToken.value = saved;
   }
 
-  function getSignalMinFromPreset() {
-    // UI can be a preset select with values like: 0, 10, 30, 40, 60, 120 etc.
-    const v = els.signalPreset ? els.signalPreset.value : "";
-    const n = safeNum(v, 0);
-
-    // If user uses "Large (≥ 40)" etc, we map if string contains digits
-    if (!Number.isFinite(n) || n === 0) {
-      const m = String(v).match(/(\d+)/);
-      return m ? safeNum(m[1], 0) : 0;
-    }
-    // clamp 0-100 for stability_score scale (0-100)
-    return Math.max(0, Math.min(100, n));
+  function getPrefs() {
+    const signalMin = safeNum(els.signalPreset?.value, 0);
+    const limit = safeNum(els.limit?.value, 50);
+    const sortBy = (els.sortBy?.value || "stability_score");
+    const sortDir = (els.sortDir?.value || "desc");
+    const stableMode = (els.stableMode?.value || "hide");
+    return { signalMin, limit, sortBy, sortDir, stableMode };
   }
 
-  function shouldHideStables() {
-    // checkbox default checked in your screenshots
-    if (!els.hideStables) return false;
-    // checkbox OR select
-    if (els.hideStables.type === "checkbox") return !!els.hideStables.checked;
-    // if it's a select like "on/off"
-    return String(els.hideStables.value).toLowerCase() === "on" ||
-           String(els.hideStables.value).toLowerCase() === "true" ||
-           String(els.hideStables.value).toLowerCase() === "1";
+  function buildTradeUrl(symbol) {
+    // Binance spot URL pattern: /trade/SYMBOL_USDT (simple)
+    const sym = String(symbol || "").toUpperCase();
+    if (!sym || STABLES.has(sym)) return null;
+
+    // Prefer USDT quote for most assets
+    const pair = `${sym}_USDT`;
+    return `${BINANCE_TRADE_BASE}${encodeURIComponent(pair)}`;
   }
 
-  function getSort() {
-    const key = els.sortBy ? els.sortBy.value : "stability_score";
-    const dir = els.sortDir ? els.sortDir.value : "desc";
-    return { key, dir };
+  function computeSignal(a) {
+    // If backend already provides signal, use it; else derive a proxy using multi-horizon momentum + stability.
+    if (Number.isFinite(Number(a.signal))) return safeNum(a.signal, 0);
+
+    const s = safeNum(a.stability_score, 0);
+    const p24 = safeNum(a.chg_24h_pct, 0);
+    const p7 = safeNum(a.chg_7d_pct, 0);
+    const p30 = safeNum(a.chg_30d_pct, 0);
+
+    // proxy: stability weights + momentum (clamped)
+    const mom = Math.max(-20, Math.min(20, (p24 * 0.45) + (p7 * 0.35) + (p30 * 0.20)));
+    const base = (s * 0.75) + ((mom + 20) * 1.25); // mom -> 0..50, stability -> 0..75
+    return Math.max(0, Math.min(100, Math.round(base)));
   }
 
-  function getLimit() {
-    const v = els.limit ? els.limit.value : "50";
-    const n = safeNum(v, 50);
-    return Math.max(1, Math.min(500, n));
-  }
+  function sortAssets(list, sortBy, sortDir) {
+    const dir = (sortDir === "asc") ? 1 : -1;
+    const key = sortBy;
 
-  function normalizeAsset(a) {
-    // expected from /api/state:
-    // symbol, name, price, chg_24h_pct, chg_7d_pct, chg_30d_pct,
-    // stability_score, rating, regime, similarity, rupture_rate, reason
-    const symbol = String(a?.symbol ?? "").toUpperCase().trim();
-    const name = String(a?.name ?? "").trim();
-
-    return {
-      symbol,
-      name,
-      price: safeNum(a?.price, 0),
-      chg_24h_pct: safeNum(a?.chg_24h_pct, 0),
-      chg_7d_pct: safeNum(a?.chg_7d_pct, 0),
-      chg_30d_pct: safeNum(a?.chg_30d_pct, 0),
-      stability_score: safeNum(a?.stability_score, 0),
-      rating: String(a?.rating ?? "").trim(),
-      regime: String(a?.regime ?? "").trim(), // STABLE/TRANSITION/CHAOTIC
-      similarity: safeNum(a?.similarity, 0),
-      rupture_rate: safeNum(a?.rupture_rate, 0),
-      reason: String(a?.reason ?? "").trim(),
+    const get = (o) => {
+      if (key === "name") return String(o.name || "");
+      if (key === "signal") return computeSignal(o);
+      return safeNum(o[key], -1e18);
     };
-  }
 
-  function compare(a, b, key, dir) {
-    const mul = dir === "asc" ? 1 : -1;
+    return [...list].sort((a, b) => {
+      const va = get(a);
+      const vb = get(b);
 
-    const av = a[key];
-    const bv = b[key];
-
-    // numbers
-    if (typeof av === "number" && typeof bv === "number") {
-      if (av < bv) return -1 * mul;
-      if (av > bv) return  1 * mul;
-      return 0;
-    }
-
-    // strings
-    const as = String(av ?? "");
-    const bs = String(bv ?? "");
-    return as.localeCompare(bs, "fr", { sensitivity: "base" }) * mul;
-  }
-
-  function computeView() {
-    const minSignal = getSignalMinFromPreset();
-    const hideStables = shouldHideStables();
-    const { key, dir } = getSort();
-    const limit = getLimit();
-
-    let arr = state.raw.map(normalizeAsset);
-
-    // Filter stablecoins (by symbol)
-    if (hideStables) {
-      arr = arr.filter((a) => !STABLES.has(a.symbol));
-    }
-
-    // Filter by stability_score threshold (Signal in Zilkara now maps to stability_score)
-    if (minSignal > 0) {
-      arr = arr.filter((a) => a.stability_score >= minSignal);
-    }
-
-    // Sort
-    // Default: stability_score desc
-    const sortKey = key || "stability_score";
-    const sortDir = dir || "desc";
-
-    arr.sort((a, b) => {
-      // force stable sort tie-breakers
-      const primary = compare(a, b, sortKey, sortDir);
-      if (primary !== 0) return primary;
-
-      // tie-breaker: higher stability_score first
-      const t1 = compare(a, b, "stability_score", "desc");
-      if (t1 !== 0) return t1;
-
-      // then by symbol
-      return compare(a, b, "symbol", "asc");
+      if (typeof va === "string" || typeof vb === "string") {
+        return dir * String(va).localeCompare(String(vb), "fr", { sensitivity:"base" });
+      }
+      if (va === vb) return 0;
+      return dir * (va > vb ? 1 : -1);
     });
-
-    state.view = arr.slice(0, limit);
   }
 
-  function makeTradeUrl(symbol) {
-    // Binance uses pairs like BTC_USDT, but you can point to search.
-    // Keep it simple: trade page with query
-    // Alternatively: `${BINANCE_TRADE_BASE}${symbol}_USDT`
-    return `${BINANCE_TRADE_BASE}${encodeURIComponent(symbol)}_USDT`;
+  function filterAssets(raw, prefs) {
+    const { signalMin, stableMode } = prefs;
+
+    let list = raw.map(x => ({ ...x, signal: computeSignal(x) }));
+
+    if (stableMode === "hide") {
+      list = list.filter(a => !STABLES.has(String(a.symbol || "").toUpperCase()));
+    }
+
+    if (signalMin > 0) {
+      list = list.filter(a => safeNum(a.signal, 0) >= signalMin);
+    }
+
+    return list;
   }
 
-  // ─────────────────────────────────────────────────────────────
-  // Rendering
-  // ─────────────────────────────────────────────────────────────
-  function render() {
-    computeView();
+  function pctClass(v) {
+    const n = safeNum(v, 0);
+    return n >= 0 ? "pct pos" : "pct neg";
+  }
 
-    if (!els.tableBody) return;
+  function renderTable(raw) {
+    const prefs = getPrefs();
+    let list = filterAssets(raw, prefs);
+    list = sortAssets(list, prefs.sortBy, prefs.sortDir);
+    list = list.slice(0, prefs.limit);
 
-    const rows = state.view.map((a) => {
-      const sym = escapeHtml(a.symbol);
-      const nm = escapeHtml(a.name);
+    const rows = list.map(a => {
+      const sym = escapeHtml((a.symbol || "").toUpperCase());
+      const name = escapeHtml(a.name || "");
+      const price = safeNum(a.price, 0);
+      const p24 = safeNum(a.chg_24h_pct, 0);
+      const p7 = safeNum(a.chg_7d_pct, 0);
+      const p30 = safeNum(a.chg_30d_pct, 0);
 
-      const price = fmtEUR.format(a.price);
-      const p24 = fmtPct.format(a.chg_24h_pct) + " %";
-      const p7  = fmtPct.format(a.chg_7d_pct) + " %";
-      const p30 = fmtPct.format(a.chg_30d_pct) + " %";
-
-      const score = fmtInt.format(a.stability_score);
+      const stability = Math.round(safeNum(a.stability_score, 0));
       const rating = escapeHtml(a.rating || "—");
-      const regime = escapeHtml(a.regime || "—");
-      const sim = fmtPct.format(a.similarity) + " %";
-      const rr = fmtPct.format(a.rupture_rate);
-
+      const regime = String(a.regime || "—").toUpperCase();
+      const rupture = safeNum(a.rupture_rate, 0);
+      const similarity = safeNum(a.similarity, 0);
       const reason = escapeHtml(a.reason || "");
 
-      // Optional trade link per row
-      const tradeUrl = makeTradeUrl(a.symbol);
+      const tradeUrl = buildTradeUrl(sym);
+      const tradeBtn = tradeUrl
+        ? `<a class="badge" href="${tradeUrl}" target="_blank" rel="nofollow noopener">Trader</a>`
+        : `<span class="badge" style="opacity:.45">—</span>`;
+
+      const regimeClass = (regime === "STABLE" || regime === "TRANSITION" || regime === "CHAOTIC") ? regime : "";
 
       return `
         <tr>
-          <td class="col-asset">
-            <div class="assetCell">
-              <div class="assetTop">
-                <span class="symbol">${sym}</span>
-                <span class="name">${nm}</span>
-              </div>
-              <div class="assetBottom">
-                <a class="tradeLink" href="${tradeUrl}" target="_blank" rel="noopener noreferrer">
-                  Trader sur Binance
-                </a>
-              </div>
-            </div>
+          <td>
+            <div class="sym">${sym}</div>
+            <div class="name">${name}</div>
           </td>
 
-          <td class="col-num">${price}</td>
+          <td class="num">${fmtEUR.format(price)}</td>
+          <td class="num ${pctClass(p24)}">${fmtPct.format(p24)} %</td>
+          <td class="num ${pctClass(p7)}">${fmtPct.format(p7)} %</td>
+          <td class="num ${pctClass(p30)}">${fmtPct.format(p30)} %</td>
 
-          <td class="col-num ${classForPct(a.chg_24h_pct)}">${p24}</td>
-          <td class="col-num ${classForPct(a.chg_7d_pct)}">${p7}</td>
-          <td class="col-num ${classForPct(a.chg_30d_pct)}">${p30}</td>
+          <td class="num"><span class="badge">${stability}</span></td>
+          <td class="num"><span class="badge">${rating}</span></td>
+          <td class="num"><span class="reg ${regimeClass}">${escapeHtml(regime)}</span></td>
+          <td class="num">${fmtPct.format(rupture)}</td>
+          <td class="num">${fmtPct.format(similarity)} %</td>
+          <td class="reason" title="${reason}">${reason}</td>
 
-          <td class="col-num">
-            <span class="scorePill">${score}</span>
-          </td>
-
-          <td class="col-center">
-            <span class="ratingPill rating-${rating}">${rating}</span>
-          </td>
-
-          <td class="col-center">
-            <span class="regimePill regime-${regime}">${regime}</span>
-          </td>
-
-          <td class="col-num">${sim}</td>
-          <td class="col-num">${rr}</td>
-
-          <td class="col-reason" title="${reason}">${reason}</td>
+          <td>${tradeBtn}</td>
         </tr>
       `;
     }).join("");
 
-    els.tableBody.innerHTML = rows || `
-      <tr>
-        <td colspan="10" style="padding:16px; opacity:.8;">
-          Aucun résultat (filtre trop strict ou données absentes).
-        </td>
-      </tr>
-    `;
-
-    // Update status from meta
-    setStatus(true, "OK", state.meta);
+    els.tableBody.innerHTML = rows || `<tr><td colspan="12" style="padding:18px;color:rgba(255,255,255,.55)">Aucune donnée.</td></tr>`;
   }
 
-  // ─────────────────────────────────────────────────────────────
-  // API Calls
-  // ─────────────────────────────────────────────────────────────
   async function fetchState() {
-    const limit = getLimit();
-    const url = `/api/state?limit=${encodeURIComponent(limit)}`;
+    setDot(true, "loading");
+    setStatus(true, "Chargement…", state.meta, "Lecture de /api/state (KV).");
 
+    const prefs = getPrefs();
+    const url = `/api/state?limit=${encodeURIComponent(prefs.limit)}&_=${Date.now()}`;
+
+    let json;
     try {
-      setStatus(true, "Chargement…", state.meta);
-
-      const res = await fetch(url, {
-        cache: "no-store",
-        headers: { "Accept": "application/json" }
-      });
-
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-
-      const json = await res.json();
-
-      // Defensive parsing
-      const assets = Array.isArray(json.assets) ? json.assets : [];
-      state.raw = assets;
-
-      state.meta = {
-        updated: json.updated ?? null,
-        source: json.source ?? "—"
-      };
-
-      // If assets empty but ok true, still render to show empty-state
-      render();
-      return json;
-    } catch (err) {
-      console.error("fetchState error:", err);
-      state.raw = [];
-      state.meta = state.meta || { updated: null, source: "—" };
-      setStatus(false, "Erreur", state.meta);
-
-      if (els.tableBody) {
-        els.tableBody.innerHTML = `
-          <tr>
-            <td colspan="10" style="padding:16px;">
-              Erreur de récupération des données.
-            </td>
-          </tr>
-        `;
-      }
-      throw err;
+      const res = await fetch(url, { cache: "no-store" });
+      json = await res.json();
+    } catch (e) {
+      setStatus(false, "Erreur", state.meta, "Échec réseau vers /api/state.");
+      return;
     }
+
+    if (!json || json.ok !== true) {
+      const err = json?.error ? String(json.error) : "Réponse invalide";
+      setStatus(false, "Erreur", state.meta, err);
+      return;
+    }
+
+    state.raw = Array.isArray(json.assets) ? json.assets : [];
+    state.meta = { updated: json.updated ?? null, source: json.source ?? "—" };
+
+    renderTable(state.raw);
+    setStatus(true, "OK", state.meta, "");
   }
 
   async function rebuildCache() {
-    // Your backend endpoint may differ: /api/rebuild or /api/rebuild-cache
-    // Try common ones:
-    const candidates = ["/api/rebuild", "/api/rebuild-cache", "/api/rebuildCache"];
-    let lastErr = null;
-
-    for (const url of candidates) {
-      try {
-        setStatus(true, "Rebuild…", state.meta);
-        const res = await fetch(url, { method: "POST" });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        // after rebuild, refresh
-        await fetchState();
-        return;
-      } catch (e) {
-        lastErr = e;
-      }
+    const token = getRebuildToken();
+    if (!token) {
+      setStatus(false, "Erreur", state.meta, "Token rebuild absent (Avancé).");
+      return;
     }
 
-    console.error("rebuildCache failed:", lastErr);
-    setStatus(false, "Rebuild KO", state.meta);
-  }
+    setDot(true, "loading");
+    setStatus(true, "Rebuild…", state.meta, "Exécution /api/rebuild (KV write).");
 
-  // ─────────────────────────────────────────────────────────────
-  // Auto refresh
-  // ─────────────────────────────────────────────────────────────
-  function stopAutoRefresh() {
-    if (state.timer) {
-      clearInterval(state.timer);
-      state.timer = null;
-    }
-  }
+    const prefs = getPrefs();
 
-  function startAutoRefresh() {
-    stopAutoRefresh();
+    // token en header (meilleur) + query (fallback)
+    const url = `/api/rebuild?limit=${encodeURIComponent(prefs.limit)}&token=${encodeURIComponent(token)}&_=${Date.now()}`;
 
-    const v = els.autoRefresh ? els.autoRefresh.value : "0";
-    const seconds = safeNum(v, 0);
-
-    if (!seconds || seconds <= 0) return;
-
-    state.timer = setInterval(() => {
-      fetchState().catch(() => {});
-    }, seconds * 1000);
-  }
-
-  // ─────────────────────────────────────────────────────────────
-  // Events
-  // ─────────────────────────────────────────────────────────────
-  function bindEvents() {
-    if (els.btnRefresh) {
-      els.btnRefresh.addEventListener("click", () => {
-        fetchState().catch(() => {});
-      });
-    }
-
-    if (els.btnRebuild) {
-      els.btnRebuild.addEventListener("click", () => {
-        rebuildCache().catch(() => {});
-      });
-    }
-
-    // Control changes -> re-render locally (no refetch needed except limit if you want)
-    const rerenderOnly = [els.signalPreset, els.sortBy, els.sortDir, els.hideStables]
-      .filter(Boolean);
-
-    for (const el of rerenderOnly) {
-      el.addEventListener("change", () => {
-        render();
-      });
-    }
-
-    // Limit changes: fetch again (because backend can limit + it’s consistent)
-    if (els.limit) {
-      els.limit.addEventListener("change", () => {
-        fetchState().catch(() => {});
-      });
-    }
-
-    // Auto refresh changes
-    if (els.autoRefresh) {
-      els.autoRefresh.addEventListener("change", () => {
-        startAutoRefresh();
-      });
-    }
-  }
-
-  // ─────────────────────────────────────────────────────────────
-  // Init
-  // ─────────────────────────────────────────────────────────────
-  async function init() {
-    bindEvents();
-
-    // Initial status
-    setStatus(true, "Prêt", state.meta);
-
-    // First load + render
+    let json;
     try {
-      await fetchState();
-    } catch {
-      // already handled in fetchState
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "x-zilkara-token": token
+        },
+        cache: "no-store"
+      });
+      json = await res.json();
+    } catch (e) {
+      setStatus(false, "Erreur", state.meta, "Échec réseau vers /api/rebuild.");
+      return;
     }
 
-    // Start auto refresh if enabled
-    startAutoRefresh();
+    if (!json || json.ok !== true) {
+      const err = json?.error ? String(json.error) : "Rebuild échoué";
+      setStatus(false, "Erreur", state.meta, err);
+      return;
+    }
+
+    // Re-read state after rebuild
+    await fetchState();
   }
 
-  document.addEventListener("DOMContentLoaded", init);
+  function applyAutoRefresh() {
+    const sec = safeNum(els.autoRefresh?.value, 0);
+    if (state.timer) clearInterval(state.timer);
+    state.timer = null;
+
+    if (sec > 0) {
+      state.timer = setInterval(fetchState, sec * 1000);
+    }
+  }
+
+  function bind() {
+    els.btnRefresh?.addEventListener("click", fetchState);
+    els.btnRebuild?.addEventListener("click", rebuildCache);
+
+    const onChange = () => {
+      applyAutoRefresh();
+      renderTable(state.raw);
+    };
+
+    els.signalPreset?.addEventListener("change", onChange);
+    els.autoRefresh?.addEventListener("change", onChange);
+    els.sortBy?.addEventListener("change", onChange);
+    els.sortDir?.addEventListener("change", onChange);
+    els.limit?.addEventListener("change", onChange);
+    els.stableMode?.addEventListener("change", onChange);
+
+    els.rebuildToken?.addEventListener("change", () => getRebuildToken());
+  }
+
+  // init
+  initTokenField();
+  bind();
+  applyAutoRefresh();
+  fetchState();
 })();

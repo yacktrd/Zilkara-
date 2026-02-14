@@ -1,80 +1,90 @@
-import fs from "fs";
-import path from "path";
+// /api/market.js
+// Source: CoinGecko markets (EUR)
+// Cache: mémoire (warm) + TTL pour performance
 
-const CACHE_DIR = "/tmp/cache";
-const CACHE_FILE = path.join(CACHE_DIR, "market.json");
+let CACHE = {
+  ts: 0,
+  payload: null
+};
 
-async function fetchFresh() {
-  const res = await fetch(
-    "https://api.coingecko.com/api/v3/coins/markets?vs_currency=eur&order=market_cap_desc&per_page=250&page=1"
-  );
+const TTL_MS = 60_000; // 60s
 
-  const data = await res.json();
+function clamp(n, a, b){
+  n = Number(n);
+  if (!Number.isFinite(n)) return a;
+  return Math.max(a, Math.min(b, n));
+}
 
-  const assets = data.map(asset => ({
-    symbol: asset.symbol.toUpperCase(),
-    name: asset.name,
-    price: asset.current_price,
-    change24h: asset.price_change_percentage_24h,
-    volume24h: asset.total_volume,
-    marketCap: asset.market_cap,
-    signal: Math.min(
-      100,
-      Math.round(
-        (Math.log10(asset.market_cap || 1) * 10) +
-        Math.abs(asset.price_change_percentage_24h || 0)
-      )
-    )
-  }));
+function computeSignal({ marketCap, volume24h, change24h }) {
+  // Signal MVP (0–100) = synthèse taille + liquidité + mouvement
+  // (volontairement non-prédictif / non-propriétaire)
+  const mc = Math.max(1, Number(marketCap || 0));
+  const vol = Math.max(1, Number(volume24h || 0));
+  const ch = Math.abs(Number(change24h || 0));
 
-  if (!fs.existsSync(CACHE_DIR))
-    fs.mkdirSync(CACHE_DIR, { recursive: true });
+  const sizeScore = clamp((Math.log10(mc) - 6) * 8, 0, 55);
+  const volScore  = clamp((Math.log10(vol) - 5) * 7, 0, 30);
+  const momScore  = clamp(ch * 1.2, 0, 15);
 
-  fs.writeFileSync(
-    CACHE_FILE,
-    JSON.stringify({
-      assets,
-      updated: Date.now()
-    })
-  );
+  return clamp(Math.round(sizeScore + volScore + momScore), 0, 100);
+}
 
-  return assets;
+async function fetchCoinGecko() {
+  const url =
+    "https://api.coingecko.com/api/v3/coins/markets" +
+    "?vs_currency=eur&order=market_cap_desc&per_page=250&page=1" +
+    "&sparkline=false&price_change_percentage=24h";
+
+  const r = await fetch(url, { headers: { "accept":"application/json" } });
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(`CoinGecko ${r.status}: ${t}`);
+  }
+  return r.json();
 }
 
 export default async function handler(req, res) {
   try {
-
-    let assets = [];
-    let source = "cache";
-
-    if (fs.existsSync(CACHE_FILE)) {
-
-      const raw = fs.readFileSync(CACHE_FILE, "utf8");
-      const data = JSON.parse(raw);
-      assets = data.assets || [];
-
-    } else {
-
-      assets = await fetchFresh();
-      source = "fresh";
-
-    }
-
     res.setHeader("Cache-Control", "no-store");
 
-    return res.json({
+    const now = Date.now();
+    if (CACHE.payload && (now - CACHE.ts) < TTL_MS) {
+      return res.status(200).json({ ...CACHE.payload, source: "cache_mem" });
+    }
+
+    const data = await fetchCoinGecko();
+
+    const assets = data.map((a, idx) => {
+      const marketCap = Number(a.market_cap || 0);
+      const volume24h = Number(a.total_volume || 0);
+      const change24h = Number(a.price_change_percentage_24h || 0);
+
+      const signal = computeSignal({ marketCap, volume24h, change24h });
+
+      return {
+        rank: idx + 1,
+        id: a.id,
+        symbol: String(a.symbol || "").toUpperCase(),
+        name: String(a.name || ""),
+        image: a.image || "",
+        price: Number(a.current_price || 0),
+        change24h,
+        volume24h,
+        marketCap,
+        signal
+      };
+    });
+
+    const payload = {
       ok: true,
-      count: assets.length,
-      assets,
-      source
-    });
+      updated: now,
+      assets
+    };
 
+    CACHE = { ts: now, payload };
+
+    return res.status(200).json({ ...payload, source: "coingecko" });
   } catch (e) {
-
-    return res.status(500).json({
-      ok: false,
-      error: e.message
-    });
-
+    return res.status(500).json({ ok:false, error: String(e?.message || e) });
   }
 }

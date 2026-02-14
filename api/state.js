@@ -1,41 +1,66 @@
 import fs from "fs";
 import path from "path";
 
-export default function handler(req, res) {
+const KV_URL = process.env.KV_REST_API_URL;
+const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 
+async function getFromKV() {
   try {
+    const res = await fetch(`${KV_URL}/get/cache`, {
+      headers: {
+        Authorization: `Bearer ${KV_TOKEN}`
+      }
+    });
 
-    const filePath = path.join(process.cwd(), "data", "assets.json");
+    const data = await res.json();
 
-    if (!fs.existsSync(filePath)) {
-
-      return res.status(200).json({
-        ok: true,
-        assets: [],
-        updated: null,
-        source: "empty"
-      });
-
+    if (data.result) {
+      return JSON.parse(data.result);
     }
 
-    const raw = fs.readFileSync(filePath, "utf8");
-    const json = JSON.parse(raw);
+    return null;
 
-    return res.status(200).json({
-      ok: true,
-      assets: json.assets || [],
-      updated: json.updated || null,
-      source: "file"
-    });
-
-  } catch (err) {
-
-    return res.status(500).json({
-      ok: false,
-      error: err.message
-    });
-
+  } catch {
+    return null;
   }
-
 }
 
+function getFromFile() {
+  try {
+    const filePath = path.join(process.cwd(), "data", "cache.json");
+    const raw = fs.readFileSync(filePath, "utf-8");
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+export default async function handler(req, res) {
+
+  // PRIORITÉ KV
+  const kv = await getFromKV();
+
+  if (kv) {
+    return res.status(200).json({
+      ok: true,
+      ...kv,
+      source: "kv"
+    });
+  }
+
+  // fallback file
+  const file = getFromFile();
+
+  if (file) {
+    return res.status(200).json({
+      ok: true,
+      ...file,
+      source: "file"
+    });
+  }
+
+  return res.status(500).json({
+    ok: false,
+    error: "no data available"
+  });
+}
