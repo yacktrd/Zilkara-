@@ -14,19 +14,19 @@ export default function Home() {
 
   return (
     <main style={{
-      background:"#0a0a0a",
-      color:"#fff",
+      background:"#0b0f17",
+      color:"#ffffff",
       minHeight:"100vh",
       padding:"40px",
       fontFamily:"system-ui"
     }}>
       <h1>Zilkara</h1>
 
-      <p>Market Scanner Core Engine</p>
+      <p>Core engine online</p>
 
       {state && (
         <div style={{marginTop:"20px"}}>
-          <div>Status: OK</div>
+          <div>Status: {state.ok ? "ONLINE" : "OFFLINE"}</div>
           <div>Timestamp: {state.ts}</div>
         </div>
       )}
