@@ -1,15 +1,13 @@
 {
   "name": "zilkara",
-  "version": "1.0.0",
-  "description": "Zilkara Market Scanner",
-  "main": "server.js",
-  "type": "commonjs",
+  "private": true,
+  "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "dev": "vercel dev",
+    "start": "vercel dev",
+    "lint": "node -e \"console.log('ok')\""
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "compression": "^1.7.4",
-    "helmet": "^7.0.0"
+    "@vercel/kv": "^3.0.0"
   }
 }
