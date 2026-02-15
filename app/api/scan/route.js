@@ -1,102 +1,192 @@
-import fs from "fs";
-import path from "path";
+// app/api/scan/route.js
+import { NextResponse } from "next/server";
+import { Redis } from "@upstash/redis";
 
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
+// ✅ IMPORTANT : ne pas mettre runtime="edge" ici si tu as eu des soucis d'env vars.
+// Next Node runtime par défaut = OK.
 
-/**
- * Cache in-memory (par instance)
- * NOTE: sur Vercel serverless, ça tient tant que l'instance vit.
- */
-const CACHE_KEY = "scan_v1";
-const TTL_MS = 30_000; // 30s (tu pourras passer à 60s ensuite)
+const CACHE_S_MAXAGE = 30;               // cache CDN 30s
+const CACHE_SWR = 120;                   // stale-while-revalidate 2 min
+const RATE_LIMIT_WINDOW_MS = 60_000;     // 60s
+const RATE_LIMIT_MAX = 60;               // 60 req/min/IP
 
-function now() {
-  return Date.now();
-}
-
-function ok(data) {
-  return Response.json(
-    { ok: true, ts: now(), data },
-    {
-      status: 200,
-      headers: {
-        "Cache-Control": `public, max-age=0, s-maxage=${Math.floor(TTL_MS / 1000)}, stale-while-revalidate=30`,
-      },
-    }
-  );
-}
-
-function fail(code, message, status = 500) {
-  return Response.json(
-    { ok: false, ts: now(), data: [], error: { code, message } },
+function json(ok, payload, status = 200) {
+  const res = NextResponse.json(
+    { ok, ts: Date.now(), ...payload },
     { status }
   );
+  // Cache CDN Vercel (simple, efficace, sans dépendances)
+  res.headers.set(
+    "Cache-Control",
+    `s-maxage=${CACHE_S_MAXAGE}, stale-while-revalidate=${CACHE_SWR}`
+  );
+  return res;
 }
 
-function getCache() {
-  const g = globalThis;
-  g.__ZILKARA_CACHE__ ||= {};
-  const entry = g.__ZILKARA_CACHE__[CACHE_KEY];
-  if (!entry) return null;
-  if (entry.exp < now()) return null;
-  return entry.value;
+function getIp(req) {
+  // Vercel / proxies
+  const xff = req.headers.get("x-forwarded-for");
+  if (xff) return xff.split(",")[0].trim();
+  return req.headers.get("x-real-ip") || "unknown";
 }
 
-function setCache(value) {
-  const g = globalThis;
-  g.__ZILKARA_CACHE__ ||= {};
-  g.__ZILKARA_CACHE__[CACHE_KEY] = {
-    exp: now() + TTL_MS,
-    value,
+function safeNumber(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function normalizeAsset(a) {
+  // Ne casse pas si certains champs manquent
+  return {
+    asset: a.asset ?? a.symbol ?? null,
+    symbol: a.symbol ?? a.asset ?? null,
+
+    price: safeNumber(a.price),
+
+    chg_24h_pct: safeNumber(a.chg_24h_pct ?? a.change24h),
+    chg_7d_pct: safeNumber(a.chg_7d_pct ?? a.change7d),
+    chg_30d_pct: safeNumber(a.chg_30d_pct ?? a.change30d),
+
+    stability_score: safeNumber(a.stability_score ?? a.score ?? a.stability),
+    rating: a.rating ?? null,
+    regime: a.regime ?? null,
+
+    rupture_rate: safeNumber(a.rupture_rate),
+    similarity: safeNumber(a.similarity),
+
+    reason: a.reason ?? null,
   };
 }
 
-export async function GET() {
-  const t0 = now();
+function buildBinanceUrl(symbol, refCode) {
+  // Pair simple USDT pour MVP (tu pourras étendre plus tard)
+  if (!symbol) return null;
+  const pair = `${symbol.toUpperCase()}_USDT`;
+  // Ref code Binance fourni par toi
+  return `https://www.binance.com/en/trade/${pair}?type=spot&ref=${encodeURIComponent(
+    refCode || ""
+  )}`;
+}
 
+export async function GET(req) {
   try {
-    // 1) cache hit
-    const cached = getCache();
-    if (cached) {
-      console.log(`[scan] HIT ${cached.length} items (${now() - t0}ms)`);
-      return ok(cached);
+    // 0) Env vars KV
+    const url = process.env.KV_REST_API_URL;
+    const token = process.env.KV_REST_API_TOKEN;
+
+    if (!url || !token) {
+      return json(
+        false,
+        {
+          data: [],
+          error: {
+            code: "KV_MISSING",
+            message:
+              "KV_REST_API_URL or KV_REST_API_TOKEN missing on Vercel (Production).",
+          },
+        },
+        500
+      );
     }
 
-    // 2) lire ton fichier local (ou ta source actuelle)
-    const filePath = path.join(process.cwd(), "data", "assets.json");
+    const redis = new Redis({ url, token });
 
-    if (!fs.existsSync(filePath)) {
-      console.log(`[scan] ERROR missing file: ${filePath}`);
-      return fail("ASSETS_MISSING", "assets.json introuvable", 500);
+    // 1) Rate limit (clé par IP)
+    const ip = getIp(req);
+    const rlKey = `rl:scan:${ip}`;
+
+    // incr + expire window
+    const count = await redis.incr(rlKey);
+    if (count === 1) await redis.pexpire(rlKey, RATE_LIMIT_WINDOW_MS);
+
+    const remaining = Math.max(0, RATE_LIMIT_MAX - count);
+    const resetAt = Date.now() + RATE_LIMIT_WINDOW_MS;
+
+    if (count > RATE_LIMIT_MAX) {
+      const res = json(
+        false,
+        {
+          data: [],
+          error: {
+            code: "RATE_LIMIT",
+            message: "Too many requests. Please retry in ~60 seconds.",
+          },
+        },
+        429
+      );
+      res.headers.set("X-RateLimit-Remaining", String(remaining));
+      res.headers.set("X-RateLimit-Reset", String(resetAt));
+      return res;
     }
 
-    const raw = fs.readFileSync(filePath, "utf8");
+    // 2) Lire le payload KV
+    const payload = await redis.get("assets_payload");
 
-    let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      console.log(`[scan] ERROR invalid JSON`);
-      return fail("ASSETS_INVALID_JSON", "assets.json invalide", 500);
+    if (!payload || typeof payload !== "object") {
+      const res = json(
+        false,
+        {
+          data: [],
+          error: {
+            code: "CACHE_MISSING",
+            message:
+              "Cache is empty. Call POST /api/rebuild (with token) to generate assets_payload.",
+          },
+        },
+        503
+      );
+      res.headers.set("X-RateLimit-Remaining", String(remaining));
+      res.headers.set("X-RateLimit-Reset", String(resetAt));
+      return res;
     }
 
-    // Ton fichier peut être { assets: [...] } ou directement [...]
-    const assets = Array.isArray(parsed) ? parsed : (parsed.assets || []);
+    const assets = Array.isArray(payload.assets) ? payload.assets : [];
+    const limitParam = new URL(req.url).searchParams.get("limit");
+    const limit = Math.min(Math.max(parseInt(limitParam || "50", 10) || 50, 1), 200);
 
-    if (!Array.isArray(assets)) {
-      console.log(`[scan] ERROR assets not array`);
-      return fail("ASSETS_BAD_FORMAT", "Format assets incorrect", 500);
-    }
+    // 3) Normaliser + trier (stabilité d’abord)
+    const normalized = assets
+      .map(normalizeAsset)
+      .filter((x) => x.asset); // garde uniquement les entrées valides
 
-    // 3) cache set
-    setCache(assets);
+    normalized.sort((a, b) => (b.stability_score ?? -1) - (a.stability_score ?? -1));
 
-    console.log(`[scan] MISS ${assets.length} items (${now() - t0}ms)`);
-    return ok(assets);
+    const sliced = normalized.slice(0, limit);
 
-  } catch (e) {
-    console.log(`[scan] FATAL`, e?.message || e);
-    return fail("SCAN_FAILED", e?.message || "Erreur serveur", 500);
+    // 4) Affiliation Binance (côté API, MVP)
+    // Si tu préfères la garder uniquement UI, dis-le et je te fais la version "API pure".
+    const BINANCE_REF = process.env.BINANCE_REF_CODE || "1216069378";
+    const withAffiliate = sliced.map((a) => ({
+      ...a,
+      binance_url: buildBinanceUrl(a.symbol || a.asset, BINANCE_REF),
+    }));
+
+    // 5) Réponse OK
+    const res = json(true, {
+      data: withAffiliate,
+      meta: {
+        updatedAt: payload.updatedAt || null,
+        count: payload.count ?? assets.length,
+        limit,
+      },
+    });
+
+    res.headers.set("X-RateLimit-Remaining", String(remaining));
+    res.headers.set("X-RateLimit-Reset", String(resetAt));
+
+    return res;
+  } catch (err) {
+    console.error("[/api/scan] INTERNAL", err);
+    return json(
+      false,
+      {
+        data: [],
+        error: {
+          code: "INTERNAL",
+          message: err?.message || "Unknown error",
+        },
+      },
+      500
+    );
   }
 }
