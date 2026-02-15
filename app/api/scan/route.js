@@ -17,16 +17,15 @@ export async function GET() {
 
     return Response.json({
       ok: true,
-      count: json.assets.length,
-      assets: json.assets,
       updatedAt: json.updatedAt,
-      ts: Date.now()
+      count: json.assets.length,
+      assets: json.assets
     });
 
-  } catch (error) {
+  } catch (err) {
     return Response.json({
       ok: false,
-      error: error.message
+      error: err.message
     });
   }
 }
