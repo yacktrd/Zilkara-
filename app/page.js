@@ -1,21 +1,43 @@
+
 export const dynamic = "force-dynamic";
 
 async function getScan() {
-  const res = await fetch(`${process.env.NEXT_PUBLIC_BASE_URL || ""}/api/scan`, {
-    cache: "no-store",
-  });
-  return res.json();
+  try {
+    const base =
+      process.env.NEXT_PUBLIC_BASE_URL ||
+      process.env.VERCEL_URL ||
+      "http://localhost:3000";
+
+    const url = base.startsWith("http")
+      ? `${base}/api/scan`
+      : `https://${base}/api/scan`;
+
+    const res = await fetch(url, {
+      cache: "no-store",
+    });
+
+    if (!res.ok) {
+      return { ok: false, error: "scan fetch failed" };
+    }
+
+    return res.json();
+
+  } catch (e) {
+    return {
+      ok: false,
+      error: e.message,
+    };
+  }
 }
 
 export default async function Home() {
   const json = await getScan();
 
   return (
-    <main style={{ padding: 24, fontFamily: "system-ui" }}>
-      <h1 style={{ marginBottom: 8 }}>Zilkara</h1>
-      <p style={{ opacity: 0.7, marginTop: 0 }}>Market Structure Scanner</p>
+    <main style={{ padding: 24 }}>
+      <h1>Zilkara</h1>
 
-      <pre style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+      <pre>
         {JSON.stringify(json, null, 2)}
       </pre>
     </main>
