@@ -2,40 +2,34 @@
 import { NextResponse } from "next/server";
 import { Redis } from "@upstash/redis";
 
+// IMPORTANT (retour d'expérience Vercel) : ne force pas runtime="edge" si tu as déjà eu des soucis d'env vars.
+// Laisse Node par défaut.
+export const runtime = "nodejs";
+
 const redis = Redis.fromEnv();
 
-// même clé que /api/scan (tu l’as déjà : redis.get("assets_payload"))
+// Même clé que /api/scan
 const PAYLOAD_KEY = "assets_payload";
 
-const PER_PAGE = 250;
-const PAGES = 2; // 2 x 250 = 500 (sécurité, tu peux limiter à 250 ensuite)
+// CoinGecko (free) — top market cap — EUR — 250
+const VS = "eur";
+const PER_PAGE = 250; // CoinGecko max
+const PAGES = 1; // 1 page = 250
+const COINGECKO_URL = (page) =>
+  "https://api.coingecko.com/api/v3/coins/markets" +
+  `?vs_currency=${encodeURIComponent(VS)}` +
+  "&order=market_cap_desc" +
+  `&per_page=${PER_PAGE}` +
+  `&page=${page}` +
+  "&sparkline=false" +
+  "&price_change_percentage=24h,7d,30d";
 
-let markets = [];
-
-for (let page = 1; page <= PAGES; page++) {
-  const url =
-    "https://api.coingecko.com/api/v3/coins/markets" +
-    `?vs_currency=eur` +
-    `&order=market_cap_desc` +
-    `&per_page=${PER_PAGE}` +
-    `&page=${page}` +
-    `&sparkline=false`;
-
-  const res = await fetch(url);
-
-  if (!res.ok) {
-    throw new Error("CoinGecko fetch failed");
-  }
-
-  const data = await res.json();
-  markets.push(...data);
+function json(ok, payload = {}, status = 200) {
+  return NextResponse.json({ ok, ts: Date.now(), ...payload }, { status });
 }
 
-// limiter à 250 exact
-markets = markets.slice(0, 250);
-
-// Auth: on garde ton mécanisme actuel (Bearer KV_REST_API_TOKEN)
-// -> si tu veux un token dédié plus tard, on fera REBUILD_TOKEN.
+// Auth : on garde ton mécanisme actuel (Bearer KV_REST_API_TOKEN)
+// -> plus tard si tu veux un token dédié, tu crées REBUILD_TOKEN.
 function isAuthorized(req) {
   const auth = req.headers.get("authorization") || "";
   const expected = process.env.KV_REST_API_TOKEN;
@@ -48,7 +42,7 @@ function safeNum(v) {
   return Number.isFinite(n) ? n : null;
 }
 
-// scoring simple (non-propriétaire) : stabilité vs amplitudes
+// Scoring simple (non-propriétaire) : stabilité vs amplitudes
 function computeStability({ chg24, chg7, chg30 }) {
   const a24 = Math.abs(chg24 ?? 0);
   const a7 = Math.abs(chg7 ?? 0);
@@ -64,7 +58,7 @@ function computeStability({ chg24, chg7, chg30 }) {
   if (score >= 85) rating = "A";
   else if (score >= 70) rating = "B";
 
-  // “ruptures” = nb de seuils franchis
+  // "ruptures" = nb de seuils franchis
   let rupture = 0;
   if (a24 > 5) rupture++;
   if (a7 > 10) rupture++;
@@ -77,96 +71,103 @@ function computeStability({ chg24, chg7, chg30 }) {
       ? "Faible fréquence de ruptures, régime stable."
       : "Ruptures plus fréquentes, régime volatil.";
 
-  return { stability_score: score, rating, regime, rupture_rate: rupture, similarity, reason };
+  return {
+    stability_score: score,
+    rating,
+    regime,
+    rupture_rate: rupture,
+    similarity,
+    reason,
+  };
+}
+
+async function fetchMarkets() {
+  const markets = [];
+
+  for (let page = 1; page <= PAGES; page++) {
+    const res = await fetch(COINGECKO_URL(page), {
+      headers: { accept: "application/json" },
+      cache: "no-store",
+    });
+
+    if (!res.ok) {
+      throw new Error(`CoinGecko fetch failed (page ${page})`);
+    }
+
+    const data = await res.json();
+
+    for (const coin of data) {
+      const symbol = coin?.symbol ? String(coin.symbol).toUpperCase() : null;
+
+      const chg24 = safeNum(coin?.price_change_percentage_24h);
+      const chg7 = safeNum(coin?.price_change_percentage_7d_in_currency);
+      const chg30 = safeNum(coin?.price_change_percentage_30d_in_currency);
+
+      const score = computeStability({ chg24, chg7, chg30 });
+
+      markets.push({
+        asset: symbol,
+        symbol,
+        name: coin?.name ?? null,
+
+        price: safeNum(coin?.current_price),
+
+        chg_24h_pct: chg24,
+        chg_7d_pct: chg7,
+        chg_30d_pct: chg30,
+
+        stability_score: score.stability_score,
+        rating: score.rating,
+        regime: score.regime,
+
+        rupture_rate: score.rupture_rate,
+        similarity: score.similarity,
+        reason: score.reason,
+
+        // affiliation Binance injectée côté API
+        binance_url: symbol
+          ? `https://www.binance.com/en/trade/${symbol}_USDT?type=spot&ref=1216069378`
+          : null,
+      });
+    }
+  }
+
+  return markets.slice(0, 250);
 }
 
 export async function POST(req) {
   try {
     if (!isAuthorized(req)) {
-      return NextResponse.json(
-        { ok: false, ts: Date.now(), data: [], error: { code: "UNAUTHORIZED", message: "Missing/invalid token." } },
-        { status: 401 }
+      return json(
+        false,
+        { data: [], error: { code: "UNAUTHORIZED", message: "Invalid token" } },
+        401
       );
     }
 
-    // fetch CoinGecko avec timeout court
-    const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), 10_000);
+    const assets = await fetchMarkets();
 
-    const r = await fetch(COINGECKO_URL, {
-      headers: { accept: "application/json" },
-      signal: controller.signal,
-      cache: "no-store",
+    // On écrit dans Redis la payload que /api/scan va relire
+    await redis.set(PAYLOAD_KEY, {
+      payload_updatedAt: Date.now(),
+      assets,
     });
 
-    clearTimeout(t);
-
-    if (!r.ok) {
-      const txt = await r.text().catch(() => "");
-      return NextResponse.json(
-        {
-          ok: false,
-          ts: Date.now(),
-          data: [],
-          error: { code: "COINGECKO_ERROR", message: `CoinGecko ${r.status} ${txt?.slice(0, 160)}` },
-        },
-        { status: 502 }
-      );
-    }
-
-    const rows = await r.json();
-
-    const assets = Array.isArray(rows)
-      ? rows.map((c) => {
-          const symbol = (c?.symbol || "").toUpperCase();
-          const name = c?.name ?? null;
-
-          // CoinGecko renvoie les % dans ces champs
-          const chg24 = safeNum(c?.price_change_percentage_24h_in_currency);
-          const chg7 = safeNum(c?.price_change_percentage_7d_in_currency);
-          const chg30 = safeNum(c?.price_change_percentage_30d_in_currency);
-
-          const base = {
-            asset: symbol || null,
-            symbol: symbol || null,
-            name,
-            price: safeNum(c?.current_price),
-
-            chg_24h_pct: chg24,
-            chg_7d_pct: chg7,
-            chg_30d_pct: chg30,
-          };
-
-          const computed = computeStability({ chg24, chg7, chg30 });
-
-          return { ...base, ...computed };
-        })
-      : [];
-
-    const payload = {
-      assets,
-      count: assets.length,
-      payload_updatedAt: Date.now(),
-      source: "coingecko",
-      vs: "eur",
-    };
-
-    await redis.set(PAYLOAD_KEY, payload);
-
-    return NextResponse.json({
-      ok: true,
+    return json(true, {
       route: "rebuild",
-      ts: Date.now(),
+      written: true,
       count: assets.length,
-      updatedAt: payload.payload_updatedAt,
+      updatedAt: Date.now(),
     });
   } catch (err) {
     console.error("[/api/rebuild] INTERNAL", err);
-    return NextResponse.json(
-      { ok: false, ts: Date.now(), data: [], error: { code: "INTERNAL", message: "Internal error" } },
-      { status: 500 }
+    return json(
+      false,
+      {
+        data: [],
+        error: { code: "INTERNAL", message: err?.message || "Internal error" },
+      },
+      500
     );
   }
 }
-
-nano app/api/rebuild/route.js
