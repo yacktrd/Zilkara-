@@ -82,92 +82,59 @@ function computeStability({ chg24, chg7, chg30 }) {
 }
 
 async function fetchMarkets() {
-  const markets = [];
+  let markets = [];
 
   for (let page = 1; page <= PAGES; page++) {
     const res = await fetch(COINGECKO_URL(page), {
-      headers: { accept: "application/json" },
       cache: "no-store",
     });
 
     if (!res.ok) {
-      throw new Error(`CoinGecko fetch failed (page ${page})`);
+      throw new Error(`CoinGecko fetch failed: ${res.status}`);
     }
 
     const data = await res.json();
 
-    for (const coin of data) {
-      const symbol = coin?.symbol ? String(coin.symbol).toUpperCase() : null;
-
-      const chg24 = safeNum(coin?.price_change_percentage_24h);
-      const chg7 = safeNum(coin?.price_change_percentage_7d_in_currency);
-      const chg30 = safeNum(coin?.price_change_percentage_30d_in_currency);
-
-      const score = computeStability({ chg24, chg7, chg30 });
-
-      markets.push({
-        asset: symbol,
-        symbol,
-        name: coin?.name ?? null,
-
-        price: safeNum(coin?.current_price),
-
-        chg_24h_pct: chg24,
-        chg_7d_pct: chg7,
-        chg_30d_pct: chg30,
-
-        stability_score: score.stability_score,
-        rating: score.rating,
-        regime: score.regime,
-
-        rupture_rate: score.rupture_rate,
-        similarity: score.similarity,
-        reason: score.reason,
-
-        // affiliation Binance injectée côté API
-        binance_url: symbol
-          ? `https://www.binance.com/en/trade/${symbol}_USDT?type=spot&ref=1216069378`
-          : null,
-      });
-    }
+    markets.push(...data);
   }
 
-  return markets.slice(0, 250);
-}
+  markets = markets.slice(0, 250);
 
-export async function POST(req) {
-  try {
-    if (!isAuthorized(req)) {
-      return json(
-        false,
-        { data: [], error: { code: "UNAUTHORIZED", message: "Invalid token" } },
-        401
-      );
-    }
+  return markets.map((coin) => {
+    const symbol = coin.symbol?.toUpperCase() ?? null;
 
-    const assets = await fetchMarkets();
+    const chg24 = safeNum(coin.price_change_percentage_24h);
+    const chg7 = safeNum(coin.price_change_percentage_7d_in_currency);
+    const chg30 = safeNum(coin.price_change_percentage_30d_in_currency);
 
-    // On écrit dans Redis la payload que /api/scan va relire
-    await redis.set(PAYLOAD_KEY, {
-      payload_updatedAt: Date.now(),
-      assets,
+    const stability = computeStability({
+      chg24,
+      chg7,
+      chg30,
     });
 
-    return json(true, {
-      route: "rebuild",
-      written: true,
-      count: assets.length,
-      updatedAt: Date.now(),
-    });
-  } catch (err) {
-    console.error("[/api/rebuild] INTERNAL", err);
-    return json(
-      false,
-      {
-        data: [],
-        error: { code: "INTERNAL", message: err?.message || "Internal error" },
-      },
-      500
-    );
-  }
+    return {
+      asset: symbol,
+      symbol,
+      name: coin.name ?? null,
+
+      price: safeNum(coin.current_price),
+
+      chg_24h_pct: chg24,
+      chg_7d_pct: chg7,
+      chg_30d_pct: chg30,
+
+      stability_score: stability.stability_score,
+      rating: stability.rating,
+      regime: stability.regime,
+
+      rupture_rate: stability.rupture_rate,
+      similarity: stability.similarity,
+      reason: stability.reason,
+
+      binance_url: symbol
+        ? `https://www.binance.com/en/trade/${symbol}_USDT?type=spot&ref=1216069378`
+        : null,
+    };
+  });
 }
