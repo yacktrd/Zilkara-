@@ -1,70 +1,102 @@
-import { kv } from "@vercel/kv";
-import { Ratelimit } from "@upstash/ratelimit";
+import fs from "fs";
+import path from "path";
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
-const TTL_SECONDS = 45;
+/**
+ * Cache in-memory (par instance)
+ * NOTE: sur Vercel serverless, ça tient tant que l'instance vit.
+ */
+const CACHE_KEY = "scan_v1";
+const TTL_MS = 30_000; // 30s (tu pourras passer à 60s ensuite)
 
-// Rate limit: 30 req / 60s / IP
-const ratelimit = new Ratelimit({
-  redis: kv,
-  limiter: Ratelimit.slidingWindow(30, "60 s"),
-});
+function now() {
+  return Date.now();
+}
 
-function json(ok, data = [], error = null, status = 200) {
+function ok(data) {
   return Response.json(
-    { ok, ts: Date.now(), data: Array.isArray(data) ? data : [], error },
+    { ok: true, ts: now(), data },
+    {
+      status: 200,
+      headers: {
+        "Cache-Control": `public, max-age=0, s-maxage=${Math.floor(TTL_MS / 1000)}, stale-while-revalidate=30`,
+      },
+    }
+  );
+}
+
+function fail(code, message, status = 500) {
+  return Response.json(
+    { ok: false, ts: now(), data: [], error: { code, message } },
     { status }
   );
 }
 
-function getIp(req) {
-  const xf = req.headers.get("x-forwarded-for");
-  return (xf ? xf.split(",")[0].trim() : "unknown");
+function getCache() {
+  const g = globalThis;
+  g.__ZILKARA_CACHE__ ||= {};
+  const entry = g.__ZILKARA_CACHE__[CACHE_KEY];
+  if (!entry) return null;
+  if (entry.exp < now()) return null;
+  return entry.value;
 }
 
-function rid() {
-  return Math.random().toString(16).slice(2, 10);
+function setCache(value) {
+  const g = globalThis;
+  g.__ZILKARA_CACHE__ ||= {};
+  g.__ZILKARA_CACHE__[CACHE_KEY] = {
+    exp: now() + TTL_MS,
+    value,
+  };
 }
 
-export async function GET(req) {
-  const start = Date.now();
-  const requestId = rid();
-  const ip = getIp(req);
+export async function GET() {
+  const t0 = now();
 
   try {
-    // 1) rate limit
-    const { success } = await ratelimit.limit(`rl:scan:${ip}`);
-    if (!success) {
-      console.log(`[scan] rid=${requestId} ip=${ip} status=429 err=RATE_LIMITED ms=${Date.now()-start}`);
-      return json(false, [], { code: "RATE_LIMITED", message: "Too many requests" }, 429);
+    // 1) cache hit
+    const cached = getCache();
+    if (cached) {
+      console.log(`[scan] HIT ${cached.length} items (${now() - t0}ms)`);
+      return ok(cached);
     }
 
-    // 2) cache
-    const cacheKey = "scan:v1";
-    const cached = await kv.get(cacheKey);
-    if (cached && Array.isArray(cached)) {
-      console.log(`[scan] rid=${requestId} ip=${ip} cache=HIT count=${cached.length} ms=${Date.now()-start}`);
-      return json(true, cached, null, 200);
+    // 2) lire ton fichier local (ou ta source actuelle)
+    const filePath = path.join(process.cwd(), "data", "assets.json");
+
+    if (!fs.existsSync(filePath)) {
+      console.log(`[scan] ERROR missing file: ${filePath}`);
+      return fail("ASSETS_MISSING", "assets.json introuvable", 500);
     }
 
-    // 3) compute/fetch (ton code actuel)
-    // Remplace ceci par ta fonction réelle:
-    const assets = await buildScanData(); // <- à brancher
+    const raw = fs.readFileSync(filePath, "utf8");
+
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      console.log(`[scan] ERROR invalid JSON`);
+      return fail("ASSETS_INVALID_JSON", "assets.json invalide", 500);
+    }
+
+    // Ton fichier peut être { assets: [...] } ou directement [...]
+    const assets = Array.isArray(parsed) ? parsed : (parsed.assets || []);
 
     if (!Array.isArray(assets)) {
-      console.log(`[scan] rid=${requestId} ip=${ip} cache=MISS err=INVALID_RESPONSE ms=${Date.now()-start}`);
-      return json(false, [], { code: "INVALID_RESPONSE", message: "Scan did not return an array" }, 502);
+      console.log(`[scan] ERROR assets not array`);
+      return fail("ASSETS_BAD_FORMAT", "Format assets incorrect", 500);
     }
 
-    // 4) store cache TTL
-    await kv.set(cacheKey, assets, { ex: TTL_SECONDS });
+    // 3) cache set
+    setCache(assets);
 
-    console.log(`[scan] rid=${requestId} ip=${ip} cache=MISS count=${assets.length} ms=${Date.now()-start}`);
-    return json(true, assets, null, 200);
+    console.log(`[scan] MISS ${assets.length} items (${now() - t0}ms)`);
+    return ok(assets);
 
   } catch (e) {
-    console.log(`[scan] rid=${requestId} ip=${ip} status=500 err=INTERNAL ms=${Date.now()-start} msg=${e?.message}`);
-    return json(false, [], { code: "INTERNAL", message: "Internal error" }, 500);
+    console.log(`[scan] FATAL`, e?.message || e);
+    return fail("SCAN_FAILED", e?.message || "Erreur serveur", 500);
   }
 }
