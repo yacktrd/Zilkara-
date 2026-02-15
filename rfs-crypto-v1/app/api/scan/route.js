@@ -1,40 +1,44 @@
-export const runtime = "nodejs";
+import { readFile } from "fs/promises";
+import path from "path";
+
 export const dynamic = "force-dynamic";
 
-function fmt(n) {
-  if (n === null || n === undefined) return "-";
-  const x = Number(n);
-  if (!Number.isFinite(x)) return String(n);
-  if (Math.abs(x) >= 1000) return x.toLocaleString("en-US", { maximumFractionDigits: 0 });
-  if (Math.abs(x) >= 1) return x.toLocaleString("en-US", { maximumFractionDigits: 4 });
-  return x.toLocaleString("en-US", { maximumFractionDigits: 8 });
-}
-
 export async function GET() {
-  // Binance public endpoint: 24h ticker stats
-  const url = "https://api.binance.com/api/v3/ticker/24hr";
-  const r = await fetch(url, { cache: "no-store" });
-  if (!r.ok) {
-    return Response.json({ ok: false, error: "binance_fetch_failed" }, { status: 502 });
+  try {
+    const filePath = path.join(process.cwd(), "data", "assets.json");
+    const file = await readFile(filePath, "utf-8");
+    const json = JSON.parse(file);
+
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        route: "scan",
+        count: json.assets.length,
+        assets: json.assets,
+        updatedAt: json.updatedAt
+      }),
+      {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store"
+        }
+      }
+    );
+
+  } catch (error) {
+    return new Response(
+      JSON.stringify({
+        ok: false,
+        route: "scan",
+        error: error.message
+      }),
+      {
+        status: 500,
+        headers: {
+          "Content-Type": "application/json"
+        }
+      }
+    );
   }
-
-  const all = await r.json();
-
-  // Filtre simple: USDT pairs + tri par quoteVolume
-  const items = all
-    .filter((x) => typeof x.symbol === "string" && x.symbol.endsWith("USDT"))
-    .map((x) => ({
-      symbol: x.symbol,
-      price: fmt(x.lastPrice),
-      change24hPct: fmt(x.priceChangePercent) + "%",
-      quoteVolume24h: fmt(x.quoteVolume),
-    }))
-    .sort((a, b) => Number(String(b.quoteVolume24h).replace(/,/g, "")) - Number(String(a.quoteVolume24h).replace(/,/g, "")))
-    .slice(0, 30);
-
-  return Response.json({
-    ok: true,
-    ts: new Date().toISOString(),
-    items,
-  });
 }
