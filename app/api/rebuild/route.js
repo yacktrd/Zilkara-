@@ -3,42 +3,68 @@ import { Redis } from "@upstash/redis";
 
 const redis = Redis.fromEnv();
 
+export async function GET(req) {
+  return handle(req);
+}
+
 export async function POST(req) {
+  return handle(req);
+}
+
+async function handle(req) {
   try {
-    // Exemple payload (remplace plus tard par ton vrai scanner)
-    const payload = {
-      updatedAt: Date.now(),
-      count: 2,
-      assets: [
+    const auth = req.headers.get("authorization") || "";
+    const token = process.env.KV_REST_API_TOKEN;
+
+    if (!auth || auth !== `Bearer ${token}`) {
+      return NextResponse.json(
         {
-          symbol: "BTC",
-          name: "Bitcoin",
-          price: 58539,
-          chg_24h_pct: 4.77,
-          chg_7d_pct: 8.12,
-          chg_30d_pct: 12.45,
-          stability_score: 92,
-          rating: "A",
-          regime: "STABLE",
-          similarity: 84,
-          rupture_rate: 3,
-          reason: "Faible fréquence de ruptures, régime stable."
+          ok: false,
+          error: {
+            code: "UNAUTHORIZED",
+            message: "Invalid token"
+          }
         },
-        {
-          symbol: "ETH",
-          name: "Ethereum",
-          price: 1743,
-          chg_24h_pct: 6.67,
-          chg_7d_pct: 9.21,
-          chg_30d_pct: 14.02,
-          stability_score: 88,
-          rating: "A",
-          regime: "STABLE",
-          similarity: 79,
-          rupture_rate: 5,
-          reason: "Structure stable avec volatilité contrôlée."
-        }
-      ]
+        { status: 401 }
+      );
+    }
+
+    // Exemple payload minimal (remplace par ton vrai scanner)
+    const assets = [
+      {
+        asset: "BTC",
+        symbol: "BTC",
+        price: 58539,
+        chg_24h_pct: 4.77,
+        chg_7d_pct: 8.12,
+        chg_30d_pct: 12.45,
+        stability_score: 92,
+        rating: "A",
+        regime: "STABLE",
+        rupture_rate: 3,
+        similarity: 84,
+        reason: "Structure stable"
+      },
+      {
+        asset: "ETH",
+        symbol: "ETH",
+        price: 1743,
+        chg_24h_pct: 6.67,
+        chg_7d_pct: 9.21,
+        chg_30d_pct: 14.02,
+        stability_score: 88,
+        rating: "A",
+        regime: "STABLE",
+        rupture_rate: 5,
+        similarity: 79,
+        reason: "Volatilité contrôlée"
+      }
+    ];
+
+    const payload = {
+      assets,
+      count: assets.length,
+      updatedAt: Date.now()
     };
 
     await redis.set("assets_payload", payload);
@@ -46,19 +72,20 @@ export async function POST(req) {
     return NextResponse.json({
       ok: true,
       route: "rebuild",
-      ts: Date.now(),
-      written: true
+      count: assets.length,
+      ts: Date.now()
     });
 
   } catch (err) {
-
-    return NextResponse.json({
-      ok: false,
-      error: {
-        code: "REBUILD_FAILED",
-        message: err.message
-      }
-    }, { status: 500 });
-
+    return NextResponse.json(
+      {
+        ok: false,
+        error: {
+          code: "INTERNAL",
+          message: err.message
+        }
+      },
+      { status: 500 }
+    );
   }
 }

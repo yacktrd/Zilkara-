@@ -19,6 +19,7 @@ function fmtInt(n: number | null | undefined) {
 }
 
 type ApiError = { code?: string; message?: string };
+
 type ScanAsset = {
   symbol?: string;
   name?: string;
@@ -32,21 +33,32 @@ type ScanAsset = {
   rating?: string;
   regime?: string;
 
-  // optionnel : déjà présent côté API si tu l’injectes
-  binance_url?: string;
-
-  // champs éventuels, ignorés si absents
   similarity?: number;
   rupture_rate?: number;
   reason?: string;
+
+  // lien affilié déjà injecté côté API
+  binance_url?: string;
+};
+
+type ScanMeta = {
+  updatedAt?: number;
+  count?: number;
+  limit?: number;
 };
 
 type ScanResponse = {
   ok: boolean;
   ts: number;
   data: ScanAsset[];
+  meta?: ScanMeta;
   error?: ApiError;
 };
+
+function clsPct(n: number | null | undefined) {
+  if (n == null || Number.isNaN(n)) return 'muted';
+  return n > 0 ? 'pos' : n < 0 ? 'neg' : 'muted';
+}
 
 export default function Page() {
   const [loading, setLoading] = useState(true);
@@ -54,7 +66,7 @@ export default function Page() {
 
   const data = useMemo(() => {
     const list = res?.data ?? [];
-    // tri: stabilité d’abord, sinon fallback sur 0
+    // Tri: stabilité d'abord (fallback -1)
     return [...list].sort(
       (a, b) => (b.stability_score ?? -1) - (a.stability_score ?? -1)
     );
@@ -63,15 +75,30 @@ export default function Page() {
   async function load() {
     setLoading(true);
     try {
+      // no-store : on veut refléter l'état réel, le cache est géré côté API (/api/scan)
       const r = await fetch('/api/scan', { cache: 'no-store' });
       const j = (await r.json()) as ScanResponse;
-      setRes(j);
+
+      // garde-fou minimal si l'API renvoie un format inattendu
+      if (!j || typeof j.ok !== 'boolean' || !Array.isArray(j.data)) {
+        setRes({
+          ok: false,
+          ts: Date.now(),
+          data: [],
+          error: { code: 'BAD_SHAPE', message: 'Invalid API response shape' },
+        });
+      } else {
+        setRes(j);
+      }
     } catch (e: any) {
       setRes({
         ok: false,
         ts: Date.now(),
         data: [],
-        error: { code: 'FETCH_FAILED', message: e?.message || 'Fetch failed' },
+        error: {
+          code: 'FETCH_ERROR',
+          message: e?.message || 'Network error',
+        },
       });
     } finally {
       setLoading(false);
@@ -80,127 +107,319 @@ export default function Page() {
 
   useEffect(() => {
     load();
+    const id = setInterval(load, 30_000); // auto-refresh 30s
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const statusLine = (() => {
-    if (loading) return 'Chargement…';
-    if (!res) return '—';
-    if (!res.ok) return `Erreur: ${res.error?.code || 'UNKNOWN'} — ${res.error?.message || ''}`;
-    return `OK — ${data.length} actifs`;
-  })();
+  const statusLabel = loading ? 'Loading…' : res?.ok ? 'ONLINE' : 'ERROR';
+
+  const updatedAtLabel = res?.meta?.updatedAt
+    ? new Date(res.meta.updatedAt).toLocaleString('fr-FR')
+    : '—';
+
+  const countLabel =
+    res?.meta?.count != null ? fmtInt(res.meta.count) : fmtInt(data.length);
+
+  const limitLabel =
+    res?.meta?.limit != null ? fmtInt(res.meta.limit) : '—';
 
   return (
-    <main style={{ padding: 16, maxWidth: 1100, margin: '0 auto' }}>
-      <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, flexWrap: 'wrap' }}>
-        <h1 style={{ fontSize: 34, margin: 0, fontWeight: 700 }}>Zilkara</h1>
-        <div style={{ opacity: 0.8 }}>{statusLine}</div>
-        <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
-          <button
-            onClick={load}
-            style={{
-              padding: '10px 12px',
-              borderRadius: 10,
-              border: '1px solid rgba(255,255,255,.15)',
-              background: 'rgba(255,255,255,.06)',
-              color: 'inherit',
-              cursor: 'pointer',
-            }}
-          >
+    <main className="wrap">
+      <header className="head">
+        <div className="titleRow">
+          <h1 className="title">Zilkara</h1>
+
+          <button className="btn" onClick={load} disabled={loading}>
             Refresh
           </button>
         </div>
-      </div>
 
-      <div style={{ marginTop: 14, borderRadius: 14, overflow: 'hidden', border: '1px solid rgba(255,255,255,.12)' }}>
-        <div style={{ overflowX: 'auto' }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 820 }}>
+        <div className="sub">
+          <div className="pill">
+            Status: <strong>{statusLabel}</strong>
+          </div>
+          <div className="pill">
+            Updated: <strong>{updatedAtLabel}</strong>
+          </div>
+          <div className="pill">
+            Count: <strong>{countLabel}</strong>
+          </div>
+          <div className="pill">
+            Limit: <strong>{limitLabel}</strong>
+          </div>
+          <div className="pill">
+            Timestamp: <strong>{res?.ts ? new Date(res.ts).toLocaleString('fr-FR') : '—'}</strong>
+          </div>
+        </div>
+
+        {!loading && res && !res.ok && res.error && (
+          <div className="errorBox">
+            <div className="errorLine">
+              Erreur: <strong>{res.error.code || 'ERROR'}</strong> —{' '}
+              <span>{res.error.message || 'Unknown error'}</span>
+            </div>
+          </div>
+        )}
+      </header>
+
+      <section className="card">
+        <div className="tableWrap">
+          <table className="table">
             <thead>
-              <tr style={{ textAlign: 'left', background: 'rgba(255,255,255,.04)' }}>
-                <Th>Asset</Th>
-                <Th>Price</Th>
-                <Th>24h</Th>
-                <Th>7d</Th>
-                <Th>30d</Th>
-                <Th>Score</Th>
-                <Th>Rating</Th>
-                <Th>Regime</Th>
-                <Th>Link</Th>
+              <tr>
+                <th>Asset</th>
+                <th className="right">Price</th>
+                <th className="right">24h</th>
+                <th className="right">7d</th>
+                <th className="right">30d</th>
+                <th className="right">Score</th>
+                <th className="center">Rating</th>
+                <th className="center">Regime</th>
               </tr>
             </thead>
+
             <tbody>
-              {data.map((a, i) => {
-                const sym = a.symbol || '—';
-                const name = a.name || '';
-                return (
-                  <tr key={`${sym}-${i}`} style={{ borderTop: '1px solid rgba(255,255,255,.08)' }}>
-                    <Td>
-                      <div style={{ fontWeight: 700 }}>{sym}</div>
-                      <div style={{ opacity: 0.75, fontSize: 12 }}>{name}</div>
-                    </Td>
-                    <Td>{fmtPrice(a.price)}</Td>
-                    <Td>{fmtPct(a.chg_24h_pct)}</Td>
-                    <Td>{fmtPct(a.chg_7d_pct)}</Td>
-                    <Td>{fmtPct(a.chg_30d_pct)}</Td>
-                    <Td>{fmtInt(a.stability_score)}</Td>
-                    <Td>{a.rating || '—'}</Td>
-                    <Td>{a.regime || '—'}</Td>
-                    <Td>
-                      {a.binance_url ? (
-                        <a
-                          href={a.binance_url}
-                          target="_blank"
-                          rel="noreferrer"
-                          style={{ textDecoration: 'underline', opacity: 0.9 }}
-                        >
-                          Binance
-                        </a>
-                      ) : (
-                        '—'
-                      )}
-                    </Td>
+              {data.length === 0 ? (
+                <tr>
+                  <td colSpan={8} className="empty">
+                    {loading ? 'Chargement…' : 'Aucune donnée.'}
+                  </td>
+                </tr>
+              ) : (
+                data.map((a, idx) => (
+                  <tr key={`${a.symbol || a.name || 'asset'}-${idx}`}>
+                    <td className="asset">
+                      <div className="assetMain">
+                        {a.binance_url ? (
+                          <a
+                            href={a.binance_url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="link"
+                          >
+                            {a.symbol || a.name || '—'}
+                          </a>
+                        ) : (
+                          <span>{a.symbol || a.name || '—'}</span>
+                        )}
+                      </div>
+                      {a.reason ? <div className="assetSub">{a.reason}</div> : null}
+                    </td>
+
+                    <td className="right mono">{fmtPrice(a.price)}</td>
+
+                    <td className={`right mono ${clsPct(a.chg_24h_pct)}`}>
+                      {fmtPct(a.chg_24h_pct)}
+                    </td>
+                    <td className={`right mono ${clsPct(a.chg_7d_pct)}`}>
+                      {fmtPct(a.chg_7d_pct)}
+                    </td>
+                    <td className={`right mono ${clsPct(a.chg_30d_pct)}`}>
+                      {fmtPct(a.chg_30d_pct)}
+                    </td>
+
+                    <td className="right mono">{fmtInt(a.stability_score)}</td>
+                    <td className="center mono">{a.rating ?? '—'}</td>
+                    <td className="center mono">{a.regime ?? '—'}</td>
                   </tr>
-                );
-              })}
-
-              {!loading && res?.ok && data.length === 0 && (
-                <tr>
-                  <Td colSpan={9} style={{ opacity: 0.8 }}>
-                    Aucun actif.
-                  </Td>
-                </tr>
-              )}
-
-              {!loading && res && !res.ok && (
-                <tr>
-                  <Td colSpan={9} style={{ opacity: 0.9 }}>
-                    {res.error?.code || 'ERROR'} — {res.error?.message || 'Unknown error'}
-                  </Td>
-                </tr>
+                ))
               )}
             </tbody>
           </table>
         </div>
-      </div>
 
-      <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
-        Timestamp: {res?.ts ? new Date(res.ts).toLocaleString('fr-FR') : '—'}
-      </div>
+        <footer className="foot">
+          <div className="hint">
+            Données servies via <code>/api/scan</code>. Cache, rate-limit et affiliation gérés côté backend.
+          </div>
+        </footer>
+      </section>
+
+      <style jsx>{`
+        :global(body) {
+          margin: 0;
+        }
+
+        .wrap {
+          padding: 28px 18px;
+          max-width: 1100px;
+          margin: 0 auto;
+          font-family: ui-serif, Georgia, 'Times New Roman', Times, serif;
+        }
+
+        .head {
+          margin-bottom: 18px;
+        }
+
+        .titleRow {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+        }
+
+        .title {
+          font-size: 44px;
+          margin: 0;
+          font-weight: 700;
+          letter-spacing: -0.5px;
+        }
+
+        .btn {
+          border: 1px solid rgba(0, 0, 0, 0.15);
+          background: white;
+          padding: 10px 14px;
+          border-radius: 10px;
+          cursor: pointer;
+          font-weight: 600;
+        }
+        .btn:disabled {
+          opacity: 0.6;
+          cursor: not-allowed;
+        }
+
+        .sub {
+          margin-top: 14px;
+          display: flex;
+          flex-wrap: wrap;
+          gap: 10px;
+        }
+
+        .pill {
+          border: 1px solid rgba(0, 0, 0, 0.12);
+          padding: 8px 10px;
+          border-radius: 999px;
+          font-size: 14px;
+          background: rgba(255, 255, 255, 0.7);
+        }
+
+        .errorBox {
+          margin-top: 14px;
+          padding: 12px 14px;
+          border-radius: 12px;
+          border: 1px solid rgba(180, 0, 0, 0.25);
+          background: rgba(255, 0, 0, 0.04);
+        }
+
+        .errorLine {
+          font-size: 16px;
+        }
+
+        .card {
+          border: 1px solid rgba(0, 0, 0, 0.12);
+          border-radius: 16px;
+          overflow: hidden;
+          background: rgba(255, 255, 255, 0.7);
+        }
+
+        .tableWrap {
+          width: 100%;
+          overflow-x: auto;
+        }
+
+        .table {
+          width: 100%;
+          border-collapse: collapse;
+          min-width: 840px;
+        }
+
+        thead th {
+          text-align: left;
+          font-size: 14px;
+          font-weight: 700;
+          padding: 14px 14px;
+          border-bottom: 1px solid rgba(0, 0, 0, 0.1);
+          background: rgba(0, 0, 0, 0.03);
+        }
+
+        tbody td {
+          padding: 14px 14px;
+          border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+          vertical-align: top;
+        }
+
+        tbody tr:hover td {
+          background: rgba(0, 0, 0, 0.02);
+        }
+
+        .right {
+          text-align: right;
+        }
+
+        .center {
+          text-align: center;
+        }
+
+        .mono {
+          font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+            'Liberation Mono', 'Courier New', monospace;
+          font-size: 13px;
+        }
+
+        .asset {
+          max-width: 360px;
+        }
+
+        .assetMain {
+          font-weight: 700;
+          font-size: 16px;
+        }
+
+        .assetSub {
+          margin-top: 6px;
+          font-size: 13px;
+          opacity: 0.8;
+        }
+
+        .link {
+          text-decoration: none;
+          border-bottom: 1px solid rgba(0, 0, 0, 0.25);
+          color: inherit;
+        }
+        .link:hover {
+          border-bottom-color: rgba(0, 0, 0, 0.6);
+        }
+
+        .pos {
+          color: #0a7a2f;
+          font-weight: 700;
+        }
+        .neg {
+          color: #b00020;
+          font-weight: 700;
+        }
+        .muted {
+          opacity: 0.85;
+        }
+
+        .empty {
+          padding: 22px 14px;
+          text-align: center;
+          opacity: 0.75;
+        }
+
+        .foot {
+          padding: 12px 14px;
+        }
+
+        .hint {
+          font-size: 13px;
+          opacity: 0.8;
+        }
+
+        @media (max-width: 520px) {
+          .wrap {
+            padding: 18px 14px;
+          }
+          .title {
+            font-size: 38px;
+          }
+          .btn {
+            padding: 9px 12px;
+          }
+        }
+      `}</style>
     </main>
-  );
-}
-
-function Th({ children }: { children: any }) {
-  return (
-    <th style={{ padding: '12px 12px', fontSize: 12, letterSpacing: 0.3, opacity: 0.8, whiteSpace: 'nowrap' }}>
-      {children}
-    </th>
-  );
-}
-
-function Td({ children, colSpan, style }: { children: any; colSpan?: number; style?: any }) {
-  return (
-    <td style={{ padding: '12px 12px', verticalAlign: 'top', whiteSpace: 'nowrap', ...style }} colSpan={colSpan}>
-      {children}
-    </td>
   );
 }
