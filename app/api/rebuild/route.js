@@ -7,15 +7,32 @@ const redis = Redis.fromEnv();
 // même clé que /api/scan (tu l’as déjà : redis.get("assets_payload"))
 const PAYLOAD_KEY = "assets_payload";
 
-// CoinGecko (free) — top market cap
-const COINGECKO_URL =
-  "https://api.coingecko.com/api/v3/coins/markets" +
-  "?vs_currency=eur" +
-  "&order=market_cap_desc" +
-  "&per_page=250" +
-  "&page=1" +
-  "&sparkline=false" +
-  "&price_change_percentage=24h,7d,30d";
+const PER_PAGE = 250;
+const PAGES = 2; // 2 x 250 = 500 (sécurité, tu peux limiter à 250 ensuite)
+
+let markets = [];
+
+for (let page = 1; page <= PAGES; page++) {
+  const url =
+    "https://api.coingecko.com/api/v3/coins/markets" +
+    `?vs_currency=eur` +
+    `&order=market_cap_desc` +
+    `&per_page=${PER_PAGE}` +
+    `&page=${page}` +
+    `&sparkline=false`;
+
+  const res = await fetch(url);
+
+  if (!res.ok) {
+    throw new Error("CoinGecko fetch failed");
+  }
+
+  const data = await res.json();
+  markets.push(...data);
+}
+
+// limiter à 250 exact
+markets = markets.slice(0, 250);
 
 // Auth: on garde ton mécanisme actuel (Bearer KV_REST_API_TOKEN)
 // -> si tu veux un token dédié plus tard, on fera REBUILD_TOKEN.
