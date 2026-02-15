@@ -1,0 +1,107 @@
+"use client";
+
+import { useEffect, useState } from "react";
+
+export default function Page() {
+  const [assets, setAssets] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  async function load() {
+    try {
+      setLoading(true);
+
+      const res = await fetch("/api/scan", {
+        cache: "no-store",
+      });
+
+      const json = await res.json();
+
+      if (!json.ok) {
+        throw new Error(json.error?.message || "Scan error");
+      }
+
+      setAssets(json.data || []);
+      setError(null);
+
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    load();
+
+    const interval = setInterval(load, 30000);
+
+    return () => clearInterval(interval);
+  }, []);
+
+  return (
+    <main style={{ padding: 20, fontFamily: "system-ui" }}>
+      
+      <h1 style={{ fontSize: 28 }}>
+        Zilkara
+      </h1>
+
+      <p style={{ color: "#666" }}>
+        Market Structure Scanner
+      </p>
+
+      {loading && <p>Loading…</p>}
+
+      {error && (
+        <p style={{ color: "red" }}>
+          {error}
+        </p>
+      )}
+
+      {!loading && !error && (
+        <table style={{
+          width: "100%",
+          borderCollapse: "collapse",
+          marginTop: 20
+        }}>
+          <thead>
+            <tr>
+              <th align="left">Asset</th>
+              <th align="right">Price</th>
+              <th align="right">24h</th>
+              <th align="right">7d</th>
+              <th align="right">Signal</th>
+            </tr>
+          </thead>
+
+          <tbody>
+            {assets.map((a) => (
+              <tr key={a.symbol}>
+                <td>{a.symbol}</td>
+
+                <td align="right">
+                  ${Number(a.price).toFixed(2)}
+                </td>
+
+                <td align="right">
+                  {Number(a.chg_24h_pct).toFixed(2)}%
+                </td>
+
+                <td align="right">
+                  {Number(a.chg_7d_pct).toFixed(2)}%
+                </td>
+
+                <td align="right">
+                  {Number(a.score).toFixed(0)}
+                </td>
+
+              </tr>
+            ))}
+          </tbody>
+
+        </table>
+      )}
+
+    </main>
+  );
+}
