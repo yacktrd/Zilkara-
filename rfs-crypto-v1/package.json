@@ -4,8 +4,8 @@
   "private": true,
   "scripts": {
     "build": "next build",
-    "start": "next start",
-    "dev": "next dev"
+    "dev": "next dev",
+    "start": "next start"
   },
   "dependencies": {
     "next": "14.2.3",
@@ -13,8 +13,8 @@
     "react-dom": "18.2.0"
   },
   "devDependencies": {
-    "@types/node": "^20.19.33",
-    "@types/react": "^18.3.28",
-    "typescript": "^5.9.3"
+    "typescript": "^5.0.0",
+    "@types/node": "^20.0.0",
+    "@types/react": "^18.0.0"
   }
 }
