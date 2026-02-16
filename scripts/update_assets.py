@@ -5,157 +5,156 @@ import statistics
 
 OUT_PATH = "data/assets.json"
 
-COINS = [
-    ("BTC", "bitcoin"),
-    ("ETH", "ethereum"),
-    ("SOL", "solana"),
-]
-
 VS = "eur"
-DAYS = 30
-UA = {"User-Agent": "rfs-crypto-v1"}
 
-def safe_get(url, params):
-    try:
-        r = requests.get(url, params=params, headers=UA, timeout=20)
-        return r
-    except Exception as e:
-        print("Request error:", e)
-        return None
+UA = {
+    "User-Agent": "Zilkara/1.0"
+}
 
-def fetch_prices(coin_id):
-    # 30 jours de prix pour calculer trend + 7d/30d + stabilité
-    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
-    params = {"vs_currency": VS, "days": DAYS}
+# --------------------------------------------------
+# FETCH TOP 250 COINS IN ONE REQUEST
+# --------------------------------------------------
 
-    r = safe_get(url, params)
-    if r is None:
-        return None
+def fetch_top_250():
+    url = "https://api.coingecko.com/api/v3/coins/markets"
 
-    if r.status_code != 200:
-        print(f"API error prices for {coin_id}: {r.status_code}")
-        return None
-
-    data = r.json()
-    prices = data.get("prices")
-    if not prices:
-        print(f"No 'prices' field for {coin_id}")
-        return None
-
-    return [p[1] for p in prices]
-
-def fetch_market(coin_id):
-    # prix actuel + variation 24h
-    url = "https://api.coingecko.com/api/v3/simple/price"
     params = {
-        "ids": coin_id,
-        "vs_currencies": VS,
-        "include_24hr_change": "true",
+        "vs_currency": VS,
+        "order": "market_cap_desc",
+        "per_page": 250,
+        "page": 1,
+        "price_change_percentage": "24h,7d,30d"
     }
 
-    r = safe_get(url, params)
-    if r is None:
-        return None
+    try:
+        r = requests.get(url, params=params, headers=UA, timeout=20)
+    except Exception as e:
+        print("Request error:", e)
+        return []
 
     if r.status_code != 200:
-        print(f"API error market for {coin_id}: {r.status_code}")
-        return None
+        print("API error:", r.status_code)
+        return []
 
-    data = r.json()
-    if coin_id not in data:
-        print(f"No market data for {coin_id}")
-        return None
+    return r.json()
 
-    price = data[coin_id].get(VS)
-    chg24 = data[coin_id].get(f"{VS}_24h_change")
-    if price is None or chg24 is None:
-        print(f"Incomplete market fields for {coin_id}")
-        return None
+# --------------------------------------------------
+# SCORE CALCULATION
+# --------------------------------------------------
 
-    return {"price": float(price), "chg_24h": float(chg24)}
+def stability_score(chg24, chg7, chg30):
 
-def stability_score(prices):
-    if prices is None or len(prices) < 5:
-        return 0
-    returns = [(prices[i] - prices[i-1]) / prices[i-1] for i in range(1, len(prices)) if prices[i-1] != 0]
-    if len(returns) < 2:
-        return 0
-    vol = statistics.stdev(returns)
-    # score simple: plus la volatilité est forte, plus le score baisse
-    score = max(0, min(100, int(100 - vol * 1000)))
-    return score
+    values = [
+        abs(chg24 or 0),
+        abs(chg7 or 0),
+        abs(chg30 or 0)
+    ]
+
+    avg_volatility = statistics.mean(values)
+
+    score = max(0, 100 - avg_volatility * 2)
+
+    return round(score)
 
 def rating(score):
-    if score >= 80: return "A"
-    if score >= 60: return "B"
-    if score >= 40: return "C"
+
+    if score >= 80:
+        return "A"
+
+    if score >= 60:
+        return "B"
+
+    if score >= 40:
+        return "C"
+
     return "D"
 
-def trend(prices):
-    if prices is None or len(prices) < 2:
-        return "Sideways"
-    if prices[-1] > prices[0]: return "Uptrend"
-    if prices[-1] < prices[0]: return "Downtrend"
-    return "Sideways"
+def regime(score):
 
-def market_state(score):
-    if score >= 70: return "Stable"
-    if score >= 50: return "Transition"
-    return "Volatile"
+    if score >= 70:
+        return "STABLE"
 
-def pct_change(a, b):
-    # from b -> a
-    if b == 0:
-        return 0.0
-    return (a - b) / b * 100.0
+    if score >= 50:
+        return "TRANSITION"
 
-assets = []
+    return "VOLATILE"
 
-for symbol, coin_id in COINS:
-    prices = fetch_prices(coin_id)
-    mkt = fetch_market(coin_id)
+# --------------------------------------------------
+# BUILD ASSETS
+# --------------------------------------------------
 
-    # si l'API rate-limit, on espace un peu
-    time.sleep(1.2)
+def build_assets():
 
-    if prices is None or mkt is None:
-        # fallback propre : ne plante pas, écrit quand même
-        assets.append({
-            "asset": symbol,
-            "price": 0,
-            "chg_24h_pct": 0,
-            "chg_7d_pct": 0,
-            "chg_30d_pct": 0,
-            "stability": 0,
-            "rating": "D",
-            "market_state": "Volatile",
-            "trend": "Sideways"
-        })
-        continue
+    coins = fetch_top_250()
 
-    score = stability_score(prices)
+    assets = []
 
-    # 7 jours: on prend un point ~7 jours avant la fin (si dispo)
-    if len(prices) >= 8:
-        chg7 = pct_change(prices[-1], prices[-8])
-    else:
-        chg7 = 0.0
+    for coin in coins:
 
-    chg30 = pct_change(prices[-1], prices[0])
+        price = coin.get("current_price")
 
-    assets.append({
-        "asset": symbol,
-        "price": round(mkt["price"], 2),
-        "chg_24h_pct": round(mkt["chg_24h"], 2),
-        "chg_7d_pct": round(chg7, 2),
-        "chg_30d_pct": round(chg30, 2),
-        "stability": score,
-        "rating": rating(score),
-        "market_state": market_state(score),
-        "trend": trend(prices),
-    })
+        chg24 = coin.get("price_change_percentage_24h")
+        chg7 = coin.get("price_change_percentage_7d_in_currency")
+        chg30 = coin.get("price_change_percentage_30d_in_currency")
 
-with open(OUT_PATH, "w") as f:
-    json.dump(assets, f, indent=2)
+        score = stability_score(chg24, chg7, chg30)
 
-print("assets.json updated (live)")
+        asset = {
+
+            "asset": coin.get("symbol", "").upper(),
+
+            "name": coin.get("name"),
+
+            "price": round(price, 4) if price else None,
+
+            "chg_24h_pct": round(chg24, 2) if chg24 else 0,
+
+            "chg_7d_pct": round(chg7, 2) if chg7 else 0,
+
+            "chg_30d_pct": round(chg30, 2) if chg30 else 0,
+
+            "stability_score": score,
+
+            "rating": rating(score),
+
+            "regime": regime(score),
+
+            "link":
+            f"https://www.binance.com/en/trade/{coin.get('symbol','').upper()}_USDT"
+
+        }
+
+        assets.append(asset)
+
+    return assets
+
+# --------------------------------------------------
+# SAVE
+# --------------------------------------------------
+
+def save():
+
+    assets = build_assets()
+
+    data = {
+
+        "updatedAt": int(time.time()),
+
+        "count": len(assets),
+
+        "assets": assets
+
+    }
+
+    with open(OUT_PATH, "w") as f:
+        json.dump(data, f, indent=2)
+
+    print(f"assets.json updated — {len(assets)} assets")
+
+
+# --------------------------------------------------
+# RUN
+# --------------------------------------------------
+
+if __name__ == "__main__":
+    save()

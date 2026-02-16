@@ -1,3 +1,4 @@
+
 "use client";
 
 import { useEffect, useState } from "react";
@@ -16,13 +17,13 @@ export default function Scanner() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    fetch("/api/scan")
-      .then(res => res.json())
-      .then(json => {
-        setData(json.data);
-        setLoading(false);
-      });
-  }, []);
+  fetch("/api/scan")
+    .then(res => res.json())
+    .then(json => {
+      setData(json.assets); //
+      setLoading(false);
+    });
+}, []);
 
   if (loading) {
     return <div style={{ padding: 20 }}>Loading...</div>;
