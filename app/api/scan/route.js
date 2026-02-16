@@ -27,37 +27,35 @@ export async function GET(req) {
 
     const payload = await redis.get(PAYLOAD_KEY);
 
-    if (!payload || typeof payload !== "object" || !Array.isArray(payload.assets)) {
-      return json(
-        false,
-        {
-          data: [],
-          error: { code: "NO_DATA", message: `No ${PAYLOAD_KEY} in Redis` },
-          meta: { updatedAt: null, count: 0, limit },
-        },
-        503
-      );
+if (!payload) {
+  return NextResponse.json({
+    ok: false,
+    ts: Date.now(),
+    data: [],
+    error: {
+      code: "NO_DATA",
+      message: "No assets_payload in Redis"
     }
+  });
+}
 
-    const all = payload.assets;
-    const data = all.slice(0, limit);
+const allAssets = payload.assets || payload.data || [];
+const assets = allAssets.slice(0, limit);
 
-    // meta.count = total stocké, pas le slice
-    const updatedAt =
-      Number.isFinite(Number(payload.payload_updatedAt))
-        ? Number(payload.payload_updatedAt)
-        : Number.isFinite(Number(payload.updatedAt))
-          ? Number(payload.updatedAt)
-          : null;
+return NextResponse.json({
+  ok: true,
+  ts: Date.now(),
+  data: assets,
+  meta: {
+    updatedAt: payload.payload_updatedAt,
+    count: assets.length,
+    limit
+  }
+});
 
-    return json(true, {
-      data,
-      meta: {
-        updatedAt,
-        count: all.length,
-        limit,
-      },
-    });
+
+
+    
   } catch (err) {
     console.error("[/api/scan] INTERNAL", err);
     return json(
