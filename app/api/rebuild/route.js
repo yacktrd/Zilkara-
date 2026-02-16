@@ -1,4 +1,3 @@
-
 import { NextResponse } from "next/server";
 
 export const runtime = "nodejs";
@@ -223,3 +222,4 @@ export async function POST(req) {
     );
   }
 }
+return json(true, { route: "rebuild", written: true, version: "rebuild-v250", count: assets.length });
