@@ -1,14 +1,16 @@
 import { NextResponse } from "next/server";
+import { Redis } from "@upstash/redis";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+const redis = Redis.fromEnv();
 
 const PAYLOAD_KEY = "assets_payload";
 
 const VS = "eur";
 const PER_PAGE = 100;
-const MAX_PAGES = 3; // 3x100 = 300 actifs récupérés
-const LIMIT = 250;
+const PAGES = 3; // 3 x 100 = 300 → slice 250 final
 
 const BINANCE_REF = "1216069378";
 
@@ -22,7 +24,9 @@ function json(ok, payload = {}, status = 200) {
 function isAuthorized(req) {
   const auth = req.headers.get("authorization") || "";
   const expected = process.env.KV_REST_API_TOKEN;
+
   if (!expected) return false;
+
   return auth === `Bearer ${expected}`;
 }
 
@@ -31,7 +35,7 @@ function safeNum(v) {
   return Number.isFinite(n) ? n : null;
 }
 
-function computeStability({ chg24, chg7, chg30 }) {
+function computeStability(chg24, chg7, chg30) {
 
   const a24 = Math.abs(chg24 ?? 0);
   const a7 = Math.abs(chg7 ?? 0);
@@ -45,10 +49,7 @@ function computeStability({ chg24, chg7, chg30 }) {
   const stability_score =
     Math.max(
       0,
-      Math.min(
-        100,
-        Math.round(100 - penalty)
-      )
+      Math.min(100, Math.round(100 - penalty))
     );
 
   const regime =
@@ -57,10 +58,14 @@ function computeStability({ chg24, chg7, chg30 }) {
       : "VOLATILE";
 
   let rating = "C";
-  if (stability_score >= 85) rating = "A";
-  else if (stability_score >= 70) rating = "B";
+
+  if (stability_score >= 85)
+    rating = "A";
+  else if (stability_score >= 70)
+    rating = "B";
 
   let rupture_rate = 0;
+
   if (a24 > 5) rupture_rate++;
   if (a7 > 10) rupture_rate++;
   if (a30 > 20) rupture_rate++;
@@ -70,14 +75,16 @@ function computeStability({ chg24, chg7, chg30 }) {
       0,
       Math.min(
         100,
-        Math.round(100 - (a24 * 2 + a7))
+        Math.round(
+          100 - (a24 * 2 + a7)
+        )
       )
     );
 
   const reason =
     regime === "STABLE"
       ? "Faible fréquence de ruptures, régime stable."
-      : "Structure volatile.";
+      : "Ruptures plus fréquentes, régime volatil.";
 
   return {
     stability_score,
@@ -85,11 +92,11 @@ function computeStability({ chg24, chg7, chg30 }) {
     regime,
     rupture_rate,
     similarity,
-    reason,
+    reason
   };
 }
 
-async function fetchPage(page) {
+async function fetchCoinGeckoPage(page) {
 
   const url =
     `https://api.coingecko.com/api/v3/coins/markets` +
@@ -97,10 +104,11 @@ async function fetchPage(page) {
     `&order=market_cap_desc` +
     `&per_page=${PER_PAGE}` +
     `&page=${page}` +
+    `&sparkline=false` +
     `&price_change_percentage=24h,7d,30d`;
 
   const res = await fetch(url, {
-    cache: "no-store",
+    cache: "no-store"
   });
 
   if (!res.ok)
@@ -111,37 +119,48 @@ async function fetchPage(page) {
   return res.json();
 }
 
-async function fetchAllAssets() {
-
-  const all = [];
-
-  for (let page = 1; page <= MAX_PAGES; page++) {
-
-    const data = await fetchPage(page);
-
-    if (!Array.isArray(data) || data.length === 0)
-      break;
-
-    all.push(...data);
-
-    await new Promise(r => setTimeout(r, 400));
-  }
-
-  return all;
-}
-
 export async function POST(req) {
 
   try {
 
     if (!isAuthorized(req))
-      return json(false, { error: "Unauthorized" }, 401);
+      return json(
+        false,
+        { error: "unauthorized" },
+        401
+      );
 
-    const raw = await fetchAllAssets();
+    let rawAssets = [];
 
-    const assets =
-      raw
-        .slice(0, LIMIT)
+    // pagination correcte
+    for (let page = 1; page <= PAGES; page++) {
+
+  const url =
+    `https://api.coingecko.com/api/v3/coins/markets` +
+    `?vs_currency=${VS}` +
+    `&order=market_cap_desc` +
+    `&per_page=${PER_PAGE}` +
+    `&page=${page}` +
+    `&sparkline=false` +
+    `&price_change_percentage=24h,7d,30d`;
+
+  const res = await fetch(url, { cache: "no-store" });
+
+  if (!res.ok) continue;
+
+  const json = await res.json();
+
+  all.push(...json);
+
+  // FIX CRITIQUE
+  await new Promise(r => setTimeout(r, 1500));
+}
+    // limite finale
+    rawAssets =
+      rawAssets.slice(0, 250);
+
+    const processed =
+      rawAssets
         .map(a => {
 
           const price =
@@ -149,7 +168,7 @@ export async function POST(req) {
 
           const chg24 =
             safeNum(
-              a.price_change_percentage_24h_in_currency
+              a.price_change_percentage_24h
             );
 
           const chg7 =
@@ -162,64 +181,119 @@ export async function POST(req) {
               a.price_change_percentage_30d_in_currency
             );
 
-          const score =
-            computeStability({
+          if (
+            price === null ||
+            chg24 === null ||
+            chg7 === null ||
+            chg30 === null
+          )
+            return null;
+
+          const s =
+            computeStability(
               chg24,
               chg7,
-              chg30,
-            });
+              chg30
+            );
 
           return {
 
-            asset: a.symbol?.toUpperCase(),
-            symbol: a.symbol?.toUpperCase(),
+            asset:
+              a.symbol.toUpperCase(),
+
+            symbol:
+              a.symbol.toUpperCase(),
 
             price,
 
-            chg_24h_pct: chg24,
-            chg_7d_pct: chg7,
-            chg_30d_pct: chg30,
+            chg_24h_pct:
+              chg24,
 
-            ...score,
+            chg_7d_pct:
+              chg7,
+
+            chg_30d_pct:
+              chg30,
+
+            stability_score:
+              s.stability_score,
+
+            rating:
+              s.rating,
+
+            regime:
+              s.regime,
+
+            rupture_rate:
+              s.rupture_rate,
+
+            similarity:
+              s.similarity,
+
+            reason:
+              s.reason,
 
             binance_url:
-              `https://www.binance.com/en/trade/${a.symbol?.toUpperCase()}_USDT?ref=${BINANCE_REF}`
+              `https://www.binance.com/en/trade/${a.symbol.toUpperCase()}_USDT?type=spot&ref=${BINANCE_REF}`
 
           };
-        });
 
-    await fetch(
-      `${process.env.KV_REST_API_URL}/set/${PAYLOAD_KEY}`,
+        })
+        .filter(Boolean);
+
+    const payload = {
+
+      data:
+        processed,
+
+      meta: {
+
+        updatedAt:
+          Date.now(),
+
+        count:
+          processed.length,
+
+        limit:
+          250
+
+      }
+
+    };
+
+    await redis.set(
+      PAYLOAD_KEY,
+      payload
+    );
+
+    return json(
+      true,
       {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.KV_REST_API_TOKEN}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          value: JSON.stringify({
-            updatedAt: Date.now(),
-            count: assets.length,
-            limit: LIMIT,
-            data: assets,
-          }),
-        }),
+
+        route:
+          "rebuild",
+
+        written:
+          true,
+
+        count:
+          processed.length
+
       }
     );
 
-    return json(true, {
-      route: "rebuild",
-      written: true,
-      count: assets.length,
-    });
-
-  } catch (e) {
+  }
+  catch (err) {
 
     return json(
       false,
-      { error: e.message },
+      {
+
+        error:
+          err.message
+
+      },
       500
     );
   }
 }
-return json(true, { route: "rebuild", written: true, version: "rebuild-v250", count: assets.length });
