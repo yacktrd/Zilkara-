@@ -1,54 +1,73 @@
+// app/api/scan/route.js
 import { NextResponse } from "next/server";
 import { Redis } from "@upstash/redis";
+
+// IMPORTANT: laisse Node par défaut
+export const runtime = "nodejs";
 
 const redis = Redis.fromEnv();
 const PAYLOAD_KEY = "assets_payload";
 
+function json(ok, payload = {}, status = 200) {
+  return NextResponse.json({ ok, ts: Date.now(), ...payload }, { status });
+}
+
+function parseLimit(raw, fallback = 250, max = 250) {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.min(Math.floor(n), max);
+}
+
 export async function GET(req) {
   try {
     const { searchParams } = new URL(req.url);
-    const limit = Number(searchParams.get("limit") ?? 250);
+
+    // hard cap 250 côté API (cohérent avec ton rebuild)
+    const limit = parseLimit(searchParams.get("limit"), 250, 250);
 
     const payload = await redis.get(PAYLOAD_KEY);
 
-    if (!payload || !payload.assets) {
-      return NextResponse.json({
-        ok: false,
-        ts: Date.now(),
-        data: [],
-        error: {
-          code: "NO_DATA",
-          message: "No assets_payload in Redis"
-        }
-      });
+    if (!payload || typeof payload !== "object" || !Array.isArray(payload.assets)) {
+      return json(
+        false,
+        {
+          data: [],
+          error: { code: "NO_DATA", message: `No ${PAYLOAD_KEY} in Redis` },
+          meta: { updatedAt: null, count: 0, limit },
+        },
+        503
+      );
     }
 
-    const assets = payload.assets.slice(0, limit);
+    const all = payload.assets;
+    const data = all.slice(0, limit);
 
-    return NextResponse.json({
-      ok: true,
-      ts: Date.now(),
-      data: assets,
+    // meta.count = total stocké, pas le slice
+    const updatedAt =
+      Number.isFinite(Number(payload.payload_updatedAt))
+        ? Number(payload.payload_updatedAt)
+        : Number.isFinite(Number(payload.updatedAt))
+          ? Number(payload.updatedAt)
+          : null;
+
+    return json(true, {
+      data,
       meta: {
-        updatedAt: payload.payload_updatedAt,
-        count: assets.length,
-        limit
-      }
+        updatedAt,
+        count: all.length,
+        limit,
+      },
     });
-
   } catch (err) {
-
-    console.error("[SCAN_ERROR]", err);
-
-    return NextResponse.json({
-      ok: false,
-      ts: Date.now(),
-      data: [],
-      error: {
-        code: "INTERNAL",
-        message: err.message
-      }
-    }, { status: 500 });
-
+    console.error("[/api/scan] INTERNAL", err);
+    return json(
+      false,
+      {
+        data: [],
+        error: { code: "INTERNAL", message: err?.message || "Internal error" },
+        meta: { updatedAt: null, count: 0, limit: 0 },
+      },
+      500
+    );
   }
 }
