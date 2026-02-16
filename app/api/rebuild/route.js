@@ -2,27 +2,26 @@
 import { NextResponse } from "next/server";
 import { Redis } from "@upstash/redis";
 
-// ⚠️ Laisse Node par défaut (Upstash + fetch + env plus fiable)
+// On reste sur Node (plus fiable que edge avec Upstash + fetch + env)
 export const runtime = "nodejs";
 
 const redis = Redis.fromEnv();
 
-// même clé que /api/scan lit : redis.get("assets_payload")
+// Même clé que /api/scan (scan lit redis.get("assets_payload"))
 const PAYLOAD_KEY = "assets_payload";
 
-// CoinGecko (free) — on pagine pour être robuste
+// CoinGecko (free) — pagination robuste (ne pas compter sur 250 d'un coup)
 const VS = "eur";
-const PER_PAGE = 100; // plus stable que 250/page
-const PAGES = 3; // 3*100 = 300 -> slice 250
-
+const PER_PAGE = 100; // plus fiable que 250/page
+const PAGES = 3; // 3*100=300 puis slice 250
 const COINGECKO_URL = (page) =>
-  "https://api.coingecko.com/api/v3/coins/markets" +
+  `https://api.coingecko.com/api/v3/coins/markets` +
   `?vs_currency=${encodeURIComponent(VS)}` +
-  "&order=market_cap_desc" +
+  `&order=market_cap_desc` +
   `&per_page=${PER_PAGE}` +
   `&page=${page}` +
-  "&sparkline=false" +
-  "&price_change_percentage=24h,7d,30d";
+  `&sparkline=false` +
+  `&price_change_percentage=24h,7d,30d`;
 
 const BINANCE_REF = "1216069378";
 
@@ -42,6 +41,7 @@ function safeNum(v) {
   return Number.isFinite(n) ? n : null;
 }
 
+// Scoring simple (non-propriétaire) : stabilité vs amplitudes
 function computeStability({ chg24, chg7, chg30 }) {
   const a24 = Math.abs(chg24 ?? 0);
   const a7 = Math.abs(chg7 ?? 0);
@@ -57,13 +57,14 @@ function computeStability({ chg24, chg7, chg30 }) {
   if (stability_score >= 85) rating = "A";
   else if (stability_score >= 70) rating = "B";
 
-  // ruptures = seuils franchis
+  // ruptures = nb de seuils franchis
   let rupture_rate = 0;
   if (a24 > 5) rupture_rate++;
   if (a7 > 10) rupture_rate++;
   if (a30 > 20) rupture_rate++;
 
   const similarity = Math.max(0, Math.min(100, Math.round(100 - (a24 * 2 + a7))));
+
   const reason =
     regime === "STABLE"
       ? "Faible fréquence de ruptures, régime stable."
@@ -72,50 +73,29 @@ function computeStability({ chg24, chg7, chg30 }) {
   return { stability_score, rating, regime, rupture_rate, similarity, reason };
 }
 
-async function fetchJsonWithTimeout(url, { timeoutMs = 12000, retries = 2 } = {}) {
-  let lastErr;
-  for (let i = 0; i <= retries; i++) {
-    const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      const res = await fetch(url, {
-        cache: "no-store",
-        headers: { accept: "application/json" },
-        signal: controller.signal,
-      });
-      clearTimeout(t);
-
-      if (!res.ok) {
-        const txt = await res.text().catch(() => "");
-        throw new Error(`CoinGecko ${res.status} ${res.statusText}${txt ? ` — ${txt.slice(0, 200)}` : ""}`);
-      }
-      return await res.json();
-    } catch (e) {
-      clearTimeout(t);
-      lastErr = e;
-      // petit backoff
-      if (i < retries) await new Promise((r) => setTimeout(r, 300 * (i + 1)));
-    }
-  }
-  throw lastErr;
-}
-
-async function fetchMarketsTop250() {
+async function fetchMarkets250() {
   const markets = [];
+  const seen = new Set();
 
   for (let page = 1; page <= PAGES; page++) {
-    const url = COINGECKO_URL(page);
-    const data = await fetchJsonWithTimeout(url, { timeoutMs: 12000, retries: 2 });
-    if (!Array.isArray(data)) throw new Error("CoinGecko payload is not an array");
-    markets.push(...data);
-  }
+    const res = await fetch(COINGECKO_URL(page), {
+      cache: "no-store",
+      headers: { accept: "application/json" },
+    });
 
-  // top 250 exact
-  const top = markets.slice(0, 250);
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(`CoinGecko fetch failed: ${res.status} ${txt.slice(0, 120)}`);
+    }
 
-  return top
-    .map((coin) => {
-      const symbol = (coin?.symbol || "").toUpperCase() || null;
+    const data = await res.json();
+    if (!Array.isArray(data)) continue;
+
+    for (const coin of data) {
+      const symbol = (coin?.symbol || "").toUpperCase();
+      if (!symbol) continue;
+      if (seen.has(symbol)) continue; // dédoublonnage symbol
+      seen.add(symbol);
 
       const chg24 = safeNum(coin?.price_change_percentage_24h);
       const chg7 = safeNum(coin?.price_change_percentage_7d_in_currency);
@@ -123,8 +103,8 @@ async function fetchMarketsTop250() {
 
       const score = computeStability({ chg24, chg7, chg30 });
 
-      return {
-        asset: symbol, // compat front
+      markets.push({
+        asset: symbol,
         symbol,
         name: coin?.name ?? null,
 
@@ -143,12 +123,17 @@ async function fetchMarketsTop250() {
         reason: score.reason,
 
         // affiliation Binance injectée côté API
-        binance_url: symbol
-          ? `https://www.binance.com/en/trade/${symbol}_USDT?type=spot&ref=${BINANCE_REF}`
-          : null,
-      };
-    })
-    .filter((x) => x.symbol && x.price != null); // évite les entrées cassées
+        binance_url: `https://www.binance.com/en/trade/${symbol}_USDT?type=spot&ref=${BINANCE_REF}`,
+      });
+
+      if (markets.length >= 250) break;
+    }
+
+    if (markets.length >= 250) break;
+  }
+
+  // On force 250 max
+  return markets.slice(0, 250);
 }
 
 export async function POST(req) {
@@ -156,19 +141,24 @@ export async function POST(req) {
     if (!isAuthorized(req)) {
       return json(
         false,
-        { data: [], error: { code: "UNAUTHORIZED", message: "Invalid token" } },
+        {
+          route: "rebuild",
+          written: false,
+          data: [],
+          error: { code: "UNAUTHORIZED", message: "Invalid token" },
+        },
         401
       );
     }
 
-    const assets = await fetchMarketsTop250();
+    const assets = await fetchMarkets250();
 
+    // Payload exact que /api/scan doit relire
     const payload = {
       assets,
       payload_updatedAt: Date.now(),
     };
 
-    // /api/scan relit exactement cette payload
     await redis.set(PAYLOAD_KEY, payload);
 
     return json(true, {
@@ -176,14 +166,17 @@ export async function POST(req) {
       written: true,
       count: assets.length,
       updatedAt: payload.payload_updatedAt,
-      limit: 250,
-      vs: VS,
     });
   } catch (err) {
     console.error("[/api/rebuild] INTERNAL", err);
     return json(
       false,
-      { data: [], error: { code: "INTERNAL", message: err?.message || "Internal error" } },
+      {
+        route: "rebuild",
+        written: false,
+        data: [],
+        error: { code: "INTERNAL", message: err?.message || "Internal error" },
+      },
       500
     );
   }
