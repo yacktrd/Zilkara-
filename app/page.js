@@ -2,24 +2,40 @@
 
 import { useEffect, useState } from "react";
 
-export default function Home() {
+const API = "/api/scan";
+
+function ratingColor(rating) {
+  if (rating === "A") return "#16a34a"; // vert
+  if (rating === "B") return "#ea580c"; // orange
+  if (rating === "C") return "#6b7280"; // gris
+  return "#6b7280";
+}
+
+function regimeColor(regime) {
+  if (regime === "STABLE") return "#16a34a";
+  if (regime === "VOLATILE") return "#dc2626";
+  return "#6b7280";
+}
+
+export default function Page() {
 
   const [data, setData] = useState([]);
-  const [lastUpdate, setLastUpdate] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [ts, setTs] = useState(null);
 
-  async function loadData() {
+  async function load() {
     try {
-      const res = await fetch("/api/scan");
+      const res = await fetch(API, { cache: "no-store" });
       const json = await res.json();
 
       if (json?.data) {
 
-        // tri par score décroissant
-        const sorted = json.data.sort((a, b) => b.score - a.score);
+        const sorted = json.data.sort(
+          (a, b) => b.stability_score - a.stability_score
+        );
 
         setData(sorted);
-        setLastUpdate(new Date());
+        setTs(json.ts);
       }
 
     } catch (e) {
@@ -31,116 +47,160 @@ export default function Home() {
 
   useEffect(() => {
 
-    loadData();
+    load();
 
-    const interval = setInterval(loadData, 60000);
+    const interval = setInterval(load, 30000);
 
     return () => clearInterval(interval);
 
   }, []);
 
-  function ratingColor(rating) {
-
-    if (rating === "A") return "#16a34a";
-    if (rating === "B") return "#ca8a04";
-    if (rating === "C") return "#ea580c";
-    if (rating === "D") return "#dc2626";
-
-    return "#6b7280";
-  }
-
   return (
-
     <main style={{
-      padding: "20px",
-      fontFamily: "system-ui",
-      maxWidth: "700px",
+      padding: 20,
+      fontFamily: "serif",
+      maxWidth: 900,
       margin: "0 auto"
     }}>
 
-      <h1 style={{
-        fontSize: "28px",
-        marginBottom: "5px"
-      }}>
-        Zilkara
-      </h1>
+      {/* HEADER */}
 
       <div style={{
-        fontSize: "14px",
-        color: "#666",
-        marginBottom: "20px"
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center"
       }}>
-        {loading
-          ? "Loading..."
-          : `OK — ${data.length} actifs`
-        }
+
+        <h1 style={{
+          fontSize: 32,
+          fontWeight: 600
+        }}>
+          Zilkara
+        </h1>
+
+        <button
+          onClick={load}
+          style={{
+            fontSize: 14,
+            cursor: "pointer"
+          }}
+        >
+          Refresh
+        </button>
+
       </div>
 
-      <table style={{
-        width: "100%",
-        borderCollapse: "collapse"
+      <div style={{
+        marginBottom: 20,
+        color: "#666"
+      }}>
+        OK — {data.length} actifs
+      </div>
+
+      {/* TABLE */}
+
+      <div style={{
+        overflowX: "auto"
       }}>
 
-        <thead>
-          <tr style={{
-            textAlign: "left",
-            fontSize: "13px",
-            color: "#666"
-          }}>
-            <th>Asset</th>
-            <th>Score</th>
-            <th>Rating</th>
-            <th>Regime</th>
-          </tr>
-        </thead>
+        <table style={{
+          width: "100%",
+          borderCollapse: "collapse"
+        }}>
 
-        <tbody>
-
-          {data.map((asset, i) => (
-
-            <tr key={i} style={{
-              borderTop: "1px solid #eee",
-              fontSize: "15px"
-            }}>
-
-              <td style={{ padding: "8px 0" }}>
-                {asset.symbol}
-              </td>
-
-              <td>
-                {asset.score}
-              </td>
-
-              <td style={{
-                color: ratingColor(asset.rating),
-                fontWeight: "600"
-              }}>
-                {asset.rating}
-              </td>
-
-              <td style={{
-                color: asset.regime === "STABLE"
-                  ? "#16a34a"
-                  : "#ea580c"
-              }}>
-                {asset.regime}
-              </td>
-
+          <thead>
+            <tr style={{ textAlign: "left" }}>
+              <th>Asset</th>
+              <th>Price</th>
+              <th>24h</th>
+              <th>7d</th>
+              <th>Score</th>
+              <th>Rating</th>
+              <th>Regime</th>
             </tr>
+          </thead>
 
-          ))}
+          <tbody>
 
-        </tbody>
+            {loading && (
+              <tr>
+                <td colSpan="7">Loading...</td>
+              </tr>
+            )}
 
-      </table>
+            {!loading && data.map((a, i) => (
 
-      <div style={{
-        marginTop: "15px",
-        fontSize: "12px",
-        color: "#999"
-      }}>
-        auto refresh 60s
+              <tr key={i}>
+
+                <td>
+                  <a
+                    href={a.binance_url}
+                    target="_blank"
+                    style={{
+                      textDecoration: "none",
+                      color: "black",
+                      fontWeight: 500
+                    }}
+                  >
+                    {a.asset}
+                  </a>
+                </td>
+
+                <td>
+                  {a.price.toFixed(4)}
+                </td>
+
+                <td style={{
+                  color: a.chg_24h_pct >= 0 ? "#16a34a" : "#dc2626"
+                }}>
+                  {a.chg_24h_pct.toFixed(2)}%
+                </td>
+
+                <td style={{
+                  color: a.chg_7d_pct >= 0 ? "#16a34a" : "#dc2626"
+                }}>
+                  {a.chg_7d_pct.toFixed(2)}%
+                </td>
+
+                <td>
+                  {a.stability_score}
+                </td>
+
+                <td style={{
+                  color: ratingColor(a.rating),
+                  fontWeight: 600
+                }}>
+                  {a.rating}
+                </td>
+
+                <td style={{
+                  color: regimeColor(a.regime),
+                  fontWeight: 600
+                }}>
+                  {a.regime}
+                </td>
+
+              </tr>
+
+            ))}
+
+          </tbody>
+
+        </table>
+
       </div>
+
+      {/* FOOTER */}
+
+      {ts && (
+        <div style={{
+          marginTop: 20,
+          fontSize: 12,
+          color: "#888"
+        }}>
+          Updated: {new Date(ts).toLocaleTimeString()}
+        </div>
+      )}
 
     </main>
   );
