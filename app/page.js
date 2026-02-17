@@ -1,111 +1,130 @@
-export const dynamic = "force-dynamic";
+"use client";
 
-async function getScan() {
-  try {
-    const base =
-      process.env.NEXT_PUBLIC_BASE_URL ||
-      process.env.VERCEL_URL ||
-      "http://localhost:3000";
+import { useEffect, useState } from "react";
 
-    // IMPORTANT: VERCEL_URL est souvent sans protocole -> on force https
-    const normalizedBase = base.startsWith("http")
-      ? base
-      : `https://${base}`;
+export default function Home() {
 
-    const url = `${normalizedBase}/api/scan?limit=250`;
+  const [data, setData] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [lastUpdate, setLastUpdate] = useState(null);
 
-    const res = await fetch(url, { cache: "no-store" });
-    if (!res.ok) return { ok: false, data: [], meta: null };
+  async function fetchScan() {
+    try {
+      const res = await fetch("/api/scan", { cache: "no-store" });
+      const json = await res.json();
 
-    return res.json();
-  } catch {
-    return { ok: false, data: [], meta: null };
+      if (json?.data) {
+        setData(json.data);
+        setLastUpdate(new Date());
+      }
+
+    } catch (err) {
+      console.error("Fetch error:", err);
+    } finally {
+      setLoading(false);
+    }
   }
-}
 
-function toDate(meta) {
-  if (!meta?.updatedAt) return null;
-  const ts = meta.updatedAt;
-  // seconds vs ms
-  const ms = ts > 1e12 ? ts : ts * 1000;
-  return new Date(ms);
-}
+  useEffect(() => {
 
-function fmtPrice(n) {
-  if (n == null) return "—";
-  return Number(n).toLocaleString("en-US", { maximumFractionDigits: 6 });
-}
+    fetchScan();
 
-function fmtPct(x) {
-  if (x == null) return "—";
-  const pct = Number(x) * 100;
-  return `${pct.toFixed(2)}%`;
-}
+    const interval = setInterval(() => {
+      fetchScan();
+    }, 60000);
 
-export default async function Home() {
-  const json = await getScan();
+    return () => clearInterval(interval);
 
-  const data = (json?.data || [])
-    .slice()
-    .sort((a, b) => (b.stability_score ?? 0) - (a.stability_score ?? 0));
-
-  const updated = toDate(json?.meta);
+  }, []);
 
   return (
-    <main style={{ padding: 16, background: "#0b0f1a", minHeight: "100vh", color: "white" }}>
-      {/* Auto-refresh simple (server page reload) */}
-      <meta httpEquiv="refresh" content="60" />
 
-      <h2 style={{ margin: 0 }}>Zilkara Scanner</h2>
+    <main style={{
+      padding: "20px",
+      fontFamily: "system-ui",
+      background: "#0b0f17",
+      color: "#e6edf3",
+      minHeight: "100vh"
+    }}>
 
-      <div style={{ fontSize: 12, opacity: 0.8, marginTop: 8, marginBottom: 12 }}>
-        {json?.meta ? (
-          <>
-            Assets: {json.meta.count} | Updated: {updated ? updated.toLocaleTimeString() : "—"}
-          </>
-        ) : (
-          "No meta"
-        )}
-      </div>
+      <h1 style={{
+        fontSize: "24px",
+        marginBottom: "10px"
+      }}>
+        Zilkara Scanner
+      </h1>
 
-      <div style={{ overflowX: "auto", border: "1px solid #1f2a44", borderRadius: 8 }}>
-        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+      <p style={{
+        fontSize: "12px",
+        color: "#8b949e",
+        marginBottom: "20px"
+      }}>
+        Last update: {lastUpdate ? lastUpdate.toLocaleTimeString() : "..."}
+      </p>
+
+      {loading ? (
+
+        <p>Loading...</p>
+
+      ) : (
+
+        <table style={{
+          width: "100%",
+          borderCollapse: "collapse"
+        }}>
+
           <thead>
-            <tr style={{ textAlign: "left", background: "#101a33" }}>
-              <th style={{ padding: 10 }}>Symbol</th>
-              <th style={{ padding: 10, textAlign: "right" }}>Price</th>
-              <th style={{ padding: 10, textAlign: "right" }}>24h</th>
-              <th style={{ padding: 10, textAlign: "right" }}>7d</th>
-              <th style={{ padding: 10, textAlign: "right" }}>30d</th>
-              <th style={{ padding: 10, textAlign: "right" }}>Score</th>
-              <th style={{ padding: 10 }}>Rating</th>
-              <th style={{ padding: 10 }}>Regime</th>
+            <tr style={{
+              borderBottom: "1px solid #30363d"
+            }}>
+              <th align="left">Symbol</th>
+              <th align="right">Price</th>
+              <th align="right">Score</th>
+              <th align="center">Rating</th>
+              <th align="center">Regime</th>
             </tr>
           </thead>
 
           <tbody>
-            {data.map((a, i) => (
-              <tr key={i} style={{ borderTop: "1px solid #1f2a44" }}>
-                <td style={{ padding: 10, whiteSpace: "nowrap" }}>{a.symbol}</td>
-                <td style={{ padding: 10, textAlign: "right", whiteSpace: "nowrap" }}>{fmtPrice(a.price)}</td>
-                <td style={{ padding: 10, textAlign: "right", whiteSpace: "nowrap" }}>{fmtPct(a.chg_24h_pct)}</td>
-                <td style={{ padding: 10, textAlign: "right", whiteSpace: "nowrap" }}>{fmtPct(a.chg_7d_pct)}</td>
-                <td style={{ padding: 10, textAlign: "right", whiteSpace: "nowrap" }}>{fmtPct(a.chg_30d_pct)}</td>
-                <td style={{ padding: 10, textAlign: "right" }}>{a.stability_score ?? "—"}</td>
-                <td style={{ padding: 10 }}>{a.rating ?? "—"}</td>
-                <td style={{ padding: 10 }}>{a.regime ?? "—"}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
 
-      {!json?.ok && (
-        <div style={{ marginTop: 12, color: "#ff6b6b", fontSize: 12 }}>
-          API error: /api/scan not OK
-        </div>
+            {data
+              .sort((a, b) => b.score - a.score)
+              .map((asset, index) => (
+
+                <tr key={index} style={{
+                  borderBottom: "1px solid #161b22"
+                }}>
+
+                  <td>{asset.symbol}</td>
+
+                  <td align="right">
+                    {asset.price?.toFixed?.(4) ?? "-"}
+                  </td>
+
+                  <td align="right">
+                    {asset.score}
+                  </td>
+
+                  <td align="center">
+                    {asset.rating}
+                  </td>
+
+                  <td align="center">
+                    {asset.regime}
+                  </td>
+
+                </tr>
+
+              ))}
+
+          </tbody>
+
+        </table>
+
       )}
+
     </main>
+
   );
+
 }
-/page.js
