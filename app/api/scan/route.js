@@ -1,151 +1,87 @@
 // app/api/scan/route.js
-import { NextResponse } from "next/server";
-
+export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
+export const fetchCache = 'force-no-store'
+export const revalidate = 0
 import fs from "fs/promises";
 import path from "path";
 
-// IMPORTANT (Vercel / Next.js App Router)
-// Cette route est DYNAMIQUE (lecture fichier + cache serveur).
-export const dynamic = "force-dynamic";
-export const runtime = "nodejs";
-
-// Cache mémoire (sur instance)
-let CACHE = null;
-let CACHE_TS = 0;
-const CACHE_DURATION_MS = 60_000; // 60s
-
-function clampInt(v, min, max, fallback) {
-  const n = Number.parseInt(v, 10);
-  if (Number.isNaN(n)) return fallback;
-  return Math.max(min, Math.min(max, n));
+function num(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
 }
 
-function safeUpper(v) {
-  return String(v || "").trim().toUpperCase();
+function safeString(v) {
+  return typeof v === "string" ? v : "";
 }
 
-export async function GET(req) {
+export async function GET() {
+  let file_error = null;
+  let file_meta = {
+    path: "data/assets.json",
+    last_update_ts: null,
+    count: null,
+    size_bytes: null,
+  };
+
   try {
-    // 1) Cache (si présent et pas expiré)
-    const now = Date.now();
-    if (CACHE && now - CACHE_TS < CACHE_DURATION_MS) {
-      return NextResponse.json(CACHE, {
-        headers: {
-          "Cache-Control": "no-store",
-        },
-      });
-    }
-
-    // 2) Paramètres (optionnels) : ?limit=20&minScore=90&mode=STABLE&ratings=A,B
-    const url = new URL(req.url);
-
-    const limit = clampInt(url.searchParams.get("limit"), 5, 50, 20);
-    const minScore = clampInt(url.searchParams.get("minScore"), 0, 100, 90);
-
-    const mode = safeUpper(url.searchParams.get("mode")); // ALL / STABLE / VOLATILE
-    const ratingsParam = url.searchParams.get("ratings"); // ex "A,B"
-    const allowedRatings = ratingsParam
-      ? ratingsParam
-          .split(",")
-          .map((x) => safeUpper(x))
-          .filter(Boolean)
-      : ["A", "B"];
-
-    // 3) Lecture fichier data/assets.json
-    //    IMPORTANT : on lit depuis le root du projet en prod aussi.
     const filePath = path.join(process.cwd(), "data", "assets.json");
 
-    let raw;
-    try {
-      raw = await fs.readFile(filePath, "utf-8");
-    } catch (e) {
-      return NextResponse.json(
-        {
-          ok: false,
-          ts: Date.now(),
-          error: "ASSETS_FILE_NOT_FOUND",
-          details: `Impossible de lire ${filePath}`,
-        },
-        { status: 500 }
-      );
-    }
+    const stat = await fs.stat(filePath);
+    file_meta.size_bytes = stat.size;
+    file_meta.last_update_ts = stat.mtimeMs ? Math.round(stat.mtimeMs) : null;
 
-    let json;
-    try {
-      json = JSON.parse(raw);
-    } catch (e) {
-      return NextResponse.json(
-        {
-          ok: false,
-          ts: Date.now(),
-          error: "ASSETS_JSON_INVALID",
-          details: "assets.json n'est pas un JSON valide",
-        },
-        { status: 500 }
-      );
-    }
+    const raw = await fs.readFile(filePath, "utf-8");
+    const parsed = JSON.parse(raw);
 
-    // Supporte 2 formats :
-    // - { data: [...] }
-    // - [...]
-    const dataArray = Array.isArray(json) ? json : Array.isArray(json?.data) ? json.data : [];
+    const arr = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.data) ? parsed.data : [];
+    const data = arr
+      .map((x) => {
+        const score = num(x?.score) ?? num(x?.stability_score) ?? null;
 
-    // 4) Normalisation + filtres
-    const cleaned = dataArray
-      .map((a) => ({
-        asset: a?.asset ?? a?.symbol ?? "",
-        symbol: a?.symbol ?? a?.asset ?? "",
-        price: Number(a?.price ?? 0),
-        chg_24h_pct: Number(a?.chg_24h_pct ?? 0),
-        chg_7d_pct: Number(a?.chg_7d_pct ?? 0),
-        chg_30d_pct: Number(a?.chg_30d_pct ?? 0),
-        stability_score: Number(a?.stability_score ?? a?.score ?? 0),
-        rating: safeUpper(a?.rating ?? ""),
-        regime: safeUpper(a?.regime ?? "UNKNOWN"),
-        binance_url: a?.binance_url ?? null,
-      }))
-      .filter((a) => a.symbol);
+        return {
+          asset: safeString(x?.asset) || safeString(x?.symbol) || "",
+          symbol: safeString(x?.symbol) || safeString(x?.asset) || "",
+          price: num(x?.price),
+          chg_24h_pct: num(x?.chg_24h_pct),
+          chg_7d_pct: num(x?.chg_7d_pct),
+          chg_30d_pct: num(x?.chg_30d_pct),
 
-    const filtered = cleaned
-      .filter((a) => a.stability_score >= minScore)
-      .filter((a) => (allowedRatings.length ? allowedRatings.includes(a.rating) : true))
-      .filter((a) => {
-        if (!mode || mode === "ALL") return true;
-        return a.regime === mode;
+          score, // <= Version 1: le "Score" est servi explicitement
+          stability_score: num(x?.stability_score) ?? score, // compat
+
+          rating: safeString(x?.rating) || null,
+          regime: safeString(x?.regime) || null,
+
+          rupture_rate: num(x?.rupture_rate),
+          similarity: num(x?.similarity),
+          reason: safeString(x?.reason) || null,
+
+          binance_url: safeString(x?.binance_url) || null,
+        };
       })
-      .sort((x, y) => y.stability_score - x.stability_score)
-      .slice(0, limit);
+      .filter((x) => x.asset && x.symbol);
 
-    // 5) Réponse
-    const response = {
-      ok: true,
-      ts: Date.now(),
-      count: filtered.length,
-      params: {
-        limit,
-        minScore,
-        mode: mode || "ALL",
-        ratings: allowedRatings,
+    file_meta.count = data.length;
+
+    return Response.json(
+      {
+        ok: true,
+        ts: Date.now(),
+        meta: file_meta,
+        file_error,
+        data,
       },
-      data: filtered,
-    };
-
-    // 6) Mise en cache mémoire
-    CACHE = response;
-    CACHE_TS = Date.now();
-
-    return NextResponse.json(response, {
-      headers: {
-        "Cache-Control": "no-store",
-      },
-    });
-  } catch (err) {
-    return NextResponse.json(
+      { status: 200 }
+    );
+  } catch (e) {
+    file_error = e?.message || String(e);
+    return Response.json(
       {
         ok: false,
         ts: Date.now(),
-        error: "SCAN_INTERNAL_ERROR",
-        details: String(err?.message || err),
+        meta: file_meta,
+        error: file_error,
       },
       { status: 500 }
     );
