@@ -1,6 +1,7 @@
 // app/page.js
 "use client";
 
+// deploy refresh
 import { useEffect, useMemo, useState } from "react";
 
 const REFRESH_MS = 60_000;
