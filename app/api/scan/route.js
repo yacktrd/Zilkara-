@@ -1,16 +1,12 @@
-// app/api/scan/route.js
-export const runtime = 'nodejs'
-export const dynamic = 'force-dynamic'
-export const fetchCache = 'force-no-store'
-export const revalidate = 0
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const fetchCache = "force-no-store";
+export const revalidate = 0;
+
 import fs from "fs/promises";
 import path from "path";
 
-function num(v) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-}
-
+export async function GET() {
 function safeString(v) {
   return typeof v === "string" ? v : "";
 }
