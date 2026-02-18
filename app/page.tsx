@@ -20,7 +20,7 @@ export default function Scanner() {
   fetch("/api/scan")
     .then(res => res.json())
     .then(json => {
-      setData(json.assets); //
+      setData(json.data); //
       setLoading(false);
     });
 }, []);
