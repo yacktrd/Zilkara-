@@ -1,299 +1,228 @@
-// app/page.js
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
 
-function fmtPrice(n) {
-  const v = Number(n);
-  if (!Number.isFinite(v)) return "-";
-  // affichage simple, propre
-  if (v >= 100) return v.toFixed(2);
-  if (v >= 1) return v.toFixed(3);
-  if (v >= 0.1) return v.toFixed(4);
-  return v.toFixed(6);
+function fmtNumberFR(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "--";
+
+  const abs = Math.abs(n);
+  const digits = abs >= 1 ? 2 : abs >= 0.1 ? 4 : 6;
+
+  return new Intl.NumberFormat("fr-FR", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: digits,
+  }).format(n);
 }
 
-function fmtPct(n) {
-  const v = Number(n);
-  if (!Number.isFinite(v)) return "-";
-  const sign = v > 0 ? "+" : "";
-  return `${sign}${v.toFixed(2)}%`;
+function fmtPctFR(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "--";
+  const sign = n > 0 ? "+" : "";
+  return `${sign}${new Intl.NumberFormat("fr-FR", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2,
+  }).format(n)}%`;
 }
 
 export default function Page() {
-  const [assets, setAssets] = useState([]);
-  const [status, setStatus] = useState("LOADING");
-  const [count, setCount] = useState(0);
-  const [lastUpdate, setLastUpdate] = useState(null);
+  const [data, setData] = useState([]);
+  const [ok, setOk] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState("");
 
-  // Mode UI
-  const [mode, setMode] = useState("ALL"); // ALL / STABLE / VOLATILE
-
-  // Settings UI (tu peux les rendre plus tard réglables)
-  const limit = 20;
-  const minScore = 90;
-  const ratings = "A,B";
-
-  const fetchData = async () => {
+  async function load() {
+    setLoading(true);
+    setErr("");
     try {
-      setStatus("LOADING");
-
-      const qs = new URLSearchParams({
-        limit: String(limit),
-        minScore: String(minScore),
-        mode,
-        ratings,
-      });
-
-      // no-store pour éviter cache navigateur
-      const res = await fetch(`/api/scan?${qs.toString()}`, { cache: "no-store" });
+      const res = await fetch("/api/scan", { cache: "no-store" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
 
-      if (!json?.ok) {
-        setStatus("ERROR");
-        setAssets([]);
-        setCount(0);
-        return;
-      }
-
-      setAssets(Array.isArray(json.data) ? json.data : []);
-      setCount(Number(json.count || 0));
-      setLastUpdate(new Date());
-      setStatus("OK");
+      setOk(Boolean(json?.ok));
+      setData(Array.isArray(json?.data) ? json.data : []);
     } catch (e) {
-      setStatus("ERROR");
-      setAssets([]);
-      setCount(0);
+      setErr(e?.message || "Erreur");
+      setOk(false);
+      setData([]);
+    } finally {
+      setLoading(false);
     }
-  };
+  }
 
-  // auto-refresh : 60s
   useEffect(() => {
-    fetchData();
-    const t = setInterval(fetchData, 60_000);
-    return () => clearInterval(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode]);
+    load();
+  }, []);
 
-  const headerRight = useMemo(() => {
-    if (status === "LOADING") return "Loading...";
-    if (status === "ERROR") return "Error";
-    return `OK — ${count} actifs`;
-  }, [status, count]);
+  const rows = useMemo(() => {
+    return (data || []).slice().sort((a, b) => {
+      // tri stable : stability_score desc si présent, sinon asset asc
+      const sa = Number(a?.stability_score);
+      const sb = Number(b?.stability_score);
+      const hasA = Number.isFinite(sa);
+      const hasB = Number.isFinite(sb);
+      if (hasA && hasB) return sb - sa;
+      if (hasA && !hasB) return -1;
+      if (!hasA && hasB) return 1;
+      return String(a?.asset || "").localeCompare(String(b?.asset || ""));
+    });
+  }, [data]);
 
   return (
-    <main style={styles.main}>
-      <div style={styles.topbar}>
-        <div>
-          <div style={styles.title}>Zilkara</div>
-          <div style={styles.sub}>
-            {headerRight}
-            {lastUpdate ? (
-              <span style={styles.dot}>
-                {" "}
-                • {lastUpdate.toLocaleTimeString()}
-              </span>
-            ) : null}
+    <main style={{ maxWidth: 980, margin: "0 auto", padding: "32px 16px" }}>
+      <header
+        style={{
+          display: "flex",
+          alignItems: "baseline",
+          justifyContent: "space-between",
+          gap: 16,
+          marginBottom: 18,
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
+          <h1 style={{ fontSize: 44, lineHeight: 1.05, margin: 0 }}>Zilkara</h1>
+          <div style={{ fontSize: 16, opacity: 0.7 }}>
+            {loading ? "..." : ok ? "OK" : "KO"} — {rows.length} actifs
           </div>
         </div>
+       <div style={{
+            opacity: 0.6,
+            fontSize: 12,
+            marginBottom: 10
+        }}>
+        Live Market Scanner
+        </div>
 
-        <button onClick={fetchData} style={styles.refreshBtn}>
+        <button
+          onClick={load}
+          style={{
+            padding: "10px 14px",
+            borderRadius: 10,
+            border: "1px solid rgba(0,0,0,0.15)",
+            background: "white",
+            cursor: "pointer",
+          }}
+        >
           Refresh
         </button>
-      </div>
+      </header>
 
-      <div style={styles.filters}>
-        <button
-          onClick={() => setMode("ALL")}
-          style={{ ...styles.filterBtn, ...(mode === "ALL" ? styles.filterBtnActive : {}) }}
+      {err ? (
+        <div
+          style={{
+            padding: 14,
+            borderRadius: 12,
+            border: "1px solid rgba(255,0,0,0.25)",
+            background: "rgba(255,0,0,0.04)",
+            marginBottom: 16,
+          }}
         >
-          ALL
-        </button>
-        <button
-          onClick={() => setMode("STABLE")}
-          style={{ ...styles.filterBtn, ...(mode === "STABLE" ? styles.filterBtnActive : {}) }}
-        >
-          STABLE
-        </button>
-        <button
-          onClick={() => setMode("VOLATILE")}
-          style={{ ...styles.filterBtn, ...(mode === "VOLATILE" ? styles.filterBtnActive : {}) }}
-        >
-          VOLATILE
-        </button>
-      </div>
-
-      <div style={styles.tableWrap}>
-        <table style={styles.table}>
-          <thead>
-            <tr>
-              <th style={styles.thLeft}>Asset</th>
-              <th style={styles.th}>Price</th>
-              <th style={styles.th}>24h</th>
-              <th style={styles.th}>7d</th>
-              <th style={styles.th}>Score</th>
-              <th style={styles.th}>Rating</th>
-              <th style={styles.th}>Regime</th>
-              <th style={styles.th}>Link</th>
-            </tr>
-          </thead>
-
-          <tbody>
-            {assets.map((a) => (
-              <tr key={`${a.symbol}-${a.regime}-${a.rating}`} style={styles.tr}>
-                <td style={styles.tdLeft}>
-                  <span style={styles.asset}>{a.symbol}</span>
-                </td>
-                <td style={styles.td}>{fmtPrice(a.price)}</td>
-                <td style={styles.td}>{fmtPct(a.chg_24h_pct)}</td>
-                <td style={styles.td}>{fmtPct(a.chg_7d_pct)}</td>
-                <td style={styles.td}>{Number(a.stability_score ?? 0)}</td>
-                <td style={styles.td}>{a.rating}</td>
-                <td style={styles.td}>{a.regime}</td>
-                <td style={styles.td}>
-                  {a.binance_url ? (
-                    <a href={a.binance_url} target="_blank" rel="noreferrer" style={styles.link}>
-                      Binance
-                    </a>
-                  ) : (
-                    "-"
-                  )}
-                </td>
-              </tr>
-            ))}
-
-            {status === "OK" && assets.length === 0 ? (
-              <tr>
-                <td colSpan={8} style={styles.empty}>
-                  Aucun résultat (filtres trop stricts ?)
-                </td>
-              </tr>
-            ) : null}
-
-            {status === "ERROR" ? (
-              <tr>
-                <td colSpan={8} style={styles.empty}>
-                  Erreur API /scan
-                </td>
-              </tr>
-            ) : null}
-          </tbody>
-        </table>
-      </div>
-
-      <div style={styles.footer}>
-        <div style={styles.footerLine}>
-          Params: limit={limit} • minScore={minScore} • ratings={ratings} • mode={mode}
+          Erreur: {err}
         </div>
-      </div>
-    </main>
-  );
-}
+      ) : null}
 
-const styles = {
-  main: {
-    maxWidth: 980,
-    margin: "0 auto",
-    padding: "28px 18px 40px",
-    fontFamily:
-      'ui-serif, "New York", "Iowan Old Style", "Palatino Linotype", Palatino, serif',
-  },
-  topbar: {
-    display: "flex",
-    alignItems: "flex-start",
-    justifyContent: "space-between",
-    gap: 16,
-    marginBottom: 16,
-  },
-  title: {
-    fontSize: 44,
-    fontWeight: 700,
-    lineHeight: 1,
-    letterSpacing: "-0.5px",
-  },
-  sub: {
-    marginTop: 6,
-    fontSize: 14,
-    opacity: 0.75,
-  },
-  dot: { opacity: 0.7 },
-  refreshBtn: {
-    padding: "10px 12px",
-    borderRadius: 10,
-    border: "1px solid rgba(0,0,0,0.15)",
-    background: "transparent",
-    cursor: "pointer",
-    fontSize: 14,
-  },
-  filters: {
-    display: "flex",
-    gap: 10,
-    margin: "10px 0 16px",
-  },
-  filterBtn: {
-    padding: "8px 10px",
-    borderRadius: 10,
-    border: "1px solid rgba(0,0,0,0.15)",
-    background: "transparent",
-    cursor: "pointer",
-    fontSize: 13,
-  },
-  filterBtnActive: {
-    border: "1px solid rgba(0,0,0,0.35)",
-    fontWeight: 700,
-  },
-  tableWrap: {
-    width: "100%",
-    overflowX: "auto",
-    borderTop: "1px solid rgba(0,0,0,0.08)",
-    paddingTop: 10,
-  },
-  table: {
-    width: "100%",
-    borderCollapse: "separate",
-    borderSpacing: "0 14px",
-    minWidth: 820, // force horizontal scroll sur mobile
-  },
-  thLeft: {
-    textAlign: "left",
-    fontSize: 13,
-    opacity: 0.6,
-    fontWeight: 600,
-    paddingBottom: 6,
-  },
-  th: {
-    textAlign: "left",
-    fontSize: 13,
-    opacity: 0.6,
-    fontWeight: 600,
-    paddingBottom: 6,
-  },
-  tr: {
-    background: "transparent",
-  },
-  tdLeft: {
-    padding: "10px 8px",
-    fontSize: 16,
-    fontWeight: 700,
-  },
-  td: {
-    padding: "10px 8px",
-    fontSize: 15,
-  },
-  asset: {
-    letterSpacing: "0.2px",
-  },
-  link: {
-    textDecoration: "underline",
-  },
-  empty: {
-    padding: "18px 8px",
-    opacity: 0.65,
-  },
-  footer: {
-    marginTop: 18,
-    opacity: 0.65,
-    fontSize: 12,
-  },
-  footerLine: {},
-};
+      <div style={{ overflowX: "auto" }}>
+        <table
+          style={{
+            width: "100%",
+            borderCollapse: "collapse",
+            minWidth: 520,
+          }}
+        >
+        <thead>
+  <tr style={{ textAlign: "left", opacity: 0.85 }}>
+    <th style={{ padding: "10px 0" }}>Asset</th>
+    <th style={{ padding: "10px 0" }}>Score</th>
+    <th style={{ padding: "10px 0" }}>Price</th>
+    <th style={{ padding: "10px 0" }}>24h</th>
+    <th style={{ padding: "10px 0" }}>7d</th>
+    <th style={{ padding: "10px 0" }}>Regime</th>
+    <th style={{ padding: "10px 0" }}>Trade</th>
+  </tr>
+</thead>
+    <tbody>
+{rows.map((r) => {
+
+const score = Number(r.stability_score || 0)
+
+const scoreColor =
+score >= 90 ? "#16c784" :
+score >= 75 ? "#f0b90b" :
+"#ea3943"
+
+const ratingBg =
+r.rating === "A" ? "#16c784" :
+r.rating === "B" ? "#f0b90b" :
+"#ea3943"
+
+return (
+
+<tr key={r.asset} style={{
+borderBottom: "1px solid rgba(255,255,255,0.06)",
+cursor: "default"
+}}>
+
+<td style={{
+fontWeight: 700,
+fontSize: 16
+}}>
+{r.asset}
+</td>
+
+<td style={{
+fontWeight: 800,
+color: scoreColor,
+fontSize: 18
+}}>
+{score}
+</td>
+
+<td>
+<span style={{
+background: ratingBg,
+color: "white",
+padding: "4px 8px",
+borderRadius: 6,
+fontWeight: 700,
+fontSize: 12
+}}>
+{r.rating}
+</span>
+</td>
+
+<td className="hide-mobile">
+{fmtPctFR(r.chg_24h_pct)}
+</td>
+
+<td className="hide-mobile">
+{fmtPctFR(r.chg_7d_pct)}
+</td>
+
+<td>
+
+<a
+href={r.binance_url}
+target="_blank"
+rel="noopener noreferrer"
+style={{
+background: "#f0b90b",
+color: "black",
+padding: "6px 12px",
+borderRadius: 6,
+fontWeight: 700,
+textDecoration: "none"
+}}
+>
+
+Trade
+
+</a>
+
+</td>
+
+</tr>
+
+)
+
+})}
+</tbody>
