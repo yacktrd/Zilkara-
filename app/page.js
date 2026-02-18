@@ -1,228 +1,108 @@
-"use client";
+export const dynamic = "force-dynamic";
 
-import { useEffect, useMemo, useState } from "react";
+async function getScan() {
+  try {
+    const base =
+      process.env.NEXT_PUBLIC_BASE_URL ||
+      process.env.VERCEL_URL ||
+      "http://localhost:3000";
 
-function fmtNumberFR(value) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return "--";
+    const url = base.startsWith("http")
+      ? `${base}/api/scan`
+      : `https://${base}/api/scan`;
 
-  const abs = Math.abs(n);
-  const digits = abs >= 1 ? 2 : abs >= 0.1 ? 4 : 6;
+    const res = await fetch(url, { cache: "no-store" });
 
-  return new Intl.NumberFormat("fr-FR", {
-    minimumFractionDigits: 0,
-    maximumFractionDigits: digits,
-  }).format(n);
-}
+    if (!res.ok) return { ok: false, data: [] };
 
-function fmtPctFR(value) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return "--";
-  const sign = n > 0 ? "+" : "";
-  return `${sign}${new Intl.NumberFormat("fr-FR", {
-    minimumFractionDigits: 0,
-    maximumFractionDigits: 2,
-  }).format(n)}%`;
-}
-
-export default function Page() {
-  const [data, setData] = useState([]);
-  const [ok, setOk] = useState(false);
-  const [loading, setLoading] = useState(true);
-  const [err, setErr] = useState("");
-
-  async function load() {
-    setLoading(true);
-    setErr("");
-    try {
-      const res = await fetch("/api/scan", { cache: "no-store" });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const json = await res.json();
-
-      setOk(Boolean(json?.ok));
-      setData(Array.isArray(json?.data) ? json.data : []);
-    } catch (e) {
-      setErr(e?.message || "Erreur");
-      setOk(false);
-      setData([]);
-    } finally {
-      setLoading(false);
-    }
+    return res.json();
+  } catch {
+    return { ok: false, data: [] };
   }
+}
 
-  useEffect(() => {
-    load();
-  }, []);
+function colorScore(score) {
+  if (score >= 95) return "#22c55e";
+  if (score >= 85) return "#eab308";
+  return "#ef4444";
+}
 
-  const rows = useMemo(() => {
-    return (data || []).slice().sort((a, b) => {
-      // tri stable : stability_score desc si présent, sinon asset asc
-      const sa = Number(a?.stability_score);
-      const sb = Number(b?.stability_score);
-      const hasA = Number.isFinite(sa);
-      const hasB = Number.isFinite(sb);
-      if (hasA && hasB) return sb - sa;
-      if (hasA && !hasB) return -1;
-      if (!hasA && hasB) return 1;
-      return String(a?.asset || "").localeCompare(String(b?.asset || ""));
-    });
-  }, [data]);
+export default async function Page() {
+  const json = await getScan();
+  const rows = json?.data || [];
 
   return (
-    <main style={{ maxWidth: 980, margin: "0 auto", padding: "32px 16px" }}>
-      <header
-        style={{
-          display: "flex",
-          alignItems: "baseline",
-          justifyContent: "space-between",
-          gap: 16,
-          marginBottom: 18,
-        }}
-      >
-        <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
-          <h1 style={{ fontSize: 44, lineHeight: 1.05, margin: 0 }}>Zilkara</h1>
-          <div style={{ fontSize: 16, opacity: 0.7 }}>
-            {loading ? "..." : ok ? "OK" : "KO"} — {rows.length} actifs
-          </div>
-        </div>
-       <div style={{
-            opacity: 0.6,
-            fontSize: 12,
-            marginBottom: 10
-        }}>
-        Live Market Scanner
-        </div>
+    <main
+      style={{
+        background: "#0f172a",
+        color: "#e5e7eb",
+        minHeight: "100vh",
+        padding: "24px",
+        fontFamily: "system-ui"
+      }}
+    >
+      <h1 style={{ fontSize: "28px", fontWeight: "700" }}>
+        Zilkara — Market Scanner
+      </h1>
 
-        <button
-          onClick={load}
-          style={{
-            padding: "10px 14px",
-            borderRadius: 10,
-            border: "1px solid rgba(0,0,0,0.15)",
-            background: "white",
-            cursor: "pointer",
-          }}
-        >
-          Refresh
-        </button>
-      </header>
-
-      {err ? (
-        <div
-          style={{
-            padding: 14,
-            borderRadius: 12,
-            border: "1px solid rgba(255,0,0,0.25)",
-            background: "rgba(255,0,0,0.04)",
-            marginBottom: 16,
-          }}
-        >
-          Erreur: {err}
-        </div>
-      ) : null}
+      <div style={{ opacity: 0.6, marginBottom: 20 }}>
+        {rows.length} assets detected
+      </div>
 
       <div style={{ overflowX: "auto" }}>
-        <table
-          style={{
-            width: "100%",
-            borderCollapse: "collapse",
-            minWidth: 520,
-          }}
-        >
-        <thead>
-  <tr style={{ textAlign: "left", opacity: 0.85 }}>
-    <th style={{ padding: "10px 0" }}>Asset</th>
-    <th style={{ padding: "10px 0" }}>Score</th>
-    <th style={{ padding: "10px 0" }}>Price</th>
-    <th style={{ padding: "10px 0" }}>24h</th>
-    <th style={{ padding: "10px 0" }}>7d</th>
-    <th style={{ padding: "10px 0" }}>Regime</th>
-    <th style={{ padding: "10px 0" }}>Trade</th>
-  </tr>
-</thead>
-    <tbody>
-{rows.map((r) => {
+        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+          <thead style={{ opacity: 0.6 }}>
+            <tr>
+              <th align="left">Asset</th>
+              <th align="right">Price</th>
+              <th align="right">24h</th>
+              <th align="right">Score</th>
+              <th align="center">Regime</th>
+              <th align="center">Trade</th>
+            </tr>
+          </thead>
 
-const score = Number(r.stability_score || 0)
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.asset} style={{ borderTop: "1px solid #1f2937" }}>
+                <td>{r.asset}</td>
 
-const scoreColor =
-score >= 90 ? "#16c784" :
-score >= 75 ? "#f0b90b" :
-"#ea3943"
+                <td align="right">
+                  {Number(r.price).toLocaleString("en-US")}
+                </td>
 
-const ratingBg =
-r.rating === "A" ? "#16c784" :
-r.rating === "B" ? "#f0b90b" :
-"#ea3943"
+                <td align="right">{r.chg_24h_pct}%</td>
 
-return (
+                <td
+                  align="right"
+                  style={{
+                    color: colorScore(r.stability_score),
+                    fontWeight: "700"
+                  }}
+                >
+                  {r.stability_score}
+                </td>
 
-<tr key={r.asset} style={{
-borderBottom: "1px solid rgba(255,255,255,0.06)",
-cursor: "default"
-}}>
+                <td align="center">{r.regime}</td>
 
-<td style={{
-fontWeight: 700,
-fontSize: 16
-}}>
-{r.asset}
-</td>
-
-<td style={{
-fontWeight: 800,
-color: scoreColor,
-fontSize: 18
-}}>
-{score}
-</td>
-
-<td>
-<span style={{
-background: ratingBg,
-color: "white",
-padding: "4px 8px",
-borderRadius: 6,
-fontWeight: 700,
-fontSize: 12
-}}>
-{r.rating}
-</span>
-</td>
-
-<td className="hide-mobile">
-{fmtPctFR(r.chg_24h_pct)}
-</td>
-
-<td className="hide-mobile">
-{fmtPctFR(r.chg_7d_pct)}
-</td>
-
-<td>
-
-<a
-href={r.binance_url}
-target="_blank"
-rel="noopener noreferrer"
-style={{
-background: "#f0b90b",
-color: "black",
-padding: "6px 12px",
-borderRadius: 6,
-fontWeight: 700,
-textDecoration: "none"
-}}
->
-
-Trade
-
-</a>
-
-</td>
-
-</tr>
-
-)
-
-})}
-</tbody>
+                <td align="center">
+                  <a
+                    href={r.binance_url}
+                    target="_blank"
+                    style={{
+                      color: "#3b82f6",
+                      textDecoration: "none",
+                      fontWeight: "600"
+                    }}
+                  >
+                    Trade
+                  </a>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </main>
+  );
+}

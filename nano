@@ -1,107 +1,113 @@
-"use client";
+// app/api/health/route.js
+import { NextResponse } from "next/server";
+import { Redis } from "@upstash/redis";
 
-import { useEffect, useState } from "react";
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
-export default function Page() {
-  const [assets, setAssets] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
+const redis = Redis.fromEnv();
+const PAYLOAD_KEY = "assets_payload";
 
-  async function load() {
-    try {
-      setLoading(true);
+function now() {
+  return Date.now();
+}
 
-      const res = await fetch("/api/scan", {
-        cache: "no-store",
-      });
+function json(payload, status = 200) {
+  const res = NextResponse.json(payload, { status });
 
-      const json = await res.json();
+  res.headers.set("cache-control", "no-store");
+  res.headers.set("access-control-allow-origin", "*");
 
-      if (!json.ok) {
-        throw new Error(json.error?.message || "Scan error");
-      }
+  return res;
+}
 
-      setAssets(json.data || []);
-      setError(null);
+export async function GET() {
+  const start = now();
 
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setLoading(false);
+  try {
+    const payload = await redis.get(PAYLOAD_KEY);
+
+    const latency = now() - start;
+
+    if (!payload) {
+      return json({
+        ok: false,
+        ts: now(),
+        service: "zilkara-scan",
+        redis: true,
+        scan: false,
+        latency_ms: latency,
+        asset_count: 0,
+        last_update: null,
+        status: "NO_DATA",
+      }, 503);
     }
+
+    const assets =
+      payload.assets || payload.data || [];
+
+    const updatedAt =
+      payload.payload_updatedAt ||
+      payload.updatedAt ||
+      null;
+
+    const age_sec = updatedAt
+      ? Math.floor((now() - updatedAt) / 1000)
+      : null;
+
+    const healthy =
+      Array.isArray(assets) &&
+      assets.length > 0 &&
+      latency < 2000;
+
+    const result = {
+      ok: healthy,
+      ts: now(),
+
+      service: "zilkara-scan",
+
+      redis: true,
+      scan: true,
+
+      latency_ms: latency,
+
+      asset_count: assets.length,
+
+      last_update: updatedAt,
+      age_sec,
+
+      status: healthy ? "OK" : "DEGRADED",
+    };
+
+    console.log(JSON.stringify({
+      route: "/api/health",
+      event: "health_check",
+      latency_ms: latency,
+      asset_count: assets.length,
+      healthy,
+    }));
+
+    return json(result, healthy ? 200 : 503);
+
+  } catch (e) {
+
+    console.error(JSON.stringify({
+      route: "/api/health",
+      event: "health_error",
+      error: e.message,
+    }));
+
+    return json({
+      ok: false,
+      ts: now(),
+      service: "zilkara-scan",
+      redis: false,
+      scan: false,
+      latency_ms: null,
+      asset_count: 0,
+      last_update: null,
+      status: "ERROR",
+      error: e.message,
+    }, 500);
   }
-
-  useEffect(() => {
-    load();
-
-    const interval = setInterval(load, 30000);
-
-    return () => clearInterval(interval);
-  }, []);
-
-  return (
-    <main style={{ padding: 20, fontFamily: "system-ui" }}>
-      
-      <h1 style={{ fontSize: 28 }}>
-        Zilkara
-      </h1>
-
-      <p style={{ color: "#666" }}>
-        Market Structure Scanner
-      </p>
-
-      {loading && <p>Loading…</p>}
-
-      {error && (
-        <p style={{ color: "red" }}>
-          {error}
-        </p>
-      )}
-
-      {!loading && !error && (
-        <table style={{
-          width: "100%",
-          borderCollapse: "collapse",
-          marginTop: 20
-        }}>
-          <thead>
-            <tr>
-              <th align="left">Asset</th>
-              <th align="right">Price</th>
-              <th align="right">24h</th>
-              <th align="right">7d</th>
-              <th align="right">Signal</th>
-            </tr>
-          </thead>
-
-          <tbody>
-            {assets.map((a) => (
-              <tr key={a.symbol}>
-                <td>{a.symbol}</td>
-
-                <td align="right">
-                  ${Number(a.price).toFixed(2)}
-                </td>
-
-                <td align="right">
-                  {Number(a.chg_24h_pct).toFixed(2)}%
-                </td>
-
-                <td align="right">
-                  {Number(a.chg_7d_pct).toFixed(2)}%
-                </td>
-
-                <td align="right">
-                  {Number(a.score).toFixed(0)}
-                </td>
-
-              </tr>
-            ))}
-          </tbody>
-
-        </table>
-      )}
-
-    </main>
-  );
 }
