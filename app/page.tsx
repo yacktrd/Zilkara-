@@ -72,25 +72,58 @@ export default function Page() {
     load();
   }, []);
 
-  const summary = useMemo(() => {
-    const total = data.length;
+    const summary = useMemo(() => {
+  const total = data.length;
 
-    const stable = data.filter((a) => (a.regime || "").toUpperCase() === "STABLE").length;
-    const aRating = data.filter((a) => (a.rating || "").toUpperCase() === "A").length;
+  const stableCount = data.filter(a =>
+    (a.regime || "").toUpperCase() === "STABLE"
+  ).length;
 
-    // “Signal global” simple (pas de couleurs, pas de bruit).
-    // Tu peux faire évoluer la logique ensuite (RFS), mais là on veut du lisible immédiat.
-    const confidence = total ? Math.round((stable / total) * 100) : 0;
+  const ratingABCount = data.filter(a =>
+    ["A", "B"].includes((a.rating || "").toUpperCase())
+  ).length;
 
-    // Top movers (24h) pour la shortlist
-    const top = [...data]
-      .filter((a) => typeof a.chg_24h_pct === "number")
-      .sort((x, y) => (Math.abs(y.chg_24h_pct || 0) - Math.abs(x.chg_24h_pct || 0)))
-      .slice(0, 12);
+  const scoreStable = total ? stableCount / total : 0;
+  const scoreRating = total ? ratingABCount / total : 0;
 
-    return { total, stable, aRating, confidence, top };
-  }, [data]);
+  const disciplineIndex = Number(
+    ((scoreStable * 0.6 + scoreRating * 0.4) * 10).toFixed(1)
+  );
 
+  // Sélection disciplinée
+  const disciplined = data
+    .filter(a => {
+      const regime = (a.regime || "").toUpperCase();
+      const rating = (a.rating || "").toUpperCase();
+
+      if (regime === "STABLE" && ["A", "B"].includes(rating)) return true;
+      if (regime === "TRANSITION" && rating === "A") return true;
+      return false;
+    })
+    .sort((a, b) => {
+      const ratingOrder = (r?: string) =>
+        r === "A" ? 2 : r === "B" ? 1 : 0;
+
+      const regimeOrder = (r?: string) =>
+        r === "STABLE" ? 2 : r === "TRANSITION" ? 1 : 0;
+
+      return (
+        ratingOrder(b.rating) - ratingOrder(a.rating) ||
+        regimeOrder(b.regime) - regimeOrder(a.regime) ||
+        (b.stability_score || 0) - (a.stability_score || 0) ||
+        (b.chg_7d_pct || 0) - (a.chg_7d_pct || 0)
+      );
+    })
+    .slice(0, 12);
+
+  return {
+    total,
+    stableCount,
+    ratingABCount,
+    disciplineIndex,
+    disciplined
+  };
+}, [data]);
   const shell: React.CSSProperties = {
     maxWidth: 520,
     margin: "0 auto",
@@ -185,14 +218,14 @@ export default function Page() {
 
       {/* Shortlist = cards */}
       <div style={{ fontWeight: 900, fontSize: 14, margin: "10px 0" }}>
-        Shortlist (mouvements 24h)
+        Sélection validée
       </div>
 
       {loading ? (
         <div style={{ ...card, opacity: 0.8 }}>Scan en cours…</div>
       ) : (
         <div style={{ display: "grid", gap: 10 }}>
-          {summary.top.map((a, idx) => (
+            {summary.disciplined.map(...)}
             <a
               key={`${a.symbol || a.name || "x"}-${idx}`}
               href={a.binance_url || "#"}
