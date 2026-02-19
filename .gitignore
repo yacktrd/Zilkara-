@@ -34,3 +34,5 @@ exports/
 .vercel/
 .vercel
 .env*.local
+.next/
+node_modules/
