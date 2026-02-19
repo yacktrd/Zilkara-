@@ -32,3 +32,5 @@ logs/
 exports/
 *.csv
 .vercel/
+.vercel
+.env*.local
