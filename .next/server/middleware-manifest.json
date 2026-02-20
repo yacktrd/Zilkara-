@@ -10,6 +10,7 @@
         "server/interception-route-rewrite-manifest.js",
         "prerender-manifest.js",
         "server/edge-runtime-webpack.js",
+        "server/edge-chunks/280.js",
         "server/app/api/rebuild/route.js"
       ],
       "name": "app/api/rebuild/route",
@@ -23,9 +24,36 @@
       "wasm": [],
       "assets": [],
       "environments": {
-        "previewModeId": "ee1d36b5a67e30cf7bfe0519c3cbb663",
-        "previewModeSigningKey": "2718bd7fb0c1ef31deee593a5fe6f9339c386d0a8f4facfa48300a4a6a5e3be5",
-        "previewModeEncryptionKey": "affa4f61f4cf6c0f8a2f333c7c9776f62207d2faa45d60f1dbb3d3aca0fe48f6"
+        "previewModeId": "f982c3dc0c9eba9acddebab7f237d549",
+        "previewModeSigningKey": "918774443854cf9d7311a8bd73eab4a079e7bcfeeb4a53d727969f2e04023a79",
+        "previewModeEncryptionKey": "4b12da8456b31f4e0a2903d784450786f5ef48059d2fb4aecd5c094e01ebeacd"
+      }
+    },
+    "/api/scan/route": {
+      "files": [
+        "server/middleware-build-manifest.js",
+        "server/middleware-react-loadable-manifest.js",
+        "server/next-font-manifest.js",
+        "server/interception-route-rewrite-manifest.js",
+        "prerender-manifest.js",
+        "server/edge-runtime-webpack.js",
+        "server/edge-chunks/280.js",
+        "server/app/api/scan/route.js"
+      ],
+      "name": "app/api/scan/route",
+      "page": "/api/scan/route",
+      "matchers": [
+        {
+          "regexp": "^/api/scan$",
+          "originalSource": "/api/scan"
+        }
+      ],
+      "wasm": [],
+      "assets": [],
+      "environments": {
+        "previewModeId": "f982c3dc0c9eba9acddebab7f237d549",
+        "previewModeSigningKey": "918774443854cf9d7311a8bd73eab4a079e7bcfeeb4a53d727969f2e04023a79",
+        "previewModeEncryptionKey": "4b12da8456b31f4e0a2903d784450786f5ef48059d2fb4aecd5c094e01ebeacd"
       }
     }
   },

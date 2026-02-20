@@ -1,3 +1,4 @@
+
 // app/api/scan/route.ts
 import { NextResponse } from "next/server";
 import { kv } from "@vercel/kv";
