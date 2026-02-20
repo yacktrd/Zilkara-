@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 
 type ScanAsset = {
   symbol?: string;
@@ -12,8 +12,8 @@ type ScanAsset = {
   chg_30d_pct?: number;
 
   stability_score?: number;
-  rating?: string; // e.g. "A".."E"
-  regime?: string; // e.g. "STABLE" | "TRANSITION" | "VOLATILE"
+  rating?: string; // "A".."E"
+  regime?: string; // "STABLE" | "TRANSITION" | "VOLATILE"
 
   binance_url?: string;
 
@@ -53,51 +53,67 @@ function nowHHMMSS(d = new Date()) {
 
 export default function Page() {
   const [data, setData] = useState<ScanAsset[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState<boolean>(true);
   const [err, setErr] = useState<string | null>(null);
   const [lastTs, setLastTs] = useState<number | null>(null);
 
-  async function load() {
+  const load = useCallback(async () => {
     setLoading(true);
     setErr(null);
 
     try {
       const res = await fetch("/api/scan", { cache: "no-store" });
-      const json = (await res.json()) as ScanResponse;
+
+      // Si l’API renvoie une page HTML (erreur Vercel), res.json() plante.
+      const text = await res.text();
+      let json: ScanResponse;
+
+      try {
+        json = JSON.parse(text) as ScanResponse;
+      } catch {
+        throw new Error("Réponse API invalide (pas du JSON).");
+      }
 
       if (!json.ok) throw new Error(json.error?.message || "Scan failed");
       setData(Array.isArray(json.data) ? json.data : []);
       setLastTs(typeof json.ts === "number" ? json.ts : Date.now());
-    } catch (e: any) {
-      setErr(e?.message || "Error");
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Error";
+      setErr(msg);
     } finally {
       setLoading(false);
     }
-  }
+  }, []);
 
   useEffect(() => {
     void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [load]);
 
   const summary = useMemo(() => {
     const total = data.length;
 
-    const stable = data.reduce((acc, a) => acc + (String(a.regime || "").toUpperCase() === "STABLE" ? 1 : 0), 0);
+    const stable = data.reduce(
+      (acc, a) => acc + (String(a.regime || "").toUpperCase() === "STABLE" ? 1 : 0),
+      0
+    );
 
-    const ratingA = data.reduce((acc, a) => acc + (String(a.rating || "").toUpperCase() === "A" ? 1 : 0), 0);
+    const ratingA = data.reduce(
+      (acc, a) => acc + (String(a.rating || "").toUpperCase() === "A" ? 1 : 0),
+      0
+    );
 
     const confidence = total > 0 ? Math.round((stable / total) * 100) : 0;
 
     // shortlist = gros mouvements 24h (valeur absolue), top 8
     const shortlist = [...data]
       .filter((a) => typeof a.chg_24h_pct === "number" && !Number.isNaN(a.chg_24h_pct))
-      .sort((a, b) => Math.abs(b.chg_24h_pct as number) - Math.abs(a.chg_24h_pct as number))
+      .sort((a, b) => Math.abs((b.chg_24h_pct as number) || 0) - Math.abs((a.chg_24h_pct as number) || 0))
       .slice(0, 8);
 
     return { total, stable, ratingA, confidence, shortlist };
   }, [data]);
 
+  // Styles (Apple-clean / minimal / mobile-first)
   const shell: React.CSSProperties = {
     maxWidth: 640,
     margin: "0 auto",
@@ -149,7 +165,8 @@ export default function Page() {
     padding: "10px 12px",
     background: "#fff",
     fontWeight: 700,
-    cursor: "pointer",
+    cursor: loading ? "not-allowed" : "pointer",
+    opacity: loading ? 0.6 : 1,
   };
 
   const sectionTitle: React.CSSProperties = {
@@ -164,12 +181,6 @@ export default function Page() {
     opacity: 0.78,
     fontSize: 12,
     lineHeight: 1.35,
-  };
-
-  const label: React.CSSProperties = {
-    fontSize: 12,
-    opacity: 0.72,
-    fontWeight: 700,
   };
 
   const big: React.CSSProperties = {
@@ -192,13 +203,7 @@ export default function Page() {
           </p>
         </div>
 
-        <button
-          style={btn}
-          onClick={() => void load()}
-          aria-label="Refresh"
-          title="Refresh"
-          disabled={loading}
-        >
+        <button style={btn} onClick={() => void load()} aria-label="Refresh" title="Refresh" disabled={loading}>
           Refresh
         </button>
       </div>
@@ -254,8 +259,7 @@ export default function Page() {
                   <div style={{ minWidth: 0 }}>
                     <div style={{ fontWeight: 900, fontSize: 14, marginBottom: 6 }}>{sym}</div>
                     <div style={{ fontSize: 12, opacity: 0.78 }}>
-                      Prix: {fmtPrice(a.price)} · Régime: {safeStr(a.regime)} · Rating:{" "}
-                      {safeStr(a.rating)}
+                      Prix: {fmtPrice(a.price)} · Régime: {safeStr(a.regime)} · Rating: {safeStr(a.rating)}
                     </div>
                   </div>
 
@@ -293,10 +297,8 @@ export default function Page() {
         </div>
       )}
 
-      {/* (Optionnel) aperçu compact si tu veux garder une vue liste très légère */}
       <div style={{ marginTop: 18, opacity: 0.7, fontSize: 12 }}>
-        Astuce: si tu veux une vue “table” plus tard, on la mettra derrière un toggle. Pour l’instant: focus
-        sur le signal et la shortlist.
+        Astuce: la vue “table” viendra ensuite derrière un toggle. Là: focus signal + shortlist.
       </div>
     </main>
   );
