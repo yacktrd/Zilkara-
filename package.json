@@ -1,10 +1,6 @@
 {
-  "name": "zilkara",
-  "version": "1.0.0",
+  "name": "rfs-crypto-v1",
   "private": true,
-  "description": "Zilkara — Professional crypto market scanner with real-time scoring and API endpoints",
-  "author": "Yannick Therand",
-  "license": "UNLICENSED",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -12,19 +8,13 @@
     "lint": "next lint"
   },
   "dependencies": {
-    "@upstash/ratelimit": "^2.0.8",
-    "@vercel/kv": "^3.0.0",
     "next": "14.2.3",
     "react": "18.2.0",
     "react-dom": "18.2.0"
   },
-  "devDependencies": {
-    "@types/node": "^20.11.0",
-    "@types/react": "^18.2.0",
-    "@types/react-dom": "^18.2.0",
-    "typescript": "^5.4.0"
-{
   "engines": {
-    "node": ">=20"
+    "node": ">=18.18.0"
   }
 }
+
+
