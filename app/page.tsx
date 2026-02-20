@@ -74,9 +74,10 @@ export default function Page() {
       const res = await fetch("/api/scan", { cache: "no-store" });
       const json = (await res.json()) as ScanResponse;
 
-      if (!json.ok) throw new Error(json.error?.message || "Scan failed");
-
-      // ✅ Ne jamais vider l’écran si l’API renvoie une liste vide par accident
-      if (Array.isArray(json.data) && json.data.length > 0) {
-        setData(json.data);
-        setLastTs(typeof json.ts === "number" ?
+    if (Array.isArray(json.data) && json.data.length > 0) {
+  setData(json.data);
+  setLastTs(typeof json.ts === "number" ? json.ts : Date.now());
+} else {
+  // on garde l'état actuel si l'API renvoie une liste vide
+  setLastTs(typeof json.ts === "number" ? json.ts : Date.now());
+}
