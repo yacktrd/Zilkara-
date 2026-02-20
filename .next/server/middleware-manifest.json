@@ -1,6 +1,33 @@
 {
   "version": 3,
   "middleware": {},
-  "functions": {},
+  "functions": {
+    "/api/rebuild/route": {
+      "files": [
+        "server/middleware-build-manifest.js",
+        "server/middleware-react-loadable-manifest.js",
+        "server/next-font-manifest.js",
+        "server/interception-route-rewrite-manifest.js",
+        "prerender-manifest.js",
+        "server/edge-runtime-webpack.js",
+        "server/app/api/rebuild/route.js"
+      ],
+      "name": "app/api/rebuild/route",
+      "page": "/api/rebuild/route",
+      "matchers": [
+        {
+          "regexp": "^/api/rebuild$",
+          "originalSource": "/api/rebuild"
+        }
+      ],
+      "wasm": [],
+      "assets": [],
+      "environments": {
+        "previewModeId": "ee1d36b5a67e30cf7bfe0519c3cbb663",
+        "previewModeSigningKey": "2718bd7fb0c1ef31deee593a5fe6f9339c386d0a8f4facfa48300a4a6a5e3be5",
+        "previewModeEncryptionKey": "affa4f61f4cf6c0f8a2f333c7c9776f62207d2faa45d60f1dbb3d3aca0fe48f6"
+      }
+    }
+  },
   "sortedMiddleware": []
 }

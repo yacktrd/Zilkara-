@@ -1,31 +1,27 @@
 "use client";
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
-
-type ApiError = { code?: string; message?: string };
+import React, { useEffect, useMemo, useState } from "react";
 
 type ScanAsset = {
+  // API may return either `symbol` or legacy `asset`
   symbol?: string;
+  asset?: string;
+
   name?: string;
   price?: number;
 
-  chg_24h_pct?: number; // IMPORTANT: référence 24h conservée
+  chg_24h_pct?: number;
   chg_7d_pct?: number;
   chg_30d_pct?: number;
 
   stability_score?: number;
-  regime?: string; // "STABLE" | "TRANSITION" | "VOLATILE" (ou autre)
-  rating?: string; // optionnel, mais pas affiché (évaluation non nécessaire)
+  rating?: string; // "A".."E" (or similar)
+  regime?: string; // "STABLE" | "TRANSITION" | "VOLATILE" | ...
 
-  // Doit inclure l’affiliation Binance côté API si possible
-  // Exemple attendu: https://www.binance.com/en/trade/BTC_USDT?ref=XXXX
-  binance_url?: string;
-
-  // champs RFS optionnels
-  similarity?: number;
-  rupture_rate?: number;
-  reason?: string;
+  binance_url?: string; // affiliate link already built by API
 };
+
+type ApiError = { code?: string; message?: string };
 
 type ScanResponse = {
   ok: boolean;
@@ -34,441 +30,420 @@ type ScanResponse = {
   error?: ApiError;
 };
 
-function nf(maxFrac: number) {
-  return new Intl.NumberFormat("fr-FR", { maximumFractionDigits: maxFrac });
+function fmtPct(n?: number) {
+  if (n === null || n === undefined || Number.isNaN(n)) return "—";
+  const sign = n > 0 ? "+" : "";
+  return `${sign}${new Intl.NumberFormat("fr-FR", { maximumFractionDigits: 2 }).format(n)}%`;
 }
 
 function fmtPrice(n?: number) {
-  if (n == null || Number.isNaN(n)) return "—";
-  // Prix crypto : on garde de la précision sans bruit
-  const abs = Math.abs(n);
-  if (abs >= 1000) return nf(2).format(n);
-  if (abs >= 1) return nf(4).format(n);
-  return nf(8).format(n);
-}
-
-function fmtPct(n?: number) {
-  if (n == null || Number.isNaN(n)) return "—";
-  const sign = n > 0 ? "+" : "";
-  return `${sign}${nf(2).format(n)}%`;
-}
-
-function fmtInt(n?: number) {
-  if (n == null || Number.isNaN(n)) return "—";
-  return new Intl.NumberFormat("fr-FR", { maximumFractionDigits: 0 }).format(n);
+  if (n === null || n === undefined || Number.isNaN(n)) return "—";
+  return new Intl.NumberFormat("fr-FR", { maximumFractionDigits: 8 }).format(n);
 }
 
 function safeStr(s?: string) {
-  const t = (s || "").trim();
-  return t.length ? t : "—";
+  return s && s.trim().length ? s.trim() : "—";
 }
 
-function upper(s?: string) {
-  return (s || "").trim().toUpperCase();
+function nowHHMMSS(d = new Date()) {
+  const pad = (x: number) => String(x).padStart(2, "0");
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-/**
- * Auto-refresh invisible:
- * - on refresh toutes les 60s
- * - on ne bloque pas l'écran (pas de "loading" agressif)
- * - on affiche seulement "Mis à jour : HH:MM:SS" discret
- */
-const REFRESH_MS = 60_000;
+function normalizeRegime(r?: string) {
+  const v = String(r || "").toUpperCase().trim();
+  if (!v) return "—";
+  // keep original words if already correct
+  if (v === "STABLE" || v === "TRANSITION" || v === "VOLATILE") return v;
+  return v;
+}
+
+function regimeDotColor(regime?: string) {
+  const v = String(regime || "").toUpperCase();
+  if (v === "STABLE") return "#1A7F37"; // green-ish
+  if (v === "TRANSITION") return "#B87333"; // bronze-ish
+  if (v === "VOLATILE") return "#B42318"; // red-ish
+  return "rgba(0,0,0,0.35)";
+}
+
+function pctColor(pct?: number) {
+  if (pct === null || pct === undefined || Number.isNaN(pct)) return "#111";
+  if (pct > 0) return "#1A7F37";
+  if (pct < 0) return "#B42318";
+  return "#111";
+}
+
+function resolveAssetLabel(a: ScanAsset) {
+  // Priority: symbol > asset > name
+  const sym = safeStr(a.symbol);
+  if (sym !== "—") return sym;
+
+  const legacy = safeStr(a.asset);
+  if (legacy !== "—") return legacy;
+
+  const nm = safeStr(a.name);
+  return nm;
+}
+
+function resolveBinanceHref(a: ScanAsset) {
+  const url = a.binance_url;
+  if (url && url.startsWith("http")) return url;
+  return null;
+}
 
 export default function Page() {
-  const [items, setItems] = useState<ScanAsset[]>([]);
-  const [loading, setLoading] = useState(true); // seulement au 1er chargement
-  const [softRefreshing, setSoftRefreshing] = useState(false); // refresh invisible
+  const [data, setData] = useState<ScanAsset[]>([]);
+  const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [lastTs, setLastTs] = useState<number | null>(null);
 
-  const timerRef = useRef<number | null>(null);
-  const abortRef = useRef<AbortController | null>(null);
-
-  async function fetchScan(isSoft = false) {
-    // annule requête précédente si besoin (stabilité)
-    abortRef.current?.abort();
-    const ac = new AbortController();
-    abortRef.current = ac;
-
-    if (isSoft) setSoftRefreshing(true);
-    else setLoading(true);
-
+  async function load() {
+    setLoading(true);
     setErr(null);
 
     try {
-      const r = await fetch("/api/scan", {
-        cache: "no-store",
-        signal: ac.signal,
-        headers: { "accept": "application/json" },
-      });
+      const res = await fetch("/api/scan", { cache: "no-store" });
+      const json = (await res.json()) as ScanResponse;
 
-      // si non-200, on tente de lire l’erreur mais sans casser
-      const j = (await r.json().catch(() => null)) as ScanResponse | null;
+      if (!json.ok) throw new Error(json.error?.message || "Scan failed");
 
-      if (!r.ok || !j?.ok) {
-        const msg =
-          j?.error?.message ||
-          (r.status ? `HTTP ${r.status}` : "Erreur de chargement");
-        throw new Error(msg);
-      }
+      const rows = Array.isArray(json.data) ? json.data : [];
+      setData(rows);
 
-      const list = Array.isArray(j.data) ? j.data : [];
-      setItems(list);
-      setLastTs(typeof j.ts === "number" ? j.ts : Date.now());
+      const ts = typeof json.ts === "number" ? json.ts : Date.now();
+      setLastTs(ts);
     } catch (e: any) {
-      if (e?.name === "AbortError") return; // normal
-      setErr(e?.message || "Erreur");
+      setErr(e?.message || "Error");
     } finally {
-      if (isSoft) setSoftRefreshing(false);
-      else setLoading(false);
+      setLoading(false);
     }
   }
 
   useEffect(() => {
-    void fetchScan(false);
-
-    // interval refresh invisible
-    timerRef.current = window.setInterval(() => {
-      void fetchScan(true);
-    }, REFRESH_MS);
-
-    return () => {
-      if (timerRef.current) window.clearInterval(timerRef.current);
-      abortRef.current?.abort();
-    };
+    void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /**
-   * Tri trading-grade:
-   * - priorité au stability_score (desc)
-   * - puis chg_24h_pct (abs desc) pour départager
-   */
-  const sorted = useMemo(() => {
-    const copy = [...items];
-    copy.sort((a, b) => {
-      const sa = a.stability_score ?? -1;
-      const sb = b.stability_score ?? -1;
-      if (sb !== sa) return sb - sa;
+  const stats = useMemo(() => {
+    const total = data.length;
 
-      const aa = typeof a.chg_24h_pct === "number" ? Math.abs(a.chg_24h_pct) : -1;
-      const ab = typeof b.chg_24h_pct === "number" ? Math.abs(b.chg_24h_pct) : -1;
-      return ab - aa;
-    });
-    return copy;
-  }, [items]);
+    const stableCount = data.reduce((acc, a) => acc + (normalizeRegime(a.regime) === "STABLE" ? 1 : 0), 0);
 
-  /**
-   * Signal global (compatible RFS sans entrer dans des détails internes):
-   * - ratio STABLE
-   * - indice contextuel simple (0..100) basé sur STABLE/total
-   * => outil de filtrage / régulation contextuelle (pas un “scanner hype”)
-   */
-  const context = useMemo(() => {
-    const total = sorted.length;
-    const stableCount = sorted.reduce(
-      (acc, x) => acc + (upper(x.regime) === "STABLE" ? 1 : 0),
-      0
-    );
+    const ratingAorBCount = data.reduce((acc, a) => {
+      const r = String(a.rating || "").toUpperCase();
+      return acc + (r === "A" || r === "B" ? 1 : 0);
+    }, 0);
 
-    // indice contextuel (simple, robuste, lisible)
-    const index = total > 0 ? Math.round((stableCount / total) * 100) : 0;
+    // Your current UI shows 73% as "Confiance".
+    // Keep the logic: stable share (rounded).
+    const confidence = total > 0 ? Math.round((stableCount / total) * 100) : 0;
 
-    return { total, stableCount, index };
-  }, [sorted]);
-
-  /**
-   * Shortlist (référence 24h conservée):
-   * - top mouvements 24h en valeur absolue
-   * - limité pour lecture rapide (discipline + vitesse)
-   */
-  const shortlist = useMemo(() => {
-    const list = sorted
+    // "Mouvements 24h": show top movers by ABS(24h%) but keep the column sorted by abs change
+    const movers24h = [...data]
       .filter((a) => typeof a.chg_24h_pct === "number" && !Number.isNaN(a.chg_24h_pct))
-      .sort((a, b) => Math.abs((b.chg_24h_pct as number)) - Math.abs((a.chg_24h_pct as number)))
-      .slice(0, 10);
-    return list;
-  }, [sorted]);
+      .sort((a, b) => Math.abs((b.chg_24h_pct as number) ?? 0) - Math.abs((a.chg_24h_pct as number) ?? 0))
+      .slice(0, 12);
 
-  const lastUpdatedText = useMemo(() => {
-    if (!lastTs) return "—";
-    const d = new Date(lastTs);
-    const pad = (x: number) => String(x).padStart(2, "0");
-    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-  }, [lastTs]);
+    return { total, stableCount, ratingAorBCount, confidence, movers24h };
+  }, [data]);
 
-  // --- Styles (Apple-like: sobre, aligné, respirant)
+  // ---- Styles (Apple-like minimal, trading-grade clarity) ----
   const shell: React.CSSProperties = {
-    maxWidth: 820,
+    maxWidth: 960,
     margin: "0 auto",
-    padding: "16px 14px 26px",
+    padding: "18px 16px 32px",
     fontFamily:
       'system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", Segoe UI, Roboto, Helvetica, Arial',
-    color: "#0B0B0C",
+    color: "#111",
+    background: "transparent",
   };
 
   const topRow: React.CSSProperties = {
     display: "flex",
-    alignItems: "baseline",
+    alignItems: "flex-start",
     justifyContent: "space-between",
-    gap: 12,
+    gap: 14,
+    marginBottom: 14,
   };
 
   const h1: React.CSSProperties = {
     fontSize: 28,
-    fontWeight: 900,
-    letterSpacing: -0.8,
-    margin: 0,
-    lineHeight: 1.1,
+    letterSpacing: -0.6,
+    margin: "2px 0 4px",
+    fontWeight: 800,
   };
 
   const sub: React.CSSProperties = {
-    margin: "6px 0 0",
-    fontSize: 12,
-    opacity: 0.7,
-    lineHeight: 1.3,
-  };
-
-  const pill: React.CSSProperties = {
-    border: "1px solid rgba(0,0,0,0.10)",
-    borderRadius: 999,
-    padding: "6px 10px",
-    fontSize: 12,
-    background: "#FFF",
-    whiteSpace: "nowrap",
-  };
-
-  const card: React.CSSProperties = {
-    border: "1px solid rgba(0,0,0,0.10)",
-    borderRadius: 14,
-    padding: 14,
-    background: "#FFF",
-  };
-
-  const sectionTitle: React.CSSProperties = {
-    margin: "16px 0 8px",
-    fontSize: 13,
-    fontWeight: 900,
-    letterSpacing: -0.2,
-  };
-
-  const subtle: React.CSSProperties = {
-    fontSize: 12,
     opacity: 0.75,
+    fontSize: 13,
+    margin: 0,
   };
 
   const btn: React.CSSProperties = {
     border: "1px solid rgba(0,0,0,0.12)",
     borderRadius: 12,
     padding: "10px 12px",
-    background: "#FFF",
-    fontWeight: 800,
+    background: "#fff",
+    fontWeight: 700,
     cursor: "pointer",
+    lineHeight: 1,
+    minWidth: 92,
+  };
+
+  const card: React.CSSProperties = {
+    border: "1px solid rgba(0,0,0,0.08)",
+    borderRadius: 14,
+    padding: 14,
+    background: "#fff",
+  };
+
+  const cardHeaderRow: React.CSSProperties = {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+    marginBottom: 10,
+  };
+
+  const sectionTitle: React.CSSProperties = {
+    margin: "16px 0 10px",
+    fontSize: 14,
+    fontWeight: 800,
+    letterSpacing: -0.2,
+  };
+
+  const pill: React.CSSProperties = {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 8,
+    border: "1px solid rgba(0,0,0,0.10)",
+    borderRadius: 999,
+    padding: "6px 10px",
+    fontSize: 12,
+    whiteSpace: "nowrap",
+    background: "#fff",
+  };
+
+  const muted: React.CSSProperties = { opacity: 0.78 };
+
+  const note: React.CSSProperties = {
+    marginTop: 8,
+    opacity: 0.78,
+    fontSize: 12,
+    lineHeight: 1.35,
   };
 
   const tableWrap: React.CSSProperties = {
-    border: "1px solid rgba(0,0,0,0.10)",
+    border: "1px solid rgba(0,0,0,0.08)",
     borderRadius: 14,
+    background: "#fff",
     overflow: "hidden",
-    background: "#FFF",
+  };
+
+  const table: React.CSSProperties = {
+    width: "100%",
+    borderCollapse: "separate",
+    borderSpacing: 0,
+    fontSize: 13,
   };
 
   const th: React.CSSProperties = {
-    padding: "12px 12px",
-    fontSize: 12,
-    opacity: 0.75,
-    fontWeight: 900,
     textAlign: "left",
-    whiteSpace: "nowrap",
-    background: "rgba(0,0,0,0.03)",
+    fontSize: 12,
+    opacity: 0.7,
+    fontWeight: 800,
+    padding: "12px 12px",
+    borderBottom: "1px solid rgba(0,0,0,0.06)",
+    background: "rgba(0,0,0,0.02)",
   };
 
   const td: React.CSSProperties = {
     padding: "12px 12px",
-    fontSize: 13,
-    verticalAlign: "top",
-    whiteSpace: "nowrap",
-    borderTop: "1px solid rgba(0,0,0,0.06)",
+    borderBottom: "1px solid rgba(0,0,0,0.06)",
+    verticalAlign: "middle",
   };
 
-  const right: React.CSSProperties = { textAlign: "right" };
+  const tdRight: React.CSSProperties = { ...td, textAlign: "right" };
 
-  function pctColor(n?: number) {
-    if (n == null || Number.isNaN(n)) return "#0B0B0C";
-    if (n > 0) return "#0A7A4A";
-    if (n < 0) return "#C43D3D";
-    return "#0B0B0C";
-  }
+  const assetCell: React.CSSProperties = {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    minWidth: 0,
+  };
 
-  function regimeDot(reg?: string) {
-    const r = upper(reg);
-    // Dot minimal (signal perceptif, pas décoratif)
-    if (r === "STABLE") return "#0A7A4A";
-    if (r === "TRANSITION") return "#B58B00";
-    if (r === "VOLATILE") return "#C43D3D";
-    return "rgba(0,0,0,0.35)";
-  }
+  const assetMark: React.CSSProperties = {
+    width: 18,
+    height: 4,
+    borderRadius: 99,
+    background: "rgba(0,0,0,0.22)",
+    flex: "0 0 auto",
+  };
 
-  const statusLine = useMemo(() => {
-    if (loading) return "Chargement…";
-    if (err) return "Erreur";
-    return `OK — ${context.total} actifs`;
-  }, [loading, err, context.total]);
+  const assetText: React.CSSProperties = {
+    fontWeight: 800,
+    letterSpacing: -0.2,
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  };
 
+  const regimeCell: React.CSSProperties = {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 8,
+    fontWeight: 800,
+  };
+
+  const dot: React.CSSProperties = {
+    width: 8,
+    height: 8,
+    borderRadius: 99,
+    background: "rgba(0,0,0,0.35)",
+    display: "inline-block",
+  };
+
+  const linkBtn: React.CSSProperties = {
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    border: "1px solid rgba(0,0,0,0.10)",
+    borderRadius: 12,
+    padding: "8px 10px",
+    background: "#fff",
+    fontWeight: 800,
+    fontSize: 12,
+    textDecoration: "none",
+    color: "#111",
+    whiteSpace: "nowrap",
+  };
+
+  const empty: React.CSSProperties = { ...card, opacity: 0.75 };
+
+  // ---- UI ----
   return (
     <main style={shell}>
-      {/* Header: ultra clair */}
       <div style={topRow}>
         <div>
-          <h1 style={h1}>Zilkara</h1>
+          <div style={h1}>Zilkara</div>
           <p style={sub}>
-            {statusLine} · Mis à jour: {lastUpdatedText}
-            {softRefreshing ? " · sync" : ""}
+            {loading ? "Chargement…" : err ? "Erreur" : "OK"} — {stats.total} actifs{" "}
+            {lastTs ? `· Mis à jour: ${nowHHMMSS(new Date(lastTs))}` : ""}
           </p>
         </div>
 
-        {/* Action unique (manipulation directe) */}
-        <button
-          style={btn}
-          onClick={() => void fetchScan(true)}
-          disabled={loading}
-          aria-label="Refresh"
-          title="Refresh"
-        >
+        <button style={btn} onClick={() => void load()} disabled={loading} aria-label="Refresh" title="Refresh">
           Refresh
         </button>
       </div>
 
-      {/* Error: clair, actionnable */}
       {err ? (
-        <div style={{ ...card, marginTop: 12 }}>
-          <div style={{ fontWeight: 900, marginBottom: 6 }}>Chargement impossible</div>
-          <div style={{ ...subtle, marginBottom: 10 }}>{err}</div>
-          <button style={btn} onClick={() => void fetchScan(false)}>
-            Réessayer
-          </button>
+        <div style={{ ...card, marginBottom: 14 }}>
+          <div style={{ fontWeight: 900, marginBottom: 6 }}>Impossible de charger</div>
+          <div style={{ opacity: 0.85, fontSize: 13 }}>{err}</div>
         </div>
       ) : null}
 
-      {/* Signal global (RFS-compatible, sans surcharger) */}
-      <div style={{ ...card, marginTop: 12 }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
-          <div style={{ fontWeight: 900, fontSize: 13 }}>Indice contextuel</div>
-          <div style={pill}>{context.index}%</div>
-        </div>
-
-        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 10 }}>
+      {/* Indice contextuel */}
+      <div style={card}>
+        <div style={cardHeaderRow}>
+          <div style={{ fontWeight: 900, fontSize: 14 }}>Indice contextuel</div>
           <div style={pill}>
-            STABLE: {context.stableCount}/{context.total}
+            <span style={muted}>Confiance:</span> <span style={{ fontWeight: 900 }}>{stats.confidence}%</span>
           </div>
-          <div style={pill}>Référence: 24h</div>
         </div>
 
-        <div style={{ marginTop: 10, ...subtle }}>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <div style={pill}>
+            <span style={muted}>STABLE:</span> {stats.stableCount}/{stats.total}
+          </div>
+          <div style={pill}>
+            <span style={muted}>Référence:</span> 24h
+          </div>
+          <div style={pill}>
+            <span style={muted}>RFS:</span> Filtrage & régulation du risque
+          </div>
+        </div>
+
+        <div style={note}>
           Objectif: filtrer le contexte et réguler le risque. Lecture rapide, discipline d’abord.
         </div>
       </div>
 
-      {/* Shortlist 24h (attente public + trading) */}
+      {/* Table Mouvements 24h */}
       <div style={sectionTitle}>Mouvements 24h</div>
 
       {loading ? (
-        <div style={{ ...card, opacity: 0.75 }}>Scan en cours…</div>
-      ) : shortlist.length === 0 ? (
-        <div style={{ ...card, opacity: 0.75 }}>Aucun mouvement 24h significatif.</div>
+        <div style={empty}>Scan en cours…</div>
+      ) : stats.movers24h.length === 0 ? (
+        <div style={empty}>Aucun résultat compatible.</div>
       ) : (
         <div style={tableWrap}>
-          <div style={{ overflowX: "auto" }}>
-            <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 740 }}>
-              <thead>
-                <tr>
-                  <th style={th}>Asset</th>
-                  <th style={{ ...th, ...right }}>Price</th>
-                  <th style={{ ...th, ...right }}>24h</th>
-                  <th style={{ ...th, ...right }}>Score</th>
-                  <th style={th}>Régime</th>
-                  <th style={th}>Binance</th>
-                </tr>
-              </thead>
-              <tbody>
-                {shortlist.map((a, i) => {
-                  const sym = safeStr(a.symbol);
-                  const name = safeStr(a.name);
-                  const pct = a.chg_24h_pct;
+          <table style={table}>
+            <thead>
+              <tr>
+                <th style={th}>Asset</th>
+                <th style={th}>Price</th>
+                <th style={th}>24h</th>
+                <th style={th}>Score</th>
+                <th style={th}>Régime</th>
+                <th style={{ ...th, textAlign: "center" }}>Binance</th>
+              </tr>
+            </thead>
 
-                  return (
-                    <tr key={`${sym}-${i}`}>
-                      <td style={td}>
-                        <div style={{ fontWeight: 900 }}>{sym}</div>
-                        <div style={{ fontSize: 12, opacity: 0.7 }}>{name}</div>
-                      </td>
+            <tbody>
+              {stats.movers24h.map((a, i) => {
+                const label = resolveAssetLabel(a);
+                const pct = a.chg_24h_pct;
+                const regime = normalizeRegime(a.regime);
+                const href = resolveBinanceHref(a);
+                const score =
+                  typeof a.stability_score === "number" && !Number.isNaN(a.stability_score)
+                    ? Math.round(a.stability_score)
+                    : typeof (a as any).score === "number"
+                      ? Math.round((a as any).score)
+                      : "—";
 
-                      <td style={{ ...td, ...right }}>{fmtPrice(a.price)}</td>
+                return (
+                  <tr key={`${label}-${i}`}>
+                    <td style={td}>
+                      <div style={assetCell}>
+                        <span style={assetMark} aria-hidden="true" />
+                        <span style={assetText} title={label}>
+                          {label}
+                        </span>
+                      </div>
+                    </td>
 
-                      <td style={{ ...td, ...right, color: pctColor(pct), fontWeight: 900 }}>
-                        {fmtPct(pct)}
-                      </td>
+                    <td style={td}>{fmtPrice(a.price)}</td>
 
-                      <td style={{ ...td, ...right, fontWeight: 900 }}>
-                        {fmtInt(a.stability_score)}
-                      </td>
+                    <td style={{ ...td, fontWeight: 900, color: pctColor(pct) }}>{fmtPct(pct)}</td>
 
-                      <td style={td}>
-                        <span
-                          aria-hidden="true"
-                          style={{
-                            display: "inline-block",
-                            width: 8,
-                            height: 8,
-                            borderRadius: 999,
-                            background: regimeDot(a.regime),
-                            marginRight: 8,
-                            verticalAlign: "middle",
-                          }}
-                        />
-                        <span style={{ fontWeight: 800, fontSize: 12 }}>{safeStr(a.regime)}</span>
-                      </td>
+                    <td style={td}>{score}</td>
 
-                      <td style={td}>
-                        {a.binance_url ? (
-                          <a
-                            href={a.binance_url}
-                            target="_blank"
-                            rel="noreferrer"
-                            style={{
-                              display: "inline-block",
-                              padding: "8px 10px",
-                              borderRadius: 12,
-                              border: "1px solid rgba(0,0,0,0.10)",
-                              textDecoration: "none",
-                              color: "#0B0B0C",
-                              fontWeight: 900,
-                              fontSize: 12,
-                              background: "#FFF",
-                            }}
-                            aria-label={`Ouvrir ${sym} sur Binance`}
-                            title="Ouvrir sur Binance"
-                          >
-                            Ouvrir
-                          </a>
-                        ) : (
-                          <span style={{ opacity: 0.6 }}>—</span>
-                        )}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+                    <td style={td}>
+                      <span style={regimeCell}>
+                        <span style={{ ...dot, background: regimeDotColor(regime) }} aria-hidden="true" />
+                        {safeStr(regime)}
+                      </span>
+                    </td>
+
+                    <td style={{ ...td, textAlign: "center" }}>
+                      {href ? (
+                        <a href={href} target="_blank" rel="noreferrer" style={linkBtn}>
+                          Ouvrir
+                        </a>
+                      ) : (
+                        "—"
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
         </div>
       )}
-
-      {/* Discret, pas de bruit */}
-      <div style={{ marginTop: 10, ...subtle }}>
-        Actualisation automatique toutes les 60s. (Invisible — pour éviter l’impression de bug, l’horodatage suffit.)
-      </div>
     </main>
   );
 }
