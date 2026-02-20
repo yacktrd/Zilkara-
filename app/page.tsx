@@ -71,13 +71,17 @@ export default function Page() {
     if (!silent) setErr(null);
 
     try {
-      const res = await fetch("/api/scan", { cache: "no-store" });
-      const json = (await res.json()) as ScanResponse;
+  const res = await fetch("/api/scan", { cache: "no-store" });
+  const json = await res.json();
 
-    if (Array.isArray(json.data) && json.data.length > 0) {
-  setData(json.data);
-  setLastTs(typeof json.ts === "number" ? json.ts : Date.now());
-} else {
-  // on garde l'état actuel si l'API renvoie une liste vide
-  setLastTs(typeof json.ts === "number" ? json.ts : Date.now());
+  if (Array.isArray(json.data) && json.data.length > 0) {
+    setAssets(json.data);
+    setTotal(json.data.length);
+    setLastTs(typeof json.ts === "number" ? json.ts : Date.now());
+  } else {
+    // on garde l’état actuel si l’API renvoie une liste vide
+    setLastTs(typeof json.ts === "number" ? json.ts : Date.now());
+  }
+} catch (err) {
+  console.error("Scan error:", err);
 }
