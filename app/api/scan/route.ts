@@ -11,12 +11,12 @@ type Regime = "STABLE" | "TRANSITION" | "VOLATILE";
 type ApiError = { code: string; message: string };
 
 type ScanAsset = {
-  symbol: string;
+  symbol: string; // BASE (ex: "CREAM")
   price: number;
   chg_24h_pct: number;
 
-  // base (already in your standard)
-  stability_score: number;
+  // base fields (contract stable)
+  stability_score: number; // keep as-is for compatibility
   regime: Regime;
 
   // affiliate
@@ -27,7 +27,7 @@ type ScanAsset = {
   confidence_label: "GOOD" | "MID" | "BAD";
   confidence_reason: string;
 
-  // optional debug (kept but harmless for UI)
+  // optional debug
   delta_score?: number;
   regime_change?: boolean;
 };
@@ -35,6 +35,10 @@ type ScanAsset = {
 type ScanResponse = {
   ok: boolean;
   ts: number;
+  source: "binance";
+  market: "spot";
+  quote: string;
+  count: number;
   data: ScanAsset[];
   meta?: Record<string, unknown>;
   error?: ApiError;
@@ -43,44 +47,25 @@ type ScanResponse = {
 /**
  * ---- Config (minimal + robust) ----
  * Reference obligatoire: 24h.
- * Auto-refresh UI is handled client-side; here we just produce a clean snapshot.
  */
 const DEFAULT_LIMIT = 250;
 const QUOTE = "USDT";
 
-// Cache to avoid hammering Binance. Keep it short (trading-grade stability > brute speed).
+// Short cache to avoid hammering Binance
 const SNAPSHOT_CACHE_TTL_S = 20;
 
-// KV keys (unique + simple)
+// KV keys
 const KV_KEY_LATEST = "zilkara:scan:latest";
 const KV_KEY_PREV_MAP = "zilkara:scan:prev_map";
 
-// Optional: your Binance affiliation code (keep it sober, non-intrusive)
+// Optional affiliate code
 const BINANCE_REF =
   process.env.BINANCE_REF ||
   process.env.NEXT_PUBLIC_BINANCE_REF ||
   process.env.BINANCE_AFFILIATE_CODE ||
   "";
 
-/**
- * Build a Binance trade URL (spot) with optional referral.
- * Keeps it simple and stable. No UI coupling.
- */
-function makeBinanceUrl(symbol: string): string | null {
-  if (!symbol || !symbol.endsWith(QUOTE)) return null;
-  const base = symbol.slice(0, -QUOTE.length);
-  const pair = `${base}_${QUOTE}`; // Binance web uses BASE_QUOTE
-  const url = new URL(`https://www.binance.com/en/trade/${pair}`);
-  url.searchParams.set("type", "spot");
-
-  // If you have an affiliate/ref code, we add it quietly.
-  if (BINANCE_REF) {
-    // Binance referral parameter varies by program; "ref" is a common, harmless key.
-    url.searchParams.set("ref", BINANCE_REF);
-  }
-  return url.toString();
-}
-
+/** Helpers */
 function clamp(n: number, a: number, b: number): number {
   return Math.max(a, Math.min(b, n));
 }
@@ -91,22 +76,47 @@ function toNumber(x: unknown, fallback = 0): number {
 }
 
 function normalizeSymbol(raw: unknown): string {
-  const s = String(raw ?? "").trim().toUpperCase();
-  return s;
+  return String(raw ?? "").trim().toUpperCase();
+}
+
+function baseFromFullSymbol(full: string): string {
+  if (!full) return "";
+  if (full.endsWith(QUOTE)) return full.slice(0, -QUOTE.length);
+  return full;
+}
+
+function fullFromBaseSymbol(base: string): string {
+  const b = normalizeSymbol(base);
+  if (!b) return "";
+  return b.endsWith(QUOTE) ? b : `${b}${QUOTE}`;
+}
+
+/**
+ * Build a Binance trade URL (spot) with optional referral.
+ */
+function makeBinanceUrlFromFullSymbol(fullSymbol: string): string | null {
+  const s = normalizeSymbol(fullSymbol);
+  if (!s || !s.endsWith(QUOTE)) return null;
+
+  const base = s.slice(0, -QUOTE.length);
+  const pair = `${base}_${QUOTE}`; // Binance web uses BASE_QUOTE
+  const url = new URL(`https://www.binance.com/en/trade/${pair}`);
+  url.searchParams.set("type", "spot");
+
+  if (BINANCE_REF) {
+    // "ref" is a common, harmless key
+    url.searchParams.set("ref", BINANCE_REF);
+  }
+  return url.toString();
 }
 
 /**
  * Minimal scoring (non-proprietary):
- * - We keep a simple stability_score for compatibility.
- * - We do NOT expose any proprietary RFS internals.
- *
- * You can swap these heuristics later without breaking the API contract.
+ * (Tu peux changer plus tard sans casser le contrat.)
  */
 function computeStabilityScore(chg24: number): number {
-  // lower abs change => higher stability
   const abs = Math.abs(chg24);
-  // simple curve: 0% => 100 ; 50%+ => near 0
-  const score = 100 - abs * 2;
+  const score = 100 - abs * 2; // 0%=>100 ; 50%=>0
   return clamp(Math.round(score), 0, 100);
 }
 
@@ -120,8 +130,8 @@ function computeRegime(chg24: number): Regime {
 /**
  * Confidence V1.1:
  * - Base = stability_score
- * - Regime penalties
- * - Memory penalties:
+ * - Regime penalties (V1)
+ * - Memory penalties (V1.1):
  *   - regime change => -10
  *   - abrupt delta (>=8) => -5
  */
@@ -163,25 +173,216 @@ function computeConfidenceV11(args: {
   const confidence_label: "GOOD" | "MID" | "BAD" =
     score >= 80 ? "GOOD" : score >= 60 ? "MID" : "BAD";
 
-  // Short reason (1 sentence, low noise)
   const parts: string[] = [];
   if (regime === "STABLE") parts.push("Contexte stable.");
   if (regime === "TRANSITION") parts.push("Transition détectée.");
   if (regime === "VOLATILE") parts.push("Contexte instable.");
-
   if (regime_change) parts.push("Changement de régime récent.");
   if (typeof delta_score === "number" && Math.abs(delta_score) >= 8)
     parts.push("Variation brusque récente.");
 
   const confidence_reason = parts.join(" ").trim() || "Contexte évalué.";
 
-  return { confidence_score: score, confidence_label, confidence_reason, delta_score, regime_change };
+  return {
+    confidence_score: score,
+    confidence_label,
+    confidence_reason,
+    delta_score,
+    regime_change,
+  };
 }
 
 /**
  * Fetch Binance 24h tickers
- * Endpoint: /api/v3/ticker/24hr (big payload)
- * We keep it robust with timeout + filtering.
+ * Endpoint: /api/v3/ticker/24hr
+ * Robust with timeout + filtering.
  */
 async function fetchBinance24hTickers(signal: AbortSignal): Promise<any[]> {
-  const url =
+  const url = "https://api.binance.com/api/v3/ticker/24hr";
+  const res = await fetch(url, {
+    signal,
+    // avoid any implicit caching
+    cache: "no-store",
+    headers: { "accept": "application/json" },
+  });
+
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`BINANCE_HTTP_${res.status} ${txt.slice(0, 160)}`);
+  }
+
+  const json = await res.json();
+  if (!Array.isArray(json)) {
+    throw new Error("BINANCE_BAD_PAYLOAD");
+  }
+  return json;
+}
+
+/** Filter: USDT spot tickers only + remove obvious leveraged tokens */
+function isEligibleFullSymbol(full: string): boolean {
+  const s = normalizeSymbol(full);
+  if (!s.endsWith(QUOTE)) return false;
+
+  // avoid common leveraged tokens patterns
+  const bad = ["UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"];
+  if (bad.some((x) => s.endsWith(x))) return false;
+
+  // avoid fiat-pegged pairs noise if you want (optional)
+  // if (["BUSDUSDT", "USDCUSDT", "TUSDUSDT", "FDUSDUSDT"].includes(s)) return false;
+
+  return true;
+}
+
+/** KV safe wrappers (si KV pas configuré, on continue sans casser) */
+async function kvGet<T>(key: string): Promise<T | null> {
+  try {
+    const v = await kv.get<T>(key);
+    return (v ?? null) as T | null;
+  } catch {
+    return null;
+  }
+}
+
+async function kvSet<T>(key: string, value: T, exSeconds?: number): Promise<void> {
+  try {
+    if (typeof exSeconds === "number") {
+      await kv.set(key, value as any, { ex: exSeconds });
+    } else {
+      await kv.set(key, value as any);
+    }
+  } catch {
+    // ignore: KV not configured or transient failure
+  }
+}
+
+type PrevMap = Record<
+  string,
+  { stability_score: number; regime: Regime; ts: number }
+>;
+
+export async function GET(req: Request) {
+  const ts = Date.now();
+
+  // Query params
+  const { searchParams } = new URL(req.url);
+  const limit = clamp(toNumber(searchParams.get("limit"), DEFAULT_LIMIT), 10, 500);
+
+  // 1) Serve cached snapshot if fresh
+  const cached = await kvGet<ScanResponse>(KV_KEY_LATEST);
+  if (cached && cached.ok && typeof cached.ts === "number") {
+    const ageMs = ts - cached.ts;
+    if (ageMs >= 0 && ageMs <= SNAPSHOT_CACHE_TTL_S * 1000) {
+      return NextResponse.json(cached, {
+        headers: {
+          "Cache-Control": "no-store",
+        },
+      });
+    }
+  }
+
+  // 2) Load prev_map for V1.1 memory
+  const prevMap = (await kvGet<PrevMap>(KV_KEY_PREV_MAP)) || {};
+
+  // 3) Fetch Binance with hard timeout
+  const controller = new AbortController();
+  const timeoutMs = 7000;
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const tickers = await fetchBinance24hTickers(controller.signal);
+
+    // Filter + map
+    const filtered = tickers
+      .filter((x) => isEligibleFullSymbol(x?.symbol))
+      .map((x) => {
+        const fullSymbol = normalizeSymbol(x.symbol); // e.g. CREAMUSDT
+        const baseSymbol = baseFromFullSymbol(fullSymbol); // e.g. CREAM
+
+        const price = toNumber(x.lastPrice, 0);
+        const chg24 = toNumber(x.priceChangePercent, 0);
+
+        const stability_score = computeStabilityScore(chg24);
+        const regime = computeRegime(chg24);
+
+        const prev = prevMap[baseSymbol];
+        const confidence = computeConfidenceV11({
+          stability_score,
+          regime,
+          prev_score: prev?.stability_score,
+          prev_regime: prev?.regime,
+        });
+
+        const asset: ScanAsset = {
+          symbol: baseSymbol,
+          price,
+          chg_24h_pct: chg24,
+          stability_score,
+          regime,
+          binance_url: makeBinanceUrlFromFullSymbol(fullSymbol),
+          confidence_score: confidence.confidence_score,
+          confidence_label: confidence.confidence_label,
+          confidence_reason: confidence.confidence_reason,
+          delta_score: confidence.delta_score,
+          regime_change: confidence.regime_change,
+        };
+
+        return asset;
+      })
+      .slice(0, limit);
+
+    // 4) Store new prev_map (only keep needed fields)
+    const nextPrevMap: PrevMap = {};
+    for (const a of filtered) {
+      nextPrevMap[a.symbol] = {
+        stability_score: a.stability_score,
+        regime: a.regime,
+        ts,
+      };
+    }
+    await kvSet(KV_KEY_PREV_MAP, nextPrevMap);
+
+    const out: ScanResponse = {
+      ok: true,
+      ts,
+      source: "binance",
+      market: "spot",
+      quote: QUOTE,
+      count: filtered.length,
+      data: filtered,
+      meta: {
+        confidence_method: "v1.1",
+        cache_ttl_s: SNAPSHOT_CACHE_TTL_S,
+        limit,
+      },
+    };
+
+    // 5) Cache snapshot
+    await kvSet(KV_KEY_LATEST, out, SNAPSHOT_CACHE_TTL_S);
+
+    return NextResponse.json(out, {
+      headers: {
+        "Cache-Control": "no-store",
+      },
+    });
+  } catch (e: any) {
+    const msg = typeof e?.message === "string" ? e.message : "UNKNOWN_ERROR";
+    const out: ScanResponse = {
+      ok: false,
+      ts,
+      source: "binance",
+      market: "spot",
+      quote: QUOTE,
+      count: 0,
+      data: [],
+      error: { code: "SCAN_FAILED", message: msg },
+    };
+    return NextResponse.json(out, {
+      status: 200, // keep UI stable
+      headers: {
+        "Cache-Control": "no-store",
+      },
+    });
+  } finally {
+    clearTimeout(t);
+  }
+}
