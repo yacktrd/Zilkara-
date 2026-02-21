@@ -195,7 +195,7 @@ function computeConfidenceV11(args: {
 
 /**
 
-async function fetchCoinGecko24h(signal: AbortSignal): Promise<any[]> {
+async function fetchCoinGecko24h(signal: AbortSignal) {
   const url =
     "https://api.coingecko.com/api/v3/coins/markets" +
     "?vs_currency=usd" +
@@ -205,18 +205,11 @@ async function fetchCoinGecko24h(signal: AbortSignal): Promise<any[]> {
     "&sparkline=false" +
     "&price_change_percentage=24h";
 
-  const res = await fetch(url, {
-    signal,
-    cache: "no-store",
-    headers: {
-      "User-Agent": "Zilkara/1.1",
-    },
-  });
-
+  const res = await fetch(url, { signal, cache: "no-store" });
   if (!res.ok) {
-    throw new Error(`COINGECKO_HTTP_${res.status}`);
+    const text = await res.text().catch(() => "");
+    throw new Error(`COINGECKO_HTTP_${res.status} ${text}`.trim());
   }
-
   return res.json();
 }
   const json = await res.json();
