@@ -275,7 +275,8 @@ export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const limit = clamp(toNumber(searchParams.get("limit"), DEFAULT_LIMIT), 10, 500);
 
-  // 1) const raw = await fetchCoinGecko24h(controller.signal);
+  // 1) Fetch 
+const raw = await fetchCoinGecko24h(controller.signal);
 
 const filtered = raw
   .filter((coin: any) => coin.symbol && coin.price_change_percentage_24h !== null)
