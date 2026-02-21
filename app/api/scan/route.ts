@@ -5,31 +5,22 @@ import { kv } from "@vercel/kv";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-/**
- * Zilkara /api/scan — stable contract, robust mapping, non-proprietary scoring.
- * Source: CoinGecko (Binance API blocked in your context).
- *
- * Goals:
- * - Always return a clean snapshot (24h reference)
- * - Avoid build-time mistakes seen previously (undefined vars/functions, controller order, etc.)
- * - Solid mapping + safe fallbacks
- * - Short cache + previous-map memory (confidence v1.1)
- */
-
 type Regime = "STABLE" | "TRANSITION" | "VOLATILE";
+
 type ApiError = { code: string; message: string };
 
 type ScanAsset = {
-  symbol: string;
-  price: number;
-  chg_24h_pct: number;
+  symbol: string;          // ex: BTC
+  price: number;           // USD
+  chg_24h_pct: number;     // % 24h
 
-  stability_score: number;
+  stability_score: number; // 0..100
   regime: Regime;
 
+  // Link only (NO Binance API)
   binance_url: string | null;
 
-  confidence_score: number;
+  confidence_score: number; // 0..100
   confidence_label: "GOOD" | "MID" | "BAD";
   confidence_reason: string;
 
@@ -37,43 +28,38 @@ type ScanAsset = {
   regime_change?: boolean;
 };
 
+type PrevState = { stability_score: number; regime: Regime };
+
 type ScanResponse = {
   ok: boolean;
   ts: number;
   source: "coingecko";
   market: "spot";
-  quote: string;
+  quote: "USD";
   count: number;
   data: ScanAsset[];
   meta?: Record<string, unknown>;
   error?: ApiError;
 };
 
-/** ---------- Config ---------- */
+/**
+ * Config
+ */
 const DEFAULT_LIMIT = 250;
+const SNAPSHOT_CACHE_TTL_S = 20;
 
-// CoinGecko uses vs_currency like "usd". We keep QUOTE for UI consistency.
-const VS_CURRENCY = "usd";
-const QUOTE = "USD";
+const KV_KEY_LATEST = "zilkara:scan:latest";
+const KV_KEY_PREV_MAP = "zilkara:scan:prev_map";
 
-// Trade URL affiliate (optional). Link only; API calls to Binance are not used.
 const BINANCE_REF =
   process.env.BINANCE_REF ||
   process.env.NEXT_PUBLIC_BINANCE_REF ||
   process.env.BINANCE_AFFILIATE_CODE ||
   "";
 
-// Short cache to avoid hammering CoinGecko (and for stability)
-const SNAPSHOT_CACHE_TTL_S = 20;
-
-// Timeouts (server-side)
-const FETCH_TIMEOUT_MS = 8000;
-
-// KV keys
-const KV_KEY_LATEST = "zilkara:scan:latest";
-const KV_KEY_PREV_MAP = "zilkara:scan:prev_map";
-
-/** ---------- Helpers ---------- */
+/**
+ * Helpers
+ */
 function clamp(n: number, a: number, b: number): number {
   return Math.max(a, Math.min(b, n));
 }
@@ -87,28 +73,13 @@ function normalizeSymbol(raw: unknown): string {
   return String(raw ?? "").trim().toUpperCase();
 }
 
-function makeBinanceUrlFromBaseSymbol(base: string): string | null {
-  const s = normalizeSymbol(base);
-  if (!s) return null;
-
-  // Binance web pair format: BASE_USDT
-  const pair = `${s}_USDT`;
-  const url = new URL(`https://www.binance.com/en/trade/${pair}`);
-  url.searchParams.set("type", "spot");
-  if (BINANCE_REF) url.searchParams.set("ref", BINANCE_REF);
-  return url.toString();
-}
-
 /**
- * Minimal scoring (non-proprietary):
- * - stability_score: inverse of abs(24h%)
- * - regime: STABLE/TRANSITION/VOLATILE based on abs(24h%)
+ * Minimal scoring (non-proprietary).
  */
 function computeStabilityScore(chg24: number): number {
   const abs = Math.abs(chg24);
-  // 0% => 100 ; 50% => 0 (clamped)
-  const score = 100 - abs * 2;
-  return clamp(Math.round(score), 0, 100);
+  // 0% => 100 ; 50% => 0 (clamp)
+  return clamp(Math.round(100 - abs * 2), 0, 100);
 }
 
 function computeRegime(chg24: number): Regime {
@@ -119,11 +90,12 @@ function computeRegime(chg24: number): Regime {
 }
 
 /**
- * Confidence V1.1 (simple + explainable):
- * - base = stability_score
- * - penalty by regime
- * - memory penalty: regime changed (-10)
- * - memory penalty: stability delta >= 8 (-5)
+ * Confidence V1.1:
+ * - Base = stability_score
+ * - Regime penalties
+ * - Memory penalties:
+ *   - regime change => -10
+ *   - abrupt delta (>=8) => -5
  */
 function computeConfidenceV11(args: {
   stability_score: number;
@@ -141,7 +113,6 @@ function computeConfidenceV11(args: {
 
   let score = toNumber(stability_score, 0);
 
-  // Regime penalties
   if (regime === "TRANSITION") score -= 10;
   if (regime === "VOLATILE") score -= 25;
 
@@ -168,153 +139,194 @@ function computeConfidenceV11(args: {
   if (regime === "TRANSITION") parts.push("Transition détectée.");
   if (regime === "VOLATILE") parts.push("Contexte instable.");
   if (regime_change) parts.push("Changement de régime récent.");
-  if (typeof delta_score === "number" && Math.abs(delta_score) >= 8)
+  if (typeof delta_score === "number" && Math.abs(delta_score) >= 8) {
     parts.push("Variation brusque récente.");
-
-  const confidence_reason = parts.join(" ").trim() || "Contexte évalué.";
+  }
 
   return {
     confidence_score: score,
     confidence_label,
-    confidence_reason,
+    confidence_reason: parts.join(" ").trim() || "Contexte évalué.",
     delta_score,
     regime_change,
   };
 }
 
-/** ---------- CoinGecko fetch + mapping ---------- */
-type CoinGeckoMarket = {
-  id?: string;
-  symbol?: string;
-  name?: string;
-  current_price?: number;
-  price_change_percentage_24h?: number;
-};
+/**
+ * Binance URL builder (link only).
+ * Base symbol (BTC) -> BTC_USDT
+ */
+function makeBinanceUrlFromBaseSymbol(baseSymbol: string): string | null {
+  const base = normalizeSymbol(baseSymbol);
+  if (!base) return null;
 
-// Optional key (CoinGecko has multiple auth modes depending on plan; we keep it harmless)
-const COINGECKO_API_KEY =
-  process.env.COINGECKO_API_KEY ||
-  process.env.NEXT_PUBLIC_COINGECKO_API_KEY ||
-  "";
+  const pair = `${base}_USDT`;
+  const url = new URL(`https://www.binance.com/en/trade/${pair}`);
+  url.searchParams.set("type", "spot");
+  if (BINANCE_REF) url.searchParams.set("ref", BINANCE_REF);
 
-async function fetchCoinGecko24h(signal: AbortSignal): Promise<CoinGeckoMarket[]> {
+  return url.toString();
+}
+
+/**
+ * CoinGecko markets: USD + 24h change
+ */
+async function fetchCoinGecko24h(signal: AbortSignal): Promise<any[]> {
   const url = new URL("https://api.coingecko.com/api/v3/coins/markets");
-  url.searchParams.set("vs_currency", VS_CURRENCY);
-  url.searchParams.set("order", "volume_desc");
+  url.searchParams.set("vs_currency", "usd");
+  url.searchParams.set("order", "market_cap_desc");
   url.searchParams.set("per_page", String(DEFAULT_LIMIT));
   url.searchParams.set("page", "1");
   url.searchParams.set("sparkline", "false");
-  // ensure 24h field is present
   url.searchParams.set("price_change_percentage", "24h");
-
-  const headers: Record<string, string> = {
-    accept: "application/json",
-  };
-
-  // Add key if you have one (won't break if empty)
-  if (COINGECKO_API_KEY) {
-    // Many setups accept either of these; keeping both is safe but redundant.
-    headers["x-cg-pro-api-key"] = COINGECKO_API_KEY;
-  }
 
   const res = await fetch(url.toString(), {
     method: "GET",
-    headers,
     signal,
-    // next: { revalidate: 0 } // not needed in route handlers
+    cache: "no-store",
+    headers: { accept: "application/json" },
   });
 
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`COINGECKO_HTTP_${res.status}: ${text || res.statusText}`);
+    const body = await res.text().catch(() => "");
+    throw new Error(`COINGECKO_HTTP_${res.status}: ${body || res.statusText}`);
   }
 
-  const json = (await res.json()) as unknown;
-  if (!Array.isArray(json)) throw new Error("COINGECKO_BAD_PAYLOAD");
-  return json as CoinGeckoMarket[];
+  const json = await res.json();
+  return Array.isArray(json) ? json : [];
 }
 
-/** ---------- KV safe wrappers ---------- */
-async function kvGetJson<T>(key: string): Promise<T | null> {
+/**
+ * KV safe wrappers (so build won't explode if KV is misconfigured)
+ */
+async function kvGetSafe<T>(key: string): Promise<T | null> {
   try {
-    const v = (await kv.get(key)) as unknown;
-    if (v == null) return null;
-    return v as T;
+    return (await kv.get<T>(key)) ?? null;
   } catch {
     return null;
   }
 }
 
-async function kvSetJson(key: string, value: unknown, ttlSeconds?: number): Promise<void> {
+async function kvSetSafe<T>(key: string, value: T): Promise<void> {
   try {
-    if (ttlSeconds && ttlSeconds > 0) {
-      await kv.set(key, value, { ex: ttlSeconds });
-    } else {
-      await kv.set(key, value);
-    }
+    await kv.set(key, value as any);
   } catch {
-    // ignore if KV not configured; endpoint must still work
+    // ignore
   }
 }
 
-/** ---------- Route ---------- */
-export async function GET(): Promise<NextResponse> {
+export async function GET() {
   const ts = Date.now();
 
-  // 1) Try cache first (fast + stable)
-  const cached = await kvGetJson<ScanResponse>(KV_KEY_LATEST);
-  if (cached && cached.ok && typeof cached.ts === "number") {
-    // Keep cache very short; still return it if present.
-    return NextResponse.json(cached);
-  }
-
-  // 2) Build controller BEFORE using it (fix previous error)
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
   try {
-    // 3) Fetch raw markets
-    const raw = await fetchCoinGecko24h(controller.signal);
+    // 1) Serve short snapshot cache if fresh
+    const cached = await kvGetSafe<ScanResponse>(KV_KEY_LATEST);
+    if (cached?.ok && typeof cached.ts === "number") {
+      const age = ts - cached.ts;
+      if (age >= 0 && age <= SNAPSHOT_CACHE_TTL_S * 1000) {
+        return NextResponse.json(cached, { status: 200 });
+      }
+    }
 
-    // 4) Load prev map for confidence memory
+    // 2) Load prev map (confidence memory)
     const prevMap =
-      (await kvGetJson<Record<string, { stability_score: number; regime: Regime }>>(KV_KEY_PREV_MAP)) || {};
+      (await kvGetSafe<Record<string, PrevState>>(KV_KEY_PREV_MAP)) ?? {};
 
-    // 5) Clean mapping
-    const data: ScanAsset[] = raw
-      .map((m): ScanAsset | null => {
-        const symbol = normalizeSymbol(m.symbol);
-        if (!symbol) return null;
+    // 3) Fetch upstream with timeout
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10_000);
 
-        const price = toNumber(m.current_price, 0);
-        const chg = toNumber(m.price_change_percentage_24h, 0);
+    let markets: any[] = [];
+    try {
+      markets = await fetchCoinGecko24h(controller.signal);
+    } finally {
+      clearTimeout(timer);
+    }
 
-        // Drop obvious junk rows
-        if (!Number.isFinite(price) || price <= 0) return null;
+    // 4) Map robustly
+    const data: ScanAsset[] = [];
+    const nextPrevMap: Record<string, PrevState> = {};
 
-        const stability_score = computeStabilityScore(chg);
-        const regime = computeRegime(chg);
+    for (const m of markets) {
+      const symbol = normalizeSymbol(m?.symbol);
+      if (!symbol) continue;
 
-        const prev = prevMap[symbol];
-        const conf = computeConfidenceV11({
-          stability_score,
-          regime,
-          prev_score: prev?.stability_score,
-          prev_regime: prev?.regime,
-        });
+      const price = toNumber(m?.current_price, 0);
+      const chg = toNumber(m?.price_change_percentage_24h, NaN);
 
-        return {
-          symbol,
-          price,
-          chg_24h_pct: chg,
-          stability_score,
-          regime,
-          binance_url: makeBinanceUrlFromBaseSymbol(symbol),
-          confidence_score: conf.confidence_score,
-          confidence_label: conf.confidence_label,
-          confidence_reason: conf.confidence_reason,
-          delta_score: conf.delta_score,
-          regime_change: conf.regime_change,
-        };
-      })
-      .filter
+      if (!Number.isFinite(price) || price <= 0) continue;
+      if (!Number.isFinite(chg)) continue;
+
+      const stability_score = computeStabilityScore(chg);
+      const regime = computeRegime(chg);
+
+      const prev = prevMap[symbol];
+      const conf = computeConfidenceV11({
+        stability_score,
+        regime,
+        prev_score: prev?.stability_score,
+        prev_regime: prev?.regime,
+      });
+
+      const asset: ScanAsset = {
+        symbol,
+        price,
+        chg_24h_pct: chg,
+
+        stability_score,
+        regime,
+
+        binance_url: makeBinanceUrlFromBaseSymbol(symbol),
+
+        confidence_score: conf.confidence_score,
+        confidence_label: conf.confidence_label,
+        confidence_reason: conf.confidence_reason,
+
+        delta_score: conf.delta_score,
+        regime_change: conf.regime_change,
+      };
+
+      data.push(asset);
+      nextPrevMap[symbol] = { stability_score, regime };
+
+      if (data.length >= DEFAULT_LIMIT) break;
+    }
+
+    // 5) Persist memory + snapshot cache
+    await kvSetSafe(KV_KEY_PREV_MAP, nextPrevMap);
+
+    const payload: ScanResponse = {
+      ok: true,
+      ts,
+      source: "coingecko",
+      market: "spot",
+      quote: "USD",
+      count: data.length,
+      data,
+      meta: {
+        reference: "24h",
+        cache_ttl_s: SNAPSHOT_CACHE_TTL_S,
+        limit: DEFAULT_LIMIT,
+      },
+    };
+
+    await kvSetSafe(KV_KEY_LATEST, payload);
+
+    return NextResponse.json(payload, { status: 200 });
+  } catch (err: any) {
+    const message = String(err?.message || err);
+
+    const payload: ScanResponse = {
+      ok: false,
+      ts,
+      source: "coingecko",
+      market: "spot",
+      quote: "USD",
+      count: 0,
+      data: [],
+      error: { code: "SCAN_FAILED", message },
+    };
+
+    return NextResponse.json(payload, { status: 500 });
+  }
+}
