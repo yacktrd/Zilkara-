@@ -5,6 +5,7 @@ import { kv } from "@vercel/kv";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const preferredRegion = "fra1";
 
 type Regime = "STABLE" | "TRANSITION" | "VOLATILE";
 
@@ -193,24 +194,31 @@ function computeConfidenceV11(args: {
 }
 
 /**
- * Fetch Binance 24h tickers
- * Endpoint: /api/v3/ticker/24hr
- * Robust with timeout + filtering.
- */
-async function fetchBinance24hTickers(signal: AbortSignal): Promise<any[]> {
-  const url = "https://api.binance.com/api/v3/ticker/24hr";
+
+async function fetchCoinGecko24h(signal: AbortSignal): Promise<any[]> {
+  const url =
+    "https://api.coingecko.com/api/v3/coins/markets" +
+    "?vs_currency=usd" +
+    "&order=volume_desc" +
+    "&per_page=250" +
+    "&page=1" +
+    "&sparkline=false" +
+    "&price_change_percentage=24h";
+
   const res = await fetch(url, {
     signal,
-    // avoid any implicit caching
     cache: "no-store",
-    headers: { "accept": "application/json" },
+    headers: {
+      "User-Agent": "Zilkara/1.1",
+    },
   });
 
   if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`BINANCE_HTTP_${res.status} ${txt.slice(0, 160)}`);
+    throw new Error(`COINGECKO_HTTP_${res.status}`);
   }
 
+  return res.json();
+}
   const json = await res.json();
   if (!Array.isArray(json)) {
     throw new Error("BINANCE_BAD_PAYLOAD");
@@ -267,18 +275,35 @@ export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const limit = clamp(toNumber(searchParams.get("limit"), DEFAULT_LIMIT), 10, 500);
 
-  // 1) Serve cached snapshot if fresh
-  const cached = await kvGet<ScanResponse>(KV_KEY_LATEST);
-  if (cached && cached.ok && typeof cached.ts === "number") {
-    const ageMs = ts - cached.ts;
-    if (ageMs >= 0 && ageMs <= SNAPSHOT_CACHE_TTL_S * 1000) {
-      return NextResponse.json(cached, {
-        headers: {
-          "Cache-Control": "no-store",
-        },
-      });
-    }
-  }
+  // 1) const raw = await fetchCoinGecko24h(controller.signal);
+
+const filtered = raw
+  .filter((coin: any) => coin.symbol && coin.price_change_percentage_24h !== null)
+  .slice(0, DEFAULT_LIMIT)
+  .map((coin: any) => {
+    const symbol = coin.symbol.toUpperCase();
+    const price = Number(coin.current_price);
+    const chg24 = Number(coin.price_change_percentage_24h);
+
+    const stability_score = computeStabilityScore(chg24);
+    const regime = computeRegime(chg24);
+
+    const confidence = computeConfidenceV11({
+      stability_score,
+      regime,
+    });
+
+    return {
+      symbol,
+      price,
+      chg_24h_pct: chg24,
+      stability_score,
+      regime,
+      binance_url: makeBinanceUrl(symbol + QUOTE),
+      ...confidence,
+    };
+  });
+
 
   // 2) Load prev_map for V1.1 memory
   const prevMap = (await kvGet<PrevMap>(KV_KEY_PREV_MAP)) || {};
