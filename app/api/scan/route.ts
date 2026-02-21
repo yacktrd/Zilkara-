@@ -193,8 +193,7 @@ function computeConfidenceV11(args: {
   };
 }
 
-/**
-
+// ---- CoinGecko fetch ----
 async function fetchCoinGecko24h(signal: AbortSignal) {
   const url =
     "https://api.coingecko.com/api/v3/coins/markets" +
@@ -205,18 +204,19 @@ async function fetchCoinGecko24h(signal: AbortSignal) {
     "&sparkline=false" +
     "&price_change_percentage=24h";
 
-  const res = await fetch(url, { signal, cache: "no-store" });
+  const res = await fetch(url, {
+    signal,
+    cache: "no-store",
+    headers: {
+      "User-Agent": "Zilkara/1.1",
+    },
+  });
+
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`COINGECKO_HTTP_${res.status} ${text}`.trim());
+    throw new Error(`COINGECKO_HTTP_${res.status}`);
   }
+
   return res.json();
-}
-  const json = await res.json();
-  if (!Array.isArray(json)) {
-    throw new Error("BINANCE_BAD_PAYLOAD");
-  }
-  return json;
 }
 
 /** Filter: USDT spot tickers only + remove obvious leveraged tokens */
