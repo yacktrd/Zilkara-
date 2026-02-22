@@ -2,18 +2,16 @@
 import { NextResponse } from "next/server";
 
 /**
- * Zilkara — /api/scan (V2)
- * ADN demandé :
- * - Scanner simple : liste d'actifs triés par confidence_score (décroissant)
- * - Ajout du nom complet (name) propre + robuste
- * - Binance non fiable côté serveur => source CoinGecko, lien Binance = optionnel (best-effort)
- * - Paramètres de filtre via querystring (ergonomique côté UI) (optionnels)
+ * /api/scan
+ * ADN:
+ * - Scanner simple: liste d'actifs triés par confidence_score (desc)
+ * - Ajout du nom complet (name) robuste
+ * - Source serveur: CoinGecko (Binance best-effort = lien uniquement)
+ * - Pas de filtre visuel imposé ici: l'API renvoie déjà trié
  *
- * V2 = recalibration "différenciante" :
- * - pénalise les mouvements trop faibles (stablecoins / no-op)
- * - pénalise les chocs extrêmes
- * - bonus "zone exploitable" + liquidité
- * - bonus/malus de cohérence 7j (interne, pas exposé si tu ne veux pas)
+ * Query params (optionnels):
+ * - limit=1..250 (défaut 250)
+ * - minScore=0..100 (défaut 0)  // utile si tu veux filtrer côté UI plus tard
  */
 
 export const runtime = "nodejs";
@@ -27,25 +25,19 @@ type ConfidenceLabel = "GOOD" | "MID" | "BAD";
 type ApiError = { code: string; message: string };
 
 export type ScanAsset = {
-  id?: string; // CoinGecko id
+  id: string; // CoinGecko id (toujours présent ici)
   symbol: string; // BTC
   name: string; // Bitcoin
-  price: number; // prix spot (USD)
+  price: number; // spot (USD)
   chg_24h_pct: number; // % 24h
-  stability_score: number; // compat UI (inchangé)
+  stability_score: number; // 0..100
   regime: Regime;
 
-  // Score principal (sert au tri)
   confidence_score: number; // 0..100
   confidence_label: ConfidenceLabel;
   confidence_reason: string;
 
-  // best-effort (peut être null)
-  binance_url: string | null;
-
-  // debug optionnel (tu peux laisser, l’UI l’ignore)
-  delta_score?: number;
-  regime_change?: boolean;
+  binance_url: string | null; // best-effort (lien uniquement)
 };
 
 export type ScanResponse = {
@@ -66,15 +58,15 @@ const DEFAULT_LIMIT = 250;
 const QUOTE = "usd";
 const SNAPSHOT_CACHE_TTL_S = 20;
 
-// Régimes simples (stables et explicables)
-const REGIME_STABLE_MAX_ABS = 5; // <= 5% => STABLE
-const REGIME_TRANSITION_MAX_ABS = 12; // <= 12% => TRANSITION, sinon VOLATILE
+// Régimes lisibles
+const REGIME_STABLE_MAX_ABS = 5; // <=5%
+const REGIME_TRANSITION_MAX_ABS = 12; // <=12%, sinon VOLATILE
 
 /* ----------------------------- Cache ----------------------------- */
 
 declare global {
   // eslint-disable-next-line no-var
-  var __ZILKARA_MEM_CACHE__:
+  var __Zilkara_MEM_CACHE__:
     | { key: string; ts: number; payload: ScanResponse }
     | undefined;
 }
@@ -125,14 +117,38 @@ function regimeFromAbsMove(absPct: number): Regime {
   return "VOLATILE";
 }
 
-/**
- * stability_score (compat UI)
- * On le garde simple et stable.
- */
 function computeStabilityScore(chg24: number): number {
   const abs = Math.abs(chg24);
   // 0% => 100 ; 20% => ~0
   return clamp(100 - abs * 5, 0, 100);
+}
+
+function computeConfidenceScore(args: {
+  chg24: number;
+  volume24h: number;
+  marketCap: number;
+}): { score: number; reason: string } {
+  const abs = Math.abs(args.chg24);
+  const stability = computeStabilityScore(args.chg24);
+
+  // bonus liquidité (log scale, robuste)
+  const vol = Math.max(0, args.volume24h);
+  const mcap = Math.max(0, args.marketCap);
+  const liqRaw = Math.log10(1 + vol) + 0.5 * Math.log10(1 + mcap);
+  const liqBonus = clamp((liqRaw - 6) * 4, 0, 20); // 0..20
+
+  // pénalité choc
+  const shockPenalty = clamp((abs - 10) * 2, 0, 25); // 0..25
+
+  const score = clamp(stability + liqBonus - shockPenalty, 0, 100);
+
+  let reason = "Stabilité 24h + liquidité.";
+  if (abs > 20) reason = "Move 24h extrême: confiance réduite.";
+  else if (abs > 12) reason = "Volatilité élevée: prudence.";
+  else if (abs > 5) reason = "Transition: filtrer selon objectif.";
+  else reason = "Contexte stable: sélection plus propre.";
+
+  return { score, reason };
 }
 
 function labelFromScore(score: number): ConfidenceLabel {
@@ -141,114 +157,13 @@ function labelFromScore(score: number): ConfidenceLabel {
   return "BAD";
 }
 
-/**
- * Binance peut bloquer: on renvoie un lien “best-effort” ou null.
- * (Ne pas dépendre de Binance pour remplir le scan.)
- */
+// Binance côté serveur: on ne fetch pas, on fournit juste un lien best-effort
 function buildBinanceUrl(symbol: string, quote = "USDT"): string | null {
   const s = symbol.trim().toUpperCase();
   if (!s) return null;
-  return `https://www.binance.com/en/trade/${s}${quote.toUpperCase()}`;
-}
-
-/* ----------------------- Confidence Score V2 ---------------------- */
-/**
- * Objectif V2 (différenciant + attractif):
- * - Ne PAS sur-valoriser l’immobilité (stablecoins/no-op)
- * - Favoriser une zone "exploitable" (mouvement modéré) + liquidité
- * - Pénaliser les chocs (bruit/risque contextuel)
- * - Ajouter une cohérence 7j (si dispo) pour éviter les "bons" scores purement 24h
- *
- * Important: on reste non-propriétaire (pas de détails RFS internes).
- */
-function computeConfidenceScoreV2(args: {
-  chg24: number;
-  chg7d?: number | null;
-  volume24h: number;
-  marketCap: number;
-  name: string;
-}): { score: number; reason: string } {
-  const chg24 = safeNumber(args.chg24, 0);
-  const abs24 = Math.abs(chg24);
-
-  const chg7d = args.chg7d == null ? null : safeNumber(args.chg7d, 0);
-  const abs7 = chg7d == null ? null : Math.abs(chg7d);
-
-  // 1) Base stabilité (pas trop agressive)
-  // 0% => 92 ; 10% => 52 ; 20% => 12
-  const base = clamp(92 - abs24 * 4, 0, 92);
-
-  // 2) Bonus zone exploitable (cloche simple)
-  // Centre ~2.5% ; au-delà ça retombe.
-  // 0..14
-  const center = 2.5;
-  const width = 2.5;
-  const z = (abs24 - center) / width;
-  const opportunityBonus = clamp(Math.round(14 * Math.exp(-z * z)), 0, 14);
-
-  // 3) Bonus liquidité (log scale robuste)
-  // 0..20
-  const vol = Math.max(0, safeNumber(args.volume24h, 0));
-  const mcap = Math.max(0, safeNumber(args.marketCap, 0));
-  const liqRaw = Math.log10(1 + vol) + 0.5 * Math.log10(1 + mcap);
-  const liquidityBonus = clamp((liqRaw - 6) * 4, 0, 20);
-
-  // 4) Pénalités
-  // 4a) Dead-zone (mouvement quasi nul) => stablecoins/no-op
-  // si <0.30% => -22 (c’est le levier qui enlève les stablecoins du top)
-  const deadPenalty = abs24 < 0.3 ? 22 : 0;
-
-  // 4b) Shock penalty si mouvement extrême
-  // au-delà de 12% => pénalité croissante 0..30
-  const shockPenalty = clamp((abs24 - 12) * 2.5, 0, 30);
-
-  // 5) Cohérence 7j (si dispo)
-  // +8 si 24h et 7j vont dans le même sens ET 7j pas extrême
-  // -8 si contradiction
-  let coherenceAdj = 0;
-  if (chg7d != null && abs7 != null) {
-    const sameSign = (chg24 >= 0 && chg7d >= 0) || (chg24 < 0 && chg7d < 0);
-    if (sameSign && abs7 >= 1 && abs7 <= 18) coherenceAdj = 8;
-    if (!sameSign && abs7 >= 1) coherenceAdj = -8;
-  }
-
-  // 6) Score final
-  const rawScore =
-    base +
-    opportunityBonus +
-    liquidityBonus +
-    coherenceAdj -
-    deadPenalty -
-    shockPenalty;
-
-  const score = clamp(Math.round(rawScore), 0, 100);
-
-  // Reason (1 phrase, utile, sans bruit)
-  // On explique le *pourquoi du ranking*.
-  let reason = "Confiance calibrée: liquidité + zone exploitable + stabilité 24h.";
-  if (deadPenalty > 0) reason = "Mouvement trop faible: peu exploitable (confiance réduite).";
-  else if (shockPenalty >= 15) reason = "Choc élevé: contexte bruité (prudence).";
-  else if (abs24 >= 1 && abs24 <= 6) reason = "Mouvement modéré + liquidité: sélection favorable.";
-  else if (abs24 > 6 && abs24 <= 12) reason = "Volatilité en transition: filtrer selon objectif.";
-
-  // Petite nuance cohérence si dispo (sans surcharge)
-  if (coherenceAdj === 8) reason += " Cohérence 7j positive.";
-  if (coherenceAdj === -8) reason += " Divergence 7j: prudence.";
-
-  // Dernier garde-fou: si ça ressemble à un stablecoin par le nom
-  // (sans blacklist, juste une micro pénalité si mouvement faible)
-  const name = (args.name || "").toLowerCase();
-  const looksStable =
-    name.includes("usd") || name.includes("dollar") || name.includes("eur") || name.includes("stable");
-  if (looksStable && abs24 < 0.6) {
-    // Ajuste légèrement si le deadPenalty n’a pas déclenché
-    return {
-      score: clamp(score - 8, 0, 100),
-      reason: "Actif très stable / peu exploitable (confiance réduite).",
-    };
-  }
-
-  return { score, reason };
+  const q = quote.trim().toUpperCase();
+  // ⚠️ certains symboles ne sont pas listés sur Binance => lien peut mener à rien: OK.
+  return `https://www.binance.com/en/trade/${s}${q}`;
 }
 
 /* -------------------------- CoinGecko ---------------------------- */
@@ -257,20 +172,14 @@ type CoinGeckoMarket = {
   id: string;
   symbol: string;
   name: string;
-  current_price: number;
+  current_price: number | null;
   price_change_percentage_24h: number | null;
-
-  // IMPORTANT: CoinGecko renvoie ce champ si on demande price_change_percentage=7d
-  price_change_percentage_7d_in_currency?: number | null;
-
   total_volume: number | null;
   market_cap: number | null;
 };
 
-async function fetchCoinGecko(signal: AbortSignal, limit: number): Promise<CoinGeckoMarket[]> {
+async function fetchCoinGecko24h(signal: AbortSignal, limit: number): Promise<CoinGeckoMarket[]> {
   const perPage = clamp(limit, 1, 250);
-
-  // On demande 24h + 7d pour la cohérence V2 (sans exposer 7d à l’UI).
   const url =
     `https://api.coingecko.com/api/v3/coins/markets` +
     `?vs_currency=${encodeURIComponent(QUOTE)}` +
@@ -278,7 +187,7 @@ async function fetchCoinGecko(signal: AbortSignal, limit: number): Promise<CoinG
     `&per_page=${perPage}` +
     `&page=1` +
     `&sparkline=false` +
-    `&price_change_percentage=24h,7d`;
+    `&price_change_percentage=24h`;
 
   const res = await fetch(url, {
     method: "GET",
@@ -307,21 +216,10 @@ export async function GET(req: Request) {
   const ts = Date.now();
   const { searchParams } = new URL(req.url);
 
-  // Paramètres “scanner” (optionnels, pas de filtre visuel côté UI si tu ne l’affiches pas)
   const limit = clamp(safeNumber(searchParams.get("limit"), DEFAULT_LIMIT), 1, 250);
   const minScore = clamp(safeNumber(searchParams.get("minScore"), 0), 0, 100);
 
-  // regime=STABLE|TRANSITION|VOLATILE|ALL
-  const regimeParam = (searchParams.get("regime") || "ALL").toUpperCase();
-  const regimeFilter: Regime | "ALL" =
-    regimeParam === "STABLE" || regimeParam === "TRANSITION" || regimeParam === "VOLATILE"
-      ? (regimeParam as Regime)
-      : "ALL";
-
-  // discipline=1 => coupe une partie des “VOLATILE” faibles
-  const discipline = searchParams.get("discipline") === "1";
-
-  const cacheKey = `zilkara:scan:v2:${limit}:${minScore}:${regimeFilter}:${discipline ? 1 : 0}`;
+  const cacheKey = `scan:v2:${limit}:${minScore}`;
 
   // KV cache
   const kvCached = await kvGet<ScanResponse>(cacheKey);
@@ -329,7 +227,7 @@ export async function GET(req: Request) {
     return NextResponse.json(kvCached, { status: 200 });
   }
 
-  // mémoire cache
+  // Memory cache
   const mem = globalThis.__ZILKARA_MEM_CACHE__;
   if (mem && mem.key === cacheKey && ts - mem.ts < SNAPSHOT_CACHE_TTL_S * 1000 && mem.payload.ok) {
     return NextResponse.json(mem.payload, { status: 200 });
@@ -339,66 +237,59 @@ export async function GET(req: Request) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 8000);
 
-    let raw: CoinGeckoMarket[] = [];
+    let raw: CoinGeckoMarket[];
     try {
-      raw = await fetchCoinGecko(controller.signal, limit);
+      raw = await fetchCoinGecko24h(controller.signal, limit);
     } finally {
       clearTimeout(timeout);
     }
 
+    // IMPORTANT: éviter le bug "null is not assignable to ScanAsset"
+    // => on map en (ScanAsset | null) puis on filtre avec un type guard.
     const mapped = raw
-  .map((coin): ScanAsset | null => {
-    const id = safeString(coin.id);
-    const symbol = safeString(coin.symbol).toUpperCase();
-    const name = safeString(coin.name);
+      .map((coin): ScanAsset | null => {
+        const id = safeString(coin.id);
+        const symbol = safeString(coin.symbol).toUpperCase();
+        const name = safeString(coin.name);
 
-    const price = safeNumber(coin.current_price, 0);
-    const chg24 = safeNumber(coin.price_change_percentage_24h, 0);
+        const price = safeNumber(coin.current_price, 0);
+        const chg24 = safeNumber(coin.price_change_percentage_24h, 0);
 
-    if (!symbol || !name) return null;
-    if (!Number.isFinite(price) || price <= 0) return null;
+        // garde-fous stricts (évite objets invalides + NaN)
+        if (!id || !symbol || !name) return null;
+        if (!Number.isFinite(price) || price <= 0) return null;
 
-    const abs = Math.abs(chg24);
-    const regime = regimeFromAbsMove(abs);
-    const stability_score = Math.round(computeStabilityScore(chg24));
+        const abs = Math.abs(chg24);
+        const regime = regimeFromAbsMove(abs);
+        const stability_score = Math.round(computeStabilityScore(chg24));
 
-    const volume24h = safeNumber(coin.total_volume, 0);
-    const marketCap = safeNumber(coin.market_cap, 0);
+        const volume24h = safeNumber(coin.total_volume, 0);
+        const marketCap = safeNumber(coin.market_cap, 0);
 
-    const conf = computeConfidenceScore({ chg24, volume24h, marketCap });
-    const confidence_score = Math.round(conf.score);
-    const confidence_label = labelFromScore(confidence_score);
+        const conf = computeConfidenceScore({ chg24, volume24h, marketCap });
+        const confidence_score = Math.round(conf.score);
+        const confidence_label = labelFromScore(confidence_score);
 
-    return {
-      id,
-      symbol,
-      name,
-      price,
-      chg_24h_pct: Math.round(chg24 * 100) / 100,
-      stability_score,
-      regime,
-      confidence_score,
-      confidence_label,
-      confidence_reason: conf.reason,
-      binance_url: buildBinanceUrl(symbol, "USDT"),
-    };
-  })
-  .filter((x): x is ScanAsset => x !== null);    
+        return {
+          id,
+          symbol,
+          name,
+          price,
+          chg_24h_pct: Math.round(chg24 * 100) / 100,
+          stability_score,
+          regime,
+          confidence_score,
+          confidence_label,
+          confidence_reason: conf.reason,
+          binance_url: buildBinanceUrl(symbol, "USDT"),
+        };
+      })
+      .filter((x): x is ScanAsset => x !== null);
 
-    // 1) score minimum
-    let filtered = mapped.filter((a) => a.confidence_score >= minScore);
+    // Filtre optionnel (pas de filtre visuel, juste data)
+    const filtered = minScore > 0 ? mapped.filter((a) => a.confidence_score >= minScore) : mapped;
 
-    // 2) régime
-    if (regimeFilter !== "ALL") {
-      filtered = filtered.filter((a) => a.regime === regimeFilter);
-    }
-
-    // 3) discipline
-    if (discipline) {
-      filtered = filtered.filter((a) => a.regime !== "VOLATILE" || a.confidence_score >= 70);
-    }
-
-    // TRI: confidence_score desc (ADN scanner)
+    // TRI ADN: confidence desc, puis stabilité desc, puis abs(chg) asc
     filtered.sort((a, b) => {
       if (b.confidence_score !== a.confidence_score) return b.confidence_score - a.confidence_score;
       if (b.stability_score !== a.stability_score) return b.stability_score - a.stability_score;
@@ -414,26 +305,18 @@ export async function GET(req: Request) {
       count: filtered.length,
       data: filtered.slice(0, limit),
       meta: {
-        version: "v2",
-        minScore,
-        regime: regimeFilter,
-        discipline,
         sort: "confidence_score_desc",
+        limit,
+        minScore,
       },
     };
 
     await kvSet(cacheKey, payload, SNAPSHOT_CACHE_TTL_S);
-
-    globalThis.__ZILKARA_MEM_CACHE__ = {
-      key: cacheKey,
-      ts,
-      payload,
-    };
+    globalThis.__ZILKARA_MEM_CACHE__ = { key: cacheKey, ts, payload };
 
     return NextResponse.json(payload, { status: 200 });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
-
     const payload: ScanResponse = {
       ok: false,
       ts,
@@ -444,7 +327,6 @@ export async function GET(req: Request) {
       data: [],
       error: { code: "SCAN_FAILED", message },
     };
-
     return NextResponse.json(payload, { status: 500 });
   }
 }
