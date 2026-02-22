@@ -66,7 +66,7 @@ const REGIME_TRANSITION_MAX_ABS = 12; // <=12%, sinon VOLATILE
 
 declare global {
   // eslint-disable-next-line no-var
-  var __Zilkara_MEM_CACHE__:
+  var __ZILKARA_MEM_CACHE__:
     | { key: string; ts: number; payload: ScanResponse }
     | undefined;
 }
