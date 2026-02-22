@@ -239,45 +239,44 @@ export async function GET(req: Request) {
       clearTimeout(timeout);
     }
 
-    const mapped: ScanAsset[] = raw
-      .map((coin) => {
-        const id = safeString(coin.id);
-        const symbol = safeString(coin.symbol).toUpperCase();
-        const name = safeString(coin.name);
+    const mapped = raw
+  .map((coin): ScanAsset | null => {
+    const id = safeString(coin.id);
+    const symbol = safeString(coin.symbol).toUpperCase();
+    const name = safeString(coin.name);
 
-        const price = safeNumber(coin.current_price, 0);
-        const chg24 = safeNumber(coin.price_change_percentage_24h, 0);
+    const price = safeNumber(coin.current_price, 0);
+    const chg24 = safeNumber(coin.price_change_percentage_24h, 0);
 
-        // garde-fous
-        if (!symbol || !name) return null;
-        if (!Number.isFinite(price) || price <= 0) return null;
+    if (!symbol || !name) return null;
+    if (!Number.isFinite(price) || price <= 0) return null;
 
-        const abs = Math.abs(chg24);
-        const regime = regimeFromAbsMove(abs);
-        const stability_score = Math.round(computeStabilityScore(chg24));
+    const abs = Math.abs(chg24);
+    const regime = regimeFromAbsMove(abs);
+    const stability_score = Math.round(computeStabilityScore(chg24));
 
-        const volume24h = safeNumber(coin.total_volume, 0);
-        const marketCap = safeNumber(coin.market_cap, 0);
+    const volume24h = safeNumber(coin.total_volume, 0);
+    const marketCap = safeNumber(coin.market_cap, 0);
 
-        const conf = computeConfidenceScore({ chg24, volume24h, marketCap });
-        const confidence_score = Math.round(conf.score);
-        const confidence_label = labelFromScore(confidence_score);
+    const conf = computeConfidenceScore({ chg24, volume24h, marketCap });
+    const confidence_score = Math.round(conf.score);
+    const confidence_label = labelFromScore(confidence_score);
 
-        return {
-          id,
-          symbol,
-          name,
-          price,
-          chg_24h_pct: Math.round(chg24 * 100) / 100,
-          stability_score,
-          regime,
-          confidence_score,
-          confidence_label,
-          confidence_reason: conf.reason,
-          binance_url: buildBinanceUrl(symbol, "USDT"),
-        } satisfies ScanAsset;
-      })
-      .filter((x): x is ScanAsset => Boolean(x));
+    return {
+      id,
+      symbol,
+      name,
+      price,
+      chg_24h_pct: Math.round(chg24 * 100) / 100,
+      stability_score,
+      regime,
+      confidence_score,
+      confidence_label,
+      confidence_reason: conf.reason,
+      binance_url: buildBinanceUrl(symbol, "USDT"),
+    };
+  })
+  .filter((x): x is ScanAsset => x !== null);    
 
     // TRI UNIQUE: confidence_score DESC
     mapped.sort((a, b) => {
