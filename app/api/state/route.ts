@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getStateData } from "@/lib/state";
+import { getStateData } from "../../../lib/state";
 
 export const dynamic = "force-dynamic";
 
