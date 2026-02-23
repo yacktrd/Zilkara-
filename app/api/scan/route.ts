@@ -7,12 +7,12 @@ export const dynamic = "force-dynamic";
 
 type RawItem = Record<string, any>;
 
-export type ScanAsset = {
+type ScanAsset = {
   symbol: string;
   name: string;
   price: number;
   chg_24h_pct: number;
-  confidence_score: number; // 0..100
+  confidence_score: number;
   regime: string;
   binance_url: string;
   affiliate_url: string;
@@ -21,27 +21,20 @@ export type ScanAsset = {
 function toStr(v: unknown): string {
   return typeof v === "string" ? v : v == null ? "" : String(v);
 }
-
 function toNum(v: unknown, fallback = 0): number {
   const n = typeof v === "number" ? v : Number(v);
   return Number.isFinite(n) ? n : fallback;
 }
-
 function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n));
 }
-
 function pickFirstDefined<T>(...vals: T[]): T | undefined {
-  for (const v of vals) {
-    if (v !== undefined && v !== null && v !== ("" as any)) return v;
-  }
+  for (const v of vals) if (v !== undefined && v !== null && v !== ("" as any)) return v;
   return undefined;
 }
 
 function buildBinanceUrl(symbol: string): string {
-  return `https://www.binance.com/en/trade/${encodeURIComponent(
-    symbol
-  )}?_from=markets`;
+  return `https://www.binance.com/en/trade/${encodeURIComponent(symbol)}?_from=markets`;
 }
 
 function buildAffiliateUrl(binanceUrl: string, symbol: string): string {
@@ -69,49 +62,29 @@ function buildAffiliateUrl(binanceUrl: string, symbol: string): string {
 }
 
 function normalize(item: RawItem): ScanAsset | null {
-  const symbol = toStr(pickFirstDefined(item.symbol, item.ticker, item.pair))
-    .trim()
-    .toUpperCase();
+  const symbol = toStr(pickFirstDefined(item.symbol, item.ticker, item.pair)).trim().toUpperCase();
   if (!symbol) return null;
 
   const name =
-    toStr(
-      pickFirstDefined(item.name, item.asset_name, item.base_name, item.fullname)
-    ).trim() || symbol;
+    toStr(pickFirstDefined(item.name, item.asset_name, item.base_name, item.fullname)).trim() || symbol;
 
   const price = toNum(pickFirstDefined(item.price, item.last, item.last_price), 0);
 
   const chg_24h_pct = toNum(
-    pickFirstDefined(
-      item.chg_24h_pct,
-      item.change_24h_pct,
-      item.pct_24h,
-      item.priceChangePercent
-    ),
+    pickFirstDefined(item.chg_24h_pct, item.change_24h_pct, item.pct_24h, item.priceChangePercent),
     0
   );
 
   const confidence_score = clamp(
-    toNum(
-      pickFirstDefined(
-        item.confidence_score,
-        item.confidence,
-        item.score_confidence,
-        item.score
-      ),
-      0
-    ),
+    toNum(pickFirstDefined(item.confidence_score, item.confidence, item.score_confidence, item.score), 0),
     0,
     100
   );
 
-  const regime =
-    toStr(pickFirstDefined(item.regime, item.market_regime, item.context_regime))
-      .trim() || "UNKNOWN";
+  const regime = toStr(pickFirstDefined(item.regime, item.market_regime, item.context_regime)).trim() || "UNKNOWN";
 
   const binance_url =
-    toStr(pickFirstDefined(item.binance_url, item.url, item.trade_url)).trim() ||
-    buildBinanceUrl(symbol);
+    toStr(pickFirstDefined(item.binance_url, item.url, item.trade_url)).trim() || buildBinanceUrl(symbol);
 
   const affiliate_url =
     toStr(pickFirstDefined(item.affiliate_url, item.binance_affiliate_url)).trim() ||
@@ -131,10 +104,9 @@ function normalize(item: RawItem): ScanAsset | null {
 
 export async function GET() {
   try {
-    // ✅ IMPORTANT : plus aucun fetch HTTP vers /api/state (évite 401)
-    const raw = (await getStateData()) as any;
+    // ✅ Plus aucun fetch HTTP vers /api/state → fini les 401 "Authentication Required"
+    const raw: any = await getStateData();
 
-    // Supporte: raw = array OU {items:[...]} OU {assets:[...]}
     const arr: RawItem[] = Array.isArray(raw)
       ? raw
       : Array.isArray(raw?.items)
@@ -145,7 +117,6 @@ export async function GET() {
 
     const mapped = arr.map(normalize).filter(Boolean) as ScanAsset[];
 
-    // ✅ Tri verrouillé côté API : score desc, puis symbol asc
     mapped.sort((a, b) => {
       const d = (b.confidence_score || 0) - (a.confidence_score || 0);
       if (d !== 0) return d;
@@ -165,12 +136,9 @@ export async function GET() {
       { status: 200, headers: { "cache-control": "no-store" } }
     );
   } catch (err: any) {
+    // ✅ Message différent pour confirmer qu’on n’est plus sur l’ancienne version
     return NextResponse.json(
-      {
-        ok: false,
-        error: "SCAN_FAILED",
-        detail: err?.message ?? "SCAN_FAILED",
-      },
+      { ok: false, error: "SCAN_FAILED", detail: `STATE_LIB_FAILED: ${err?.message ?? "unknown"}` },
       { status: 500, headers: { "cache-control": "no-store" } }
     );
   }
