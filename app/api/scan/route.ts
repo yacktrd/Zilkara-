@@ -4,130 +4,186 @@ import { NextResponse } from "next/server";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-type Regime = "STABLE" | "TRANSITION" | "VOLATILE";
+type RawItem = Record<string, any>;
 
-const QUOTE = "usd";
-const DEFAULT_LIMIT = 50;
+export type ScanAsset = {
+  symbol: string;
+  name: string;
+  price: number;
+  chg_24h_pct: number;
+  confidence_score: number; // 0..100
+  regime: string;
 
-function clamp(n: number, a: number, b: number) {
-  return Math.max(a, Math.min(b, n));
+  binance_url: string;
+  affiliate_url: string;
+};
+
+function toStr(v: unknown): string {
+  return typeof v === "string" ? v : v == null ? "" : String(v);
 }
 
-function regimeFromAbs(abs: number): Regime {
-  if (abs <= 5) return "STABLE";
-  if (abs <= 12) return "TRANSITION";
-  return "VOLATILE";
+function toNum(v: unknown, fallback = 0): number {
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? n : fallback;
 }
 
-function stabilityScore(chg: number) {
-  return clamp(100 - Math.abs(chg) * 4.5, 0, 100);
+function clamp(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n));
 }
 
-function liquidityScore(vol: number, cap: number) {
-  const liqRaw =
-    Math.log10(1 + vol) + 0.6 * Math.log10(1 + cap);
-  return clamp((liqRaw - 6.2) * 14, 0, 100);
+function getBaseUrl(req: Request): string {
+  const vercel = process.env.VERCEL_URL?.trim();
+  if (vercel) return `https://${vercel}`;
+
+  const host = req.headers.get("x-forwarded-host") ?? req.headers.get("host");
+  const proto = req.headers.get("x-forwarded-proto") ?? "http";
+  if (host) return `${proto}://${host}`;
+
+  return "http://localhost:3000";
 }
 
-function shockPenalty(chg: number) {
-  const abs = Math.abs(chg);
-  if (abs > 15) return -15;
-  if (abs > 10) return -8;
-  return 0;
+function buildBinanceUrl(symbol: string): string {
+  return `https://www.binance.com/en/trade/${encodeURIComponent(symbol)}?_from=markets`;
 }
 
-function stablecoinPenalty(symbol: string, chg: number, price: number) {
-  if (
-    ["USDT", "USDC", "DAI"].includes(symbol) ||
-    (Math.abs(chg) < 0.2 && price > 0.8 && price < 1.2)
-  ) {
-    return -10;
+function buildAffiliateUrl(binanceUrl: string, symbol: string): string {
+  // Option A: lien affiliate complet
+  const base = process.env.BINANCE_AFFILIATE_BASE?.trim();
+  if (base) {
+    const u = new URL(base);
+    u.searchParams.set("utm_source", "zilkara");
+    u.searchParams.set("utm_medium", "app");
+    u.searchParams.set("utm_campaign", "scan");
+    u.searchParams.set("symbol", symbol);
+    return u.toString();
   }
-  return 0;
+
+  // Option B: ref code
+  const ref = process.env.BINANCE_REF_CODE?.trim();
+  if (ref) {
+    const u = new URL(binanceUrl);
+    u.searchParams.set("ref", ref);
+    u.searchParams.set("utm_source", "zilkara");
+    u.searchParams.set("utm_medium", "app");
+    u.searchParams.set("utm_campaign", "scan");
+    return u.toString();
+  }
+
+  return binanceUrl;
 }
 
-async function fetchMarket(limit: number) {
-  const url =
-    `https://api.coingecko.com/api/v3/coins/markets` +
-    `?vs_currency=${QUOTE}` +
-    `&order=volume_desc` +
-    `&per_page=${limit}` +
-    `&page=1&sparkline=false&price_change_percentage=24h`;
+function pickFirstDefined<T>(...vals: T[]): T | undefined {
+  for (const v of vals) {
+    if (v !== undefined && v !== null && v !== ("" as any)) return v;
+  }
+  return undefined;
+}
+
+function normalize(item: RawItem): ScanAsset | null {
+  // ✅ tolère des clés alternatives venant du backend
+  const symbol = toStr(
+    pickFirstDefined(item.symbol, item.ticker, item.pair)
+  ).trim().toUpperCase();
+
+  if (!symbol) return null;
+
+  const name = toStr(
+    pickFirstDefined(item.name, item.asset_name, item.base_name, item.fullname)
+  ).trim() || symbol;
+
+  const price = toNum(pickFirstDefined(item.price, item.last, item.last_price), 0);
+
+  const chg_24h_pct = toNum(
+    pickFirstDefined(item.chg_24h_pct, item.change_24h_pct, item.pct_24h, item.priceChangePercent),
+    0
+  );
+
+  const confidence_score = clamp(
+    toNum(pickFirstDefined(item.confidence_score, item.confidence, item.score_confidence, item.score), 0),
+    0,
+    100
+  );
+
+  const regime = toStr(
+    pickFirstDefined(item.regime, item.market_regime, item.context_regime)
+  ).trim() || "UNKNOWN";
+
+  const binance_url =
+    toStr(pickFirstDefined(item.binance_url, item.url, item.trade_url)).trim() ||
+    buildBinanceUrl(symbol);
+
+  // ✅ supporte aussi binance_affiliate_url si tu l’utilises ailleurs
+  const affiliate_url =
+    toStr(pickFirstDefined(item.affiliate_url, item.binance_affiliate_url)).trim() ||
+    buildAffiliateUrl(binance_url, symbol);
+
+  return {
+    symbol,
+    name,
+    price,
+    chg_24h_pct,
+    confidence_score,
+    regime,
+    binance_url,
+    affiliate_url,
+  };
+}
+
+async function fetchState(req: Request): Promise<RawItem[]> {
+  // Source officielle interne (stable)
+  const statePath = process.env.SCAN_STATE_PATH?.trim() || "/api/state";
+  const baseUrl = getBaseUrl(req);
+
+  const url = `${baseUrl}${statePath.startsWith("/") ? "" : "/"}${statePath}`;
 
   const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) throw new Error("CoinGecko error");
-  return res.json();
+
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`STATE_FETCH_FAILED ${res.status} ${t.slice(0, 200)}`);
+  }
+
+  const data = await res.json().catch(() => null);
+
+  if (Array.isArray(data)) return data as RawItem[];
+  if (Array.isArray((data as any)?.items)) return (data as any).items as RawItem[];
+  if (Array.isArray((data as any)?.assets)) return (data as any).assets as RawItem[];
+  return [];
 }
 
 export async function GET(req: Request) {
   try {
-    const { searchParams } = new URL(req.url);
-    const limit = clamp(
-      Number(searchParams.get("limit")) || DEFAULT_LIMIT,
-      1,
-      250
-    );
+    const raw = await fetchState(req);
 
-    const raw = await fetchMarket(limit);
+    const mapped = raw.map(normalize).filter(Boolean) as ScanAsset[];
 
-    const { kv } = await import("@vercel/kv");
-    const context = await kv.get<any>("market_context");
-
-    const market_regime: Regime =
-      context?.market_regime || "STABLE";
-
-    const mapped = raw
-      .map((coin: any) => {
-        const symbol = String(coin.symbol || "").toUpperCase();
-        const name = String(coin.name || "");
-        const price = Number(coin.current_price || 0);
-        const chg = Number(coin.price_change_percentage_24h || 0);
-        const vol = Number(coin.total_volume || 0);
-        const cap = Number(coin.market_cap || 0);
-
-        if (!symbol || !name || price <= 0) return null;
-
-        const regime = regimeFromAbs(Math.abs(chg));
-        const S = stabilityScore(chg);
-        const L = liquidityScore(vol, cap);
-        const P = shockPenalty(chg);
-        const SC = stablecoinPenalty(symbol, chg, price);
-
-        const C =
-          regime === market_regime ? 8 : -6;
-
-        const confidence = clamp(
-          S * 0.45 + L * 0.35 + C + P + SC,
-          0,
-          100
-        );
-
-        return {
-          symbol,
-          name,
-          price,
-          chg_24h_pct: Math.round(chg * 100) / 100,
-          regime,
-          confidence_score: Math.round(confidence),
-        };
-      })
-      .filter(Boolean)
-      .sort(
-        (a: any, b: any) =>
-          b.confidence_score - a.confidence_score
-      );
-
-    return NextResponse.json({
-      ok: true,
-      ts: Date.now(),
-      market_regime,
-      count: mapped.length,
-      data: mapped,
+    // ✅ tri verrouillé côté API
+    mapped.sort((a, b) => {
+      const d = (b.confidence_score || 0) - (a.confidence_score || 0);
+      if (d !== 0) return d;
+      return a.symbol.localeCompare(b.symbol);
     });
-  } catch (err) {
+
     return NextResponse.json(
-      { ok: false, error: "SCAN_FAILED" },
-      { status: 500 }
+      {
+        ok: true,
+        count: mapped.length,
+        items: mapped,
+        meta: {
+          sorted_by: "confidence_score_desc",
+          generated_at: new Date().toISOString(),
+        },
+      },
+      { status: 200, headers: { "cache-control": "no-store" } }
+    );
+  } catch (err: any) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "SCAN_FAILED",
+        detail: toStr(err?.message || "SCAN_FAILED"),
+      },
+      { status: 500, headers: { "cache-control": "no-store" } }
     );
   }
 }
