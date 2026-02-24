@@ -170,8 +170,11 @@ function normalizeItem(x: any): ScanAsset | null {
 
   const regime = normalizeRegime(x?.regime ?? x?.market_regime ?? x?.context_regime);
 
-  const binance_url = cleanStr(x?.binance_url) ?? buildBinanceUrl(symbol);
-  const affiliate_url = cleanStr(x?.affiliate_url);
+  const binance_url =
+  cleanStr(x?.binance_url) ?? buildBinanceUrl(symbol);
+
+const affiliate_url =
+  cleanStr(x?.affiliate_url) ?? undefined;  
 
   return {
     symbol,
