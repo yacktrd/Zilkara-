@@ -3,6 +3,17 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 
+/**
+ * ✅ Objectif V1 (frontend)
+ * - Même interface mobile + desktop (mobile-first, grid responsive)
+ * - Supprimer "Top Signals" (le tri fait le classement)
+ * - Supprimer tout texte parasite (ex: "Trier. Lire. Décider.")
+ * - Refresh = clic sur le titre "Zilkara" (pas besoin d’un gros bouton)
+ * - Filtres ultra simples et utiles : Score minimum + Régime (ALL/STABLE/TRANSITION/VOLATILE)
+ * - Liens Binance: NE PAS reconstruire côté UI (on utilise affiliate_url/binance_url fournis)
+ * - Build TS strict: 0 null/undefined envoyé à des fonctions qui attendent number
+ */
+
 type Regime = 'STABLE' | 'TRANSITION' | 'VOLATILE' | string;
 
 type ScanAsset = {
@@ -14,20 +25,29 @@ type ScanAsset = {
   chg_24h_pct?: number | null;
 
   confidence_score?: number | null;
+  confidence_label?: string | null;
   confidence_reason?: string | null;
 
   regime?: Regime | null;
 
-  // URLs fournies par l’API — NE PAS reconstruire ici
+  // liens fournis par l’API (NE PAS reconstruire)
   binance_url?: string | null;
   affiliate_url?: string | null;
+
+  // optionnels
+  market_cap?: number | null;
+  volume_24h?: number | null;
 };
 
 type ScanResponse = {
   ok: boolean;
   ts?: string;
+  source?: string;
+  market?: string;
+  quote?: string;
   count?: number;
   data?: ScanAsset[];
+  meta?: Record<string, unknown>;
   error?: string;
   message?: string;
 };
@@ -36,26 +56,39 @@ type ContextResponse = {
   ok: boolean;
   ts?: string;
   market_regime?: string | null;
-  confidence_global?: number | null; // 0..100
+  confidence_global?: number | null; // 0-100
   stable_ratio?: number | null;
   transition_ratio?: number | null;
   volatile_ratio?: number | null;
-  error?: string;
   message?: string | null;
+  error?: string;
 };
 
-function safeString(v: unknown): string | null {
-  if (typeof v !== 'string') return null;
-  const s = v.trim();
-  return s.length ? s : null;
-}
-
-function safeNumber(v: unknown): number | null {
-  return typeof v === 'number' && Number.isFinite(v) ? v : null;
-}
+/** =========================
+ *  Helpers (null-safe strict)
+ * ========================= */
 
 function clampInt(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, Math.trunc(n)));
+}
+
+function safeNumber(v: unknown): number | null {
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  return null;
+}
+
+function safeString(v: unknown): string | null {
+  if (typeof v === 'string') {
+    const s = v.trim();
+    return s.length ? s : null;
+  }
+  return null;
+}
+
+function asIntOr(v: unknown, fallback: number, min = 0, max = 100): number {
+  const n = safeNumber(v);
+  if (n === null) return clampInt(fallback, min, max);
+  return clampInt(Math.round(n), min, max);
 }
 
 function formatPrice(v: number | null): string {
@@ -88,6 +121,10 @@ function pickTradeUrl(a: ScanAsset): string | null {
   return safeString(a.affiliate_url) ?? safeString(a.binance_url) ?? null;
 }
 
+/** ===============
+ *  UI atoms (simple)
+ * =============== */
+
 function Segmented({
   value,
   onChange,
@@ -115,7 +152,6 @@ function Segmented({
         return (
           <button
             key={opt.value}
-            type="button"
             role="tab"
             aria-selected={active}
             onClick={() => onChange(opt.value)}
@@ -137,18 +173,51 @@ function Segmented({
   );
 }
 
-function dotStyle(): React.CSSProperties {
-  return {
-    width: 9,
-    height: 9,
-    borderRadius: 99,
-    background: 'rgba(0,0,0,0.28)', // neutre (Apple-like sobre)
-    display: 'inline-block',
+function SkeletonCard() {
+  const box: React.CSSProperties = {
+    border: '1px solid rgba(0,0,0,0.10)',
+    borderRadius: 18,
+    background: 'rgba(0,0,0,0.03)',
+    padding: 16,
+    minHeight: 104,
   };
+
+  const bar = (w: number): React.CSSProperties => ({
+    height: 12,
+    width: `${w}%`,
+    borderRadius: 999,
+    background: 'rgba(0,0,0,0.08)',
+  });
+
+  return (
+    <div style={box}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
+        <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+          <div style={{ width: 40, height: 40, borderRadius: 12, background: 'rgba(0,0,0,0.08)' }} />
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <div style={bar(34)} />
+            <div style={bar(56)} />
+          </div>
+        </div>
+        <div style={{ width: 56, height: 22, borderRadius: 999, background: 'rgba(0,0,0,0.08)' }} />
+      </div>
+      <div style={{ marginTop: 14, display: 'flex', justifyContent: 'space-between', gap: 12 }}>
+        <div style={bar(40)} />
+        <div style={bar(28)} />
+      </div>
+    </div>
+  );
 }
 
-function pillStyle(): React.CSSProperties {
-  return {
+function getRegimeKind(r: ReturnType<typeof regimeLabel>): 'stable' | 'transition' | 'volatile' | 'neutral' {
+  if (r === 'STABLE') return 'stable';
+  if (r === 'TRANSITION') return 'transition';
+  if (r === 'VOLATILE') return 'volatile';
+  return 'neutral';
+}
+
+function pillStyle(kind: 'neutral' | 'stable' | 'transition' | 'volatile') {
+  const base: React.CSSProperties = {
     display: 'inline-flex',
     alignItems: 'center',
     gap: 8,
@@ -161,57 +230,38 @@ function pillStyle(): React.CSSProperties {
     userSelect: 'none',
     whiteSpace: 'nowrap',
   };
+  // pas de couleurs codées ici (tu peux faire en CSS global plus tard)
+  return base;
 }
 
-function SkeletonCard() {
-  const box: React.CSSProperties = {
-    border: '1px solid rgba(0,0,0,0.10)',
-    borderRadius: 22,
-    background: 'rgba(0,0,0,0.03)',
-    padding: 16,
-    minHeight: 112,
-  };
-  const bar = (w: number): React.CSSProperties => ({
-    height: 12,
-    width: `${w}%`,
-    borderRadius: 999,
-    background: 'rgba(0,0,0,0.08)',
-  });
-
-  return (
-    <div style={box}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
-        <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
-          <div style={{ width: 42, height: 42, borderRadius: 14, background: 'rgba(0,0,0,0.08)' }} />
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            <div style={bar(34)} />
-            <div style={bar(56)} />
-          </div>
-        </div>
-        <div style={{ width: 52, height: 22, borderRadius: 999, background: 'rgba(0,0,0,0.08)' }} />
-      </div>
-      <div style={{ marginTop: 16, display: 'flex', justifyContent: 'space-between', gap: 12 }}>
-        <div style={bar(42)} />
-        <div style={bar(28)} />
-      </div>
-    </div>
-  );
+function dotStyle(kind: 'stable' | 'transition' | 'volatile' | 'neutral') {
+  return {
+    width: 9,
+    height: 9,
+    borderRadius: 99,
+    background: 'rgba(0,0,0,0.25)',
+    display: 'inline-block',
+  } as React.CSSProperties;
 }
+
+/** =========================
+ *  Page
+ * ========================= */
 
 export default function Page() {
-  // UI (lecture/filtrage seulement)
-  const [minScore, setMinScore] = useState<number>(75);
+  // ✅ Filtres minimalistes (lecture / décision)
+  const [minScore, setMinScore] = useState<number>(0);
   const [regimeFilter, setRegimeFilter] = useState<'ALL' | 'STABLE' | 'TRANSITION' | 'VOLATILE'>('ALL');
 
-  // Back-end params (pas affichés)
+  // ✅ backend fetch (on évite les limites UI inutiles)
   const LIMIT_BACKEND = 250;
   const SORT_BACKEND = 'confidence_score_desc';
 
   const [assets, setAssets] = useState<ScanAsset[]>([]);
   const [context, setContext] = useState<ContextResponse | null>(null);
 
-  const [isLoading, setIsLoading] = useState(true);
-  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
 
   const lastUpdated = useMemo(() => safeString(context?.ts) ?? null, [context]);
@@ -220,6 +270,7 @@ export default function Page() {
     const params = new URLSearchParams();
     params.set('limit', String(LIMIT_BACKEND));
     params.set('sort', SORT_BACKEND);
+    // (discipline mode côté API pourrait être ajouté plus tard, mais UI supprimée pour lisibilité)
     return `/api/scan?${params.toString()}`;
   }, []);
 
@@ -228,6 +279,7 @@ export default function Page() {
       try {
         if (mode === 'initial') setIsLoading(true);
         if (mode === 'refresh') setIsRefreshing(true);
+
         setError(null);
 
         const scanUrl = buildScanUrl();
@@ -270,9 +322,9 @@ export default function Page() {
     fetchAll('initial');
   }, [fetchAll]);
 
-  // Filtrage purement UI (pas de calcul métier, pas de tri)
+  // ✅ Filtrage purement visuel
   const filteredAssets = useMemo(() => {
-    const ms = clampInt(Number(minScore), 0, 100);
+    const ms = clampInt(minScore, 0, 100);
     const rf = regimeFilter;
 
     return assets.filter((a) => {
@@ -281,27 +333,35 @@ export default function Page() {
 
       if (score < ms) return false;
       if (rf !== 'ALL' && reg !== rf) return false;
-
       return true;
     });
   }, [assets, minScore, regimeFilter]);
 
-  // Contexte compact
+  // ✅ Contexte (null-safe 100%)
   const ctxReg = regimeLabel(context?.market_regime ?? null);
-  const confidenceGlobal =
-    context?.confidence_global == null ? null : clampInt(Number(context.confidence_global), 0, 100);
+  const ctxRegKind = getRegimeKind(ctxReg);
+  const confidenceGlobal = asIntOr(context?.confidence_global, 0, 0, 100);
 
+  // ✅ Styles (mobile-first, identique PC/tel)
   const page: React.CSSProperties = {
     padding: 16,
-    maxWidth: 720, // ✅ même rendu que téléphone (colonne unique)
+    maxWidth: 980,
     margin: '0 auto',
+  };
+
+  const headerRow: React.CSSProperties = {
+    display: 'flex',
+    alignItems: 'baseline',
+    justifyContent: 'space-between',
+    gap: 12,
+    marginBottom: 12,
   };
 
   const title: React.CSSProperties = {
     fontSize: 34,
     fontWeight: 950,
     letterSpacing: -0.6,
-    cursor: 'pointer', // Refresh via titre (home)
+    cursor: 'pointer', // Refresh = clic sur le titre
     userSelect: 'none',
   };
 
@@ -316,8 +376,14 @@ export default function Page() {
     alignItems: 'stretch',
     justifyContent: 'space-between',
     gap: 14,
-    marginTop: 10,
     marginBottom: 14,
+  };
+
+  const contextLeft: React.CSSProperties = {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 6,
+    minWidth: 180,
   };
 
   const bigMetric: React.CSSProperties = {
@@ -336,9 +402,17 @@ export default function Page() {
     marginBottom: 14,
   };
 
-  const list: React.CSSProperties = {
+  const sliderWrap: React.CSSProperties = {
     display: 'flex',
-    flexDirection: 'column', // ✅ même UX téléphone sur desktop
+    flexDirection: 'column',
+    gap: 6,
+    minWidth: 220,
+    flex: '1 1 240px',
+  };
+
+  const grid: React.CSSProperties = {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
     gap: 12,
   };
 
@@ -376,62 +450,61 @@ export default function Page() {
     whiteSpace: 'nowrap',
   };
 
-  const divider: React.CSSProperties = { height: 1, background: 'rgba(0,0,0,0.06)', margin: '12px 0' };
+  const divider: React.CSSProperties = {
+    height: 1,
+    background: 'rgba(0,0,0,0.06)',
+    margin: '12px 0',
+  };
 
   return (
     <main style={page}>
-      {/* Header minimal : titre = home/refresh */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 12 }}>
+      {/* Header minimal (Refresh = clic sur le titre) */}
+      <div style={headerRow}>
         <div>
           <div onClick={() => fetchAll('refresh')} title="Recharger" style={title}>
             Zilkara
           </div>
           <div style={subtle}>
             {error ? 'Erreur' : 'OK'}
-            {lastUpdated ? ` — Mis à jour : ${lastUpdated}` : ''}
+            {lastUpdated ? ` — ${lastUpdated}` : ''}
             {isRefreshing ? ' — refresh…' : ''}
           </div>
         </div>
       </div>
 
-      {/* Contexte (compact, utile à la décision) */}
+      {/* Contexte (compact, utile) */}
       <section style={contextCard}>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-          <div style={{ fontSize: 12, opacity: 0.55, fontWeight: 900, letterSpacing: 1 }}>RFS CONTEXT</div>
-          <div style={{ fontSize: 14, opacity: 0.7, fontWeight: 900 }}>Confiance</div>
-          <div style={bigMetric}>{confidenceGlobal != null ? `${confidenceGlobal}%` : '—'}</div>
-          <div style={{ fontSize: 13, opacity: 0.65, fontWeight: 900 }}>
-            {ctxReg !== '—' ? `Régime : ${ctxReg}` : 'Régime : —'}
+        <div style={contextLeft}>
+          <div style={{ fontSize: 12, opacity: 0.55, fontWeight: 900, letterSpacing: 1 }}>
+            RFS CONTEXT
           </div>
+          <div style={{ fontSize: 14, opacity: 0.7, fontWeight: 900 }}>Confiance</div>
+          <div style={bigMetric}>{Number.isFinite(confidenceGlobal) ? `${confidenceGlobal}%` : '—'}</div>
+          <div style={{ fontSize: 14, opacity: 0.7, fontWeight: 900 }}>{ctxReg}</div>
         </div>
 
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 10 }}>
-          <div style={pillStyle()}>
-            <span style={dotStyle()} aria-hidden="true" />
+          <div style={pillStyle(ctxRegKind)}>
+            <span style={dotStyle(ctxRegKind)} aria-hidden="true" />
             {ctxReg !== '—' ? ctxReg : 'RÉGIME'}
-          </div>
-
-          <div style={{ fontSize: 13, opacity: 0.65, maxWidth: 320, textAlign: 'right' }}>
-            Filtrer vite. Comprendre en 2 secondes. Agir sans bruit.
           </div>
         </div>
       </section>
 
-      {/* Filtres ultra-minimaux (marketing/ergonomie : 1 action = 1 effet) */}
+      {/* Filtres (ultra simples) */}
       <section style={controls}>
-        <div style={{ minWidth: 240, flex: '1 1 240px' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 10 }}>
+        <div style={sliderWrap}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, alignItems: 'baseline' }}>
             <div style={{ fontSize: 13, opacity: 0.7, fontWeight: 900 }}>Score minimum</div>
-            <div style={{ fontSize: 13, fontWeight: 950 }}>{clampInt(Number(minScore), 0, 100)}</div>
+            <div style={{ fontSize: 13, fontWeight: 950 }}>{clampInt(minScore, 0, 100)}</div>
           </div>
           <input
             type="range"
             min={0}
             max={100}
-            value={clampInt(Number(minScore), 0, 100)}
+            value={clampInt(minScore, 0, 100)}
             onChange={(e) => setMinScore(Number(e.target.value))}
             aria-label="Score minimum"
-            style={{ width: '100%' }}
           />
         </div>
 
@@ -449,8 +522,8 @@ export default function Page() {
 
       {/* États */}
       {isLoading ? (
-        <div style={list}>
-          {Array.from({ length: 6 }).map((_, i) => (
+        <div style={grid}>
+          {Array.from({ length: 8 }).map((_, i) => (
             <SkeletonCard key={i} />
           ))}
         </div>
@@ -464,7 +537,7 @@ export default function Page() {
           Aucun résultat avec ces filtres.
         </div>
       ) : (
-        <div style={list}>
+        <div style={grid}>
           {filteredAssets.map((a, idx) => {
             const symbol = safeString(a.symbol) ?? '—';
             const name = safeString(a.name) ?? symbol;
@@ -474,17 +547,19 @@ export default function Page() {
             const price = safeNumber(a.price);
 
             const reg = regimeLabel(a.regime ?? null);
+            const regKind = getRegimeKind(reg);
+
             const url = pickTradeUrl(a);
+            const reason = safeString(a.confidence_reason);
 
             return (
               <div key={`${safeString(a.id) ?? symbol}-${idx}`} style={card}>
-                {/* Row 1 */}
+                {/* Ligne haute */}
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
                   <div style={{ display: 'flex', gap: 12, alignItems: 'center', minWidth: 0 }}>
                     <div style={iconBox} title={symbol}>
                       {symbol.slice(0, 2)}
                     </div>
-
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }}>
                       <div style={{ fontWeight: 950, fontSize: 18, lineHeight: 1.1 }}>{symbol}</div>
                       <div
@@ -496,7 +571,6 @@ export default function Page() {
                           textOverflow: 'ellipsis',
                           whiteSpace: 'nowrap',
                         }}
-                        title={name}
                       >
                         {name}
                       </div>
@@ -510,7 +584,7 @@ export default function Page() {
 
                 <div style={divider} />
 
-                {/* Row 2 */}
+                {/* Ligne métriques */}
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                     <div style={{ fontSize: 12, opacity: 0.6, fontWeight: 900 }}>24h</div>
@@ -523,10 +597,10 @@ export default function Page() {
                   </div>
                 </div>
 
-                {/* Row 3 */}
+                {/* Ligne action */}
                 <div style={{ marginTop: 12, display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
-                  <div style={pillStyle()}>
-                    <span style={dotStyle()} aria-hidden="true" />
+                  <div style={pillStyle(regKind)}>
+                    <span style={dotStyle(regKind)} aria-hidden="true" />
                     {reg}
                   </div>
 
@@ -535,14 +609,14 @@ export default function Page() {
                       Ouvrir Binance
                     </a>
                   ) : (
-                    <span style={{ opacity: 0.6, fontWeight: 900 }}>—</span>
+                    <span style={{ opacity: 0.6, fontWeight: 900 }}>Lien indisponible</span>
                   )}
                 </div>
 
                 {/* Reason (court, utile) */}
-                {safeString(a.confidence_reason) ? (
+                {reason ? (
                   <div style={{ marginTop: 10, fontSize: 12, opacity: 0.65, lineHeight: 1.35 }}>
-                    {safeString(a.confidence_reason)}
+                    {reason}
                   </div>
                 ) : null}
               </div>
