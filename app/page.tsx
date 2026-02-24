@@ -3,17 +3,6 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 
-/**
- * ✅ Objectif V1 (frontend)
- * - Même interface mobile + desktop (mobile-first, grid responsive)
- * - Supprimer "Top Signals" (le tri fait le classement)
- * - Supprimer tout texte parasite (ex: "Trier. Lire. Décider.")
- * - Refresh = clic sur le titre "Zilkara" (pas besoin d’un gros bouton)
- * - Filtres ultra simples et utiles : Score minimum + Régime (ALL/STABLE/TRANSITION/VOLATILE)
- * - Liens Binance: NE PAS reconstruire côté UI (on utilise affiliate_url/binance_url fournis)
- * - Build TS strict: 0 null/undefined envoyé à des fonctions qui attendent number
- */
-
 type Regime = 'STABLE' | 'TRANSITION' | 'VOLATILE' | string;
 
 type ScanAsset = {
@@ -64,10 +53,6 @@ type ContextResponse = {
   error?: string;
 };
 
-/** =========================
- *  Helpers (null-safe strict)
- * ========================= */
-
 function clampInt(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, Math.trunc(n)));
 }
@@ -83,12 +68,6 @@ function safeString(v: unknown): string | null {
     return s.length ? s : null;
   }
   return null;
-}
-
-function asIntOr(v: unknown, fallback: number, min = 0, max = 100): number {
-  const n = safeNumber(v);
-  if (n === null) return clampInt(fallback, min, max);
-  return clampInt(Math.round(n), min, max);
 }
 
 function formatPrice(v: number | null): string {
@@ -121,9 +100,57 @@ function pickTradeUrl(a: ScanAsset): string | null {
   return safeString(a.affiliate_url) ?? safeString(a.binance_url) ?? null;
 }
 
-/** ===============
- *  UI atoms (simple)
- * =============== */
+function regimeColor(r: 'STABLE' | 'TRANSITION' | 'VOLATILE' | '—') {
+  if (r === 'STABLE') return '#2ECC71';
+  if (r === 'TRANSITION') return '#F5A623';
+  if (r === 'VOLATILE') return '#E74C3C';
+  return 'rgba(255,255,255,0.45)';
+}
+
+function regimeOrder(r: 'STABLE' | 'TRANSITION' | 'VOLATILE' | '—') {
+  if (r === 'STABLE') return 0;
+  if (r === 'TRANSITION') return 1;
+  if (r === 'VOLATILE') return 2;
+  return 9;
+}
+
+function SkeletonCard() {
+  const box: React.CSSProperties = {
+    border: '1px solid rgba(255,255,255,0.08)',
+    borderRadius: 22,
+    background: 'rgba(255,255,255,0.04)',
+    padding: 16,
+    minHeight: 104,
+    backdropFilter: 'blur(12px)',
+    WebkitBackdropFilter: 'blur(12px)',
+  };
+
+  const bar = (w: number): React.CSSProperties => ({
+    height: 12,
+    width: `${w}%`,
+    borderRadius: 999,
+    background: 'rgba(255,255,255,0.10)',
+  });
+
+  return (
+    <div style={box}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
+        <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+          <div style={{ width: 44, height: 44, borderRadius: 14, background: 'rgba(255,255,255,0.10)' }} />
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <div style={bar(36)} />
+            <div style={bar(52)} />
+          </div>
+        </div>
+        <div style={{ width: 60, height: 26, borderRadius: 999, background: 'rgba(255,255,255,0.10)' }} />
+      </div>
+      <div style={{ marginTop: 14, display: 'flex', justifyContent: 'space-between', gap: 12 }}>
+        <div style={bar(40)} />
+        <div style={bar(28)} />
+      </div>
+    </div>
+  );
+}
 
 function Segmented({
   value,
@@ -139,12 +166,14 @@ function Segmented({
       role="tablist"
       style={{
         display: 'inline-flex',
-        border: '1px solid rgba(0,0,0,0.10)',
-        background: 'rgba(0,0,0,0.03)',
+        border: '1px solid rgba(255,255,255,0.08)',
+        background: 'rgba(255,255,255,0.04)',
         borderRadius: 14,
         padding: 4,
         gap: 4,
         overflow: 'hidden',
+        backdropFilter: 'blur(12px)',
+        WebkitBackdropFilter: 'blur(12px)',
       }}
     >
       {options.map((opt) => {
@@ -159,7 +188,8 @@ function Segmented({
               padding: '10px 12px',
               borderRadius: 12,
               border: 'none',
-              background: active ? 'white' : 'transparent',
+              background: active ? 'rgba(255,255,255,0.12)' : 'transparent',
+              color: 'rgba(255,255,255,0.92)',
               fontWeight: 900,
               fontSize: 13,
               cursor: 'pointer',
@@ -173,95 +203,32 @@ function Segmented({
   );
 }
 
-function SkeletonCard() {
-  const box: React.CSSProperties = {
-    border: '1px solid rgba(0,0,0,0.10)',
-    borderRadius: 18,
-    background: 'rgba(0,0,0,0.03)',
-    padding: 16,
-    minHeight: 104,
-  };
-
-  const bar = (w: number): React.CSSProperties => ({
-    height: 12,
-    width: `${w}%`,
-    borderRadius: 999,
-    background: 'rgba(0,0,0,0.08)',
-  });
-
-  return (
-    <div style={box}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
-        <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
-          <div style={{ width: 40, height: 40, borderRadius: 12, background: 'rgba(0,0,0,0.08)' }} />
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            <div style={bar(34)} />
-            <div style={bar(56)} />
-          </div>
-        </div>
-        <div style={{ width: 56, height: 22, borderRadius: 999, background: 'rgba(0,0,0,0.08)' }} />
-      </div>
-      <div style={{ marginTop: 14, display: 'flex', justifyContent: 'space-between', gap: 12 }}>
-        <div style={bar(40)} />
-        <div style={bar(28)} />
-      </div>
-    </div>
-  );
-}
-
-function getRegimeKind(r: ReturnType<typeof regimeLabel>): 'stable' | 'transition' | 'volatile' | 'neutral' {
-  if (r === 'STABLE') return 'stable';
-  if (r === 'TRANSITION') return 'transition';
-  if (r === 'VOLATILE') return 'volatile';
-  return 'neutral';
-}
-
-function pillStyle(kind: 'neutral' | 'stable' | 'transition' | 'volatile') {
-  const base: React.CSSProperties = {
-    display: 'inline-flex',
-    alignItems: 'center',
-    gap: 8,
-    padding: '8px 12px',
-    borderRadius: 999,
-    fontSize: 13,
-    fontWeight: 900,
-    border: '1px solid rgba(0,0,0,0.10)',
-    background: 'rgba(0,0,0,0.03)',
-    userSelect: 'none',
-    whiteSpace: 'nowrap',
-  };
-  // pas de couleurs codées ici (tu peux faire en CSS global plus tard)
-  return base;
-}
-
-function dotStyle(kind: 'stable' | 'transition' | 'volatile' | 'neutral') {
-  return {
-    width: 9,
-    height: 9,
-    borderRadius: 99,
-    background: 'rgba(0,0,0,0.25)',
-    display: 'inline-block',
-  } as React.CSSProperties;
-}
-
-/** =========================
- *  Page
- * ========================= */
-
 export default function Page() {
-  // ✅ Filtres minimalistes (lecture / décision)
-  const [minScore, setMinScore] = useState<number>(0);
-  const [regimeFilter, setRegimeFilter] = useState<'ALL' | 'STABLE' | 'TRANSITION' | 'VOLATILE'>('ALL');
+  /**
+   * ✅ Objectif
+   * - Même interface mobile + desktop (mobile-first, grid responsive)
+   * - Fond dark premium + cartes “glass”
+   * - SUPPRIMER tout texte parasite
+   * - Refresh = clic sur le titre “Zilkara”
+   * - Aucun slider / curseur
+   * - Filtre simple + utile : Régime + Tri (Stabilité / Score)
+   * - Liens Binance: utiliser uniquement affiliate_url / binance_url (ne jamais reconstruire)
+   * - TS strict: aucun null envoyé à des fonctions qui attendent un number
+   */
 
-  // ✅ backend fetch (on évite les limites UI inutiles)
+  // filtres minimalistes
+  const [regimeFilter, setRegimeFilter] = useState<'ALL' | 'STABLE' | 'TRANSITION' | 'VOLATILE'>('ALL');
+  const [sortMode, setSortMode] = useState<'STABILITY' | 'SCORE'>('STABILITY');
+
+  // backend (pas affiché)
   const LIMIT_BACKEND = 250;
   const SORT_BACKEND = 'confidence_score_desc';
 
   const [assets, setAssets] = useState<ScanAsset[]>([]);
   const [context, setContext] = useState<ContextResponse | null>(null);
 
-  const [isLoading, setIsLoading] = useState<boolean>(true);
-  const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const lastUpdated = useMemo(() => safeString(context?.ts) ?? null, [context]);
@@ -270,7 +237,6 @@ export default function Page() {
     const params = new URLSearchParams();
     params.set('limit', String(LIMIT_BACKEND));
     params.set('sort', SORT_BACKEND);
-    // (discipline mode côté API pourrait être ajouté plus tard, mais UI supprimée pour lisibilité)
     return `/api/scan?${params.toString()}`;
   }, []);
 
@@ -283,7 +249,6 @@ export default function Page() {
         setError(null);
 
         const scanUrl = buildScanUrl();
-
         const [scanRes, ctxRes] = await Promise.all([
           fetch(scanUrl, { cache: 'no-store' }),
           fetch('/api/context', { cache: 'no-store' }),
@@ -306,8 +271,9 @@ export default function Page() {
 
         setAssets(Array.isArray(scanJson.data) ? scanJson.data : []);
         setContext(ctxJson);
-      } catch (e: any) {
-        setError(e?.message ? String(e.message) : 'Erreur inconnue.');
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : 'Erreur inconnue.';
+        setError(msg);
         setAssets([]);
         setContext(null);
       } finally {
@@ -322,31 +288,53 @@ export default function Page() {
     fetchAll('initial');
   }, [fetchAll]);
 
-  // ✅ Filtrage purement visuel
-  const filteredAssets = useMemo(() => {
-    const ms = clampInt(minScore, 0, 100);
+  const ctxReg = regimeLabel(context?.market_regime ?? null);
+  const confidenceGlobal =
+    context?.confidence_global != null ? clampInt(Number(context.confidence_global), 0, 100) : null;
+
+  // ✅ Filtrer + trier (lecture rapide)
+  const visibleAssets = useMemo(() => {
     const rf = regimeFilter;
 
-    return assets.filter((a) => {
-      const score = safeNumber(a.confidence_score) ?? 0;
+    const filtered = assets.filter((a) => {
       const reg = regimeLabel(a.regime ?? null);
-
-      if (score < ms) return false;
       if (rf !== 'ALL' && reg !== rf) return false;
       return true;
     });
-  }, [assets, minScore, regimeFilter]);
 
-  // ✅ Contexte (null-safe 100%)
-  const ctxReg = regimeLabel(context?.market_regime ?? null);
-  const ctxRegKind = getRegimeKind(ctxReg);
-  const confidenceGlobal = asIntOr(context?.confidence_global, 0, 0, 100);
+    const sorted = [...filtered].sort((a, b) => {
+      const aScore = safeNumber(a.confidence_score) ?? -1;
+      const bScore = safeNumber(b.confidence_score) ?? -1;
 
-  // ✅ Styles (mobile-first, identique PC/tel)
+      const aReg = regimeLabel(a.regime ?? null);
+      const bReg = regimeLabel(b.regime ?? null);
+
+      if (sortMode === 'STABILITY') {
+        const d = regimeOrder(aReg) - regimeOrder(bReg);
+        if (d !== 0) return d;
+        // à régime égal, score desc
+        return bScore - aScore;
+      }
+
+      // sortMode === 'SCORE'
+      return bScore - aScore;
+    });
+
+    return sorted;
+  }, [assets, regimeFilter, sortMode]);
+
+  // ✅ Styles (dark + glass)
   const page: React.CSSProperties = {
+    minHeight: '100vh',
     padding: 16,
     maxWidth: 980,
     margin: '0 auto',
+    color: 'rgba(255,255,255,0.92)',
+    background: `
+      radial-gradient(1200px 600px at 10% -10%, rgba(120,120,255,0.12), transparent 60%),
+      radial-gradient(900px 500px at 110% 10%, rgba(0,200,255,0.08), transparent 55%),
+      linear-gradient(180deg, #0B0C10 0%, #0E1016 100%)
+    `,
   };
 
   const headerRow: React.CSSProperties = {
@@ -361,37 +349,65 @@ export default function Page() {
     fontSize: 34,
     fontWeight: 950,
     letterSpacing: -0.6,
-    cursor: 'pointer', // Refresh = clic sur le titre
-    userSelect: 'none',
+    cursor: 'pointer',
+    color: 'rgba(255,255,255,0.95)',
   };
 
-  const subtle: React.CSSProperties = { opacity: 0.68, fontSize: 13 };
+  const subtle: React.CSSProperties = { opacity: 0.6, fontSize: 13 };
 
   const contextCard: React.CSSProperties = {
-    border: '1px solid rgba(0,0,0,0.10)',
+    border: '1px solid rgba(255,255,255,0.08)',
     borderRadius: 22,
-    background: 'rgba(0,0,0,0.02)',
+    background: 'rgba(255,255,255,0.05)',
     padding: 16,
     display: 'flex',
     alignItems: 'stretch',
     justifyContent: 'space-between',
     gap: 14,
+    backdropFilter: 'blur(14px)',
+    WebkitBackdropFilter: 'blur(14px)',
     marginBottom: 14,
   };
 
   const contextLeft: React.CSSProperties = {
     display: 'flex',
     flexDirection: 'column',
-    gap: 6,
+    gap: 8,
     minWidth: 180,
   };
 
   const bigMetric: React.CSSProperties = {
-    fontSize: 42,
+    fontSize: 44,
     fontWeight: 950,
-    letterSpacing: -0.8,
+    letterSpacing: -1,
     lineHeight: 1,
+    color: 'white',
   };
+
+  const pill: React.CSSProperties = {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 10,
+    padding: '10px 14px',
+    borderRadius: 999,
+    fontSize: 13,
+    fontWeight: 900,
+    border: '1px solid rgba(255,255,255,0.10)',
+    background: 'rgba(255,255,255,0.04)',
+    userSelect: 'none',
+    whiteSpace: 'nowrap',
+    backdropFilter: 'blur(12px)',
+    WebkitBackdropFilter: 'blur(12px)',
+  };
+
+  const dot = (color: string): React.CSSProperties => ({
+    width: 9,
+    height: 9,
+    borderRadius: 99,
+    background: color,
+    display: 'inline-block',
+    boxShadow: `0 0 0 3px rgba(255,255,255,0.03)`,
+  });
 
   const controls: React.CSSProperties = {
     display: 'flex',
@@ -402,14 +418,6 @@ export default function Page() {
     marginBottom: 14,
   };
 
-  const sliderWrap: React.CSSProperties = {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: 6,
-    minWidth: 220,
-    flex: '1 1 240px',
-  };
-
   const grid: React.CSSProperties = {
     display: 'grid',
     gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
@@ -417,23 +425,26 @@ export default function Page() {
   };
 
   const card: React.CSSProperties = {
-    border: '1px solid rgba(0,0,0,0.10)',
+    border: '1px solid rgba(255,255,255,0.08)',
     borderRadius: 22,
-    background: 'white',
+    background: 'rgba(255,255,255,0.04)',
     padding: 16,
+    backdropFilter: 'blur(12px)',
+    WebkitBackdropFilter: 'blur(12px)',
   };
 
   const iconBox: React.CSSProperties = {
-    width: 42,
-    height: 42,
+    width: 44,
+    height: 44,
     borderRadius: 14,
-    background: 'rgba(0,0,0,0.04)',
+    background: 'rgba(255,255,255,0.06)',
     display: 'inline-flex',
     alignItems: 'center',
     justifyContent: 'center',
     fontWeight: 900,
     fontSize: 13,
     flexShrink: 0,
+    color: 'rgba(255,255,255,0.90)',
   };
 
   const openBtn: React.CSSProperties = {
@@ -442,23 +453,32 @@ export default function Page() {
     justifyContent: 'center',
     padding: '10px 12px',
     borderRadius: 14,
-    border: '1px solid rgba(0,0,0,0.12)',
-    background: 'rgba(0,0,0,0.02)',
+    border: '1px solid rgba(255,255,255,0.10)',
+    background: 'rgba(255,255,255,0.04)',
     textDecoration: 'none',
     fontWeight: 900,
-    color: 'inherit',
+    color: 'rgba(255,255,255,0.92)',
     whiteSpace: 'nowrap',
   };
 
-  const divider: React.CSSProperties = {
-    height: 1,
-    background: 'rgba(0,0,0,0.06)',
-    margin: '12px 0',
+  const divider: React.CSSProperties = { height: 1, background: 'rgba(255,255,255,0.06)', margin: '12px 0' };
+
+  const tag: React.CSSProperties = {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 8,
+    padding: '8px 12px',
+    borderRadius: 999,
+    border: '1px solid rgba(255,255,255,0.10)',
+    background: 'rgba(255,255,255,0.04)',
+    fontSize: 12,
+    fontWeight: 900,
+    color: 'rgba(255,255,255,0.90)',
   };
 
   return (
     <main style={page}>
-      {/* Header minimal (Refresh = clic sur le titre) */}
+      {/* Header minimal : Refresh = clic sur le titre */}
       <div style={headerRow}>
         <div>
           <div onClick={() => fetchAll('refresh')} title="Recharger" style={title}>
@@ -472,41 +492,35 @@ export default function Page() {
         </div>
       </div>
 
-      {/* Contexte (compact, utile) */}
+      {/* Contexte (utile, compact, lisible) */}
       <section style={contextCard}>
         <div style={contextLeft}>
-          <div style={{ fontSize: 12, opacity: 0.55, fontWeight: 900, letterSpacing: 1 }}>
-            RFS CONTEXT
+          <div style={{ fontSize: 12, opacity: 0.55, fontWeight: 900, letterSpacing: 1 }}>RFS CONTEXT</div>
+          <div style={{ fontSize: 14, opacity: 0.75, fontWeight: 900 }}>Confiance</div>
+          <div style={bigMetric}>{confidenceGlobal != null ? `${confidenceGlobal}%` : '—'}</div>
+
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+            <span style={tag}>
+              <span style={dot(regimeColor(ctxReg))} aria-hidden="true" />
+              {ctxReg === '—' ? 'Régime' : ctxReg}
+            </span>
           </div>
-          <div style={{ fontSize: 14, opacity: 0.7, fontWeight: 900 }}>Confiance</div>
-          <div style={bigMetric}>{Number.isFinite(confidenceGlobal) ? `${confidenceGlobal}%` : '—'}</div>
-          <div style={{ fontSize: 14, opacity: 0.7, fontWeight: 900 }}>{ctxReg}</div>
         </div>
 
-        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 10 }}>
-          <div style={pillStyle(ctxRegKind)}>
-            <span style={dotStyle(ctxRegKind)} aria-hidden="true" />
-            {ctxReg !== '—' ? ctxReg : 'RÉGIME'}
-          </div>
-        </div>
+        {/* Rien d’autre : pas de phrase parasite */}
+        <div />
       </section>
 
-      {/* Filtres (ultra simples) */}
+      {/* Filtres ultra simples (sans curseur) */}
       <section style={controls}>
-        <div style={sliderWrap}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, alignItems: 'baseline' }}>
-            <div style={{ fontSize: 13, opacity: 0.7, fontWeight: 900 }}>Score minimum</div>
-            <div style={{ fontSize: 13, fontWeight: 950 }}>{clampInt(minScore, 0, 100)}</div>
-          </div>
-          <input
-            type="range"
-            min={0}
-            max={100}
-            value={clampInt(minScore, 0, 100)}
-            onChange={(e) => setMinScore(Number(e.target.value))}
-            aria-label="Score minimum"
-          />
-        </div>
+        <Segmented
+          value={sortMode}
+          onChange={(v) => setSortMode(v as any)}
+          options={[
+            { value: 'STABILITY', label: 'Stabilité' },
+            { value: 'SCORE', label: 'Score' },
+          ]}
+        />
 
         <Segmented
           value={regimeFilter}
@@ -523,22 +537,36 @@ export default function Page() {
       {/* États */}
       {isLoading ? (
         <div style={grid}>
-          {Array.from({ length: 8 }).map((_, i) => (
+          {Array.from({ length: 6 }).map((_, i) => (
             <SkeletonCard key={i} />
           ))}
         </div>
       ) : error ? (
-        <div style={{ padding: 16, border: '1px solid rgba(255,0,0,0.25)', borderRadius: 18 }}>
+        <div
+          style={{
+            padding: 16,
+            border: '1px solid rgba(231,76,60,0.35)',
+            borderRadius: 18,
+            background: 'rgba(231,76,60,0.08)',
+          }}
+        >
           <div style={{ fontWeight: 950, marginBottom: 6 }}>Erreur</div>
-          <div style={{ whiteSpace: 'pre-wrap' }}>{error}</div>
+          <div style={{ whiteSpace: 'pre-wrap', opacity: 0.9 }}>{error}</div>
         </div>
-      ) : filteredAssets.length === 0 ? (
-        <div style={{ padding: 16, border: '1px solid rgba(0,0,0,0.10)', borderRadius: 18 }}>
-          Aucun résultat avec ces filtres.
+      ) : visibleAssets.length === 0 ? (
+        <div
+          style={{
+            padding: 16,
+            border: '1px solid rgba(255,255,255,0.10)',
+            borderRadius: 18,
+            background: 'rgba(255,255,255,0.04)',
+          }}
+        >
+          Aucun résultat.
         </div>
       ) : (
         <div style={grid}>
-          {filteredAssets.map((a, idx) => {
+          {visibleAssets.map((a, idx) => {
             const symbol = safeString(a.symbol) ?? '—';
             const name = safeString(a.name) ?? symbol;
 
@@ -547,24 +575,21 @@ export default function Page() {
             const price = safeNumber(a.price);
 
             const reg = regimeLabel(a.regime ?? null);
-            const regKind = getRegimeKind(reg);
-
             const url = pickTradeUrl(a);
-            const reason = safeString(a.confidence_reason);
 
             return (
               <div key={`${safeString(a.id) ?? symbol}-${idx}`} style={card}>
-                {/* Ligne haute */}
+                {/* Ligne 1 : identité + score */}
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
                   <div style={{ display: 'flex', gap: 12, alignItems: 'center', minWidth: 0 }}>
                     <div style={iconBox} title={symbol}>
                       {symbol.slice(0, 2)}
                     </div>
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }}>
-                      <div style={{ fontWeight: 950, fontSize: 18, lineHeight: 1.1 }}>{symbol}</div>
+                      <div style={{ fontWeight: 950, fontSize: 18, lineHeight: 1.1, color: 'white' }}>{symbol}</div>
                       <div
                         style={{
-                          opacity: 0.7,
+                          opacity: 0.75,
                           fontSize: 13,
                           lineHeight: 1.2,
                           overflow: 'hidden',
@@ -577,14 +602,14 @@ export default function Page() {
                     </div>
                   </div>
 
-                  <div style={{ fontWeight: 950, fontSize: 34, letterSpacing: -0.6 }}>
+                  <div style={{ fontWeight: 950, fontSize: 38, letterSpacing: -1, color: 'white' }}>
                     {formatScore(score)}
                   </div>
                 </div>
 
                 <div style={divider} />
 
-                {/* Ligne métriques */}
+                {/* Ligne 2 : variation + prix */}
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                     <div style={{ fontSize: 12, opacity: 0.6, fontWeight: 900 }}>24h</div>
@@ -597,26 +622,26 @@ export default function Page() {
                   </div>
                 </div>
 
-                {/* Ligne action */}
+                {/* Ligne 3 : régime + action */}
                 <div style={{ marginTop: 12, display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
-                  <div style={pillStyle(regKind)}>
-                    <span style={dotStyle(regKind)} aria-hidden="true" />
+                  <span style={pill}>
+                    <span style={dot(regimeColor(reg))} aria-hidden="true" />
                     {reg}
-                  </div>
+                  </span>
 
                   {url ? (
                     <a href={url} target="_blank" rel="noreferrer" style={openBtn}>
                       Ouvrir Binance
                     </a>
                   ) : (
-                    <span style={{ opacity: 0.6, fontWeight: 900 }}>Lien indisponible</span>
+                    <span style={{ opacity: 0.6, fontWeight: 900 }}>—</span>
                   )}
                 </div>
 
-                {/* Reason (court, utile) */}
-                {reason ? (
+                {/* Optionnel : une seule ligne, si utile */}
+                {safeString(a.confidence_reason) ? (
                   <div style={{ marginTop: 10, fontSize: 12, opacity: 0.65, lineHeight: 1.35 }}>
-                    {reason}
+                    {safeString(a.confidence_reason)}
                   </div>
                 ) : null}
               </div>
