@@ -1,0 +1,378 @@
+/* ===========================
+   ZILKARA UI V3 — DESIGN SYSTEM (Adaptive)
+   - Mobile-first
+   - Signal > noise
+   - RFS-compatible
+   =========================== */
+
+/* 1) Base Reset (minimal, safe) */
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* 2) Fonts (system first) */
+:root{
+  --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+               "SF Pro Text", "SF Pro Display", "Inter", "Segoe UI", Roboto, Arial, sans-serif;
+}
+
+/* 3) Tokens — Core */
+:root{
+  /* Spacing scale (4pt system) */
+  --s0: 0px;
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 20px;
+  --s6: 24px;
+  --s7: 32px;
+  --s8: 40px;
+
+  /* Radii */
+  --r0: 0px;
+  --r1: 10px;
+  --r2: 14px;
+  --r3: 18px;
+
+  /* Borders */
+  --b1: 1px;
+
+  /* Typography scale */
+  --t0: 12px; /* micro */
+  --t1: 13px; /* helper */
+  --t2: 14px; /* body */
+  --t3: 16px; /* body+ */
+  --t4: 18px; /* title */
+  --t5: 22px; /* section */
+  --t6: 28px; /* score */
+  --t7: 32px; /* big score */
+
+  /* Line heights */
+  --lh-tight: 1.15;
+  --lh-body: 1.45;
+
+  /* Motion */
+  --dur-fast: 120ms;
+  --dur-med: 180ms;
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  /* Layout */
+  --maxw: 720px; /* mobile-first, still good on desktop */
+}
+
+/* 4) Tokens — Light theme (default) */
+:root{
+  /* Surfaces */
+  --bg: #F7F8FA;
+  --surface: #FFFFFF;
+  --surface-2: #F2F4F7;
+
+  /* Text */
+  --text: #111111;
+  --text-2: #6B7280;
+  --text-3: #9CA3AF;
+
+  /* Lines */
+  --line: rgba(17, 17, 17, 0.08);
+
+  /* Accent (neutral, not “crypto neon”) */
+  --accent: #111111;
+
+  /* RFS Regimes (disciplined) */
+  --stable: #1F8A4C;
+  --transition: #B7791F;
+  --volatile: #4A5568;
+
+  /* Status */
+  --positive: #1F8A4C;
+  --negative: #B42318; /* restrained red */
+}
+
+/* 5) Tokens — Dark theme (auto) */
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg: #0E1116;
+    --surface: #161B22;
+    --surface-2: #0F141B;
+
+    --text: #E6EDF3;
+    --text-2: #8B949E;
+    --text-3: #6E7681;
+
+    --line: rgba(230, 237, 243, 0.10);
+    --accent: #E6EDF3;
+
+    /* RFS Regimes (still calm) */
+    --stable: #2FBF71;      /* not neon */
+    --transition: #E0A83E;
+    --volatile: #7A8699;
+
+    --positive: #2FBF71;
+    --negative: #FF6B6B;    /* softened */
+  }
+}
+
+/* ===========================
+   6) Global UI primitives
+   =========================== */
+
+.z-root{
+  font-family: var(--font-sans);
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100%;
+}
+
+.z-container{
+  max-width: var(--maxw);
+  margin: 0 auto;
+  padding: var(--s6) var(--s4);
+}
+
+/* Titles */
+.z-h1{
+  font-size: 26px;
+  line-height: var(--lh-tight);
+  margin: 0 0 var(--s2) 0;
+  letter-spacing: -0.02em;
+}
+.z-sub{
+  font-size: var(--t2);
+  color: var(--text-2);
+  margin: 0 0 var(--s6) 0;
+}
+
+/* Chips (minimal, calm) */
+.z-chip{
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s2);
+  padding: 6px 10px;
+  border: var(--b1) solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: var(--t1);
+  line-height: var(--lh-tight);
+  white-space: nowrap;
+}
+
+/* Divider */
+.z-divider{
+  height: 1px;
+  background: var(--line);
+  margin: var(--s6) 0;
+}
+
+/* Buttons (only one primary action: refresh / trade) */
+.z-btn{
+  appearance: none;
+  border: 0;
+  background: var(--surface);
+  color: var(--text);
+  border: var(--b1) solid var(--line);
+  border-radius: 999px;
+  padding: 10px 14px;
+  font-size: var(--t2);
+  line-height: var(--lh-tight);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s2);
+  cursor: pointer;
+  transition: transform var(--dur-fast) var(--ease-out),
+              background var(--dur-fast) var(--ease-out);
+}
+.z-btn:active{ transform: scale(0.98); }
+.z-btn--ghost{
+  background: transparent;
+}
+.z-btn--right{
+  margin-left: auto;
+}
+
+/* ===========================
+   7) RFS Context Block
+   =========================== */
+
+.z-context{
+  background: var(--surface);
+  border: var(--b1) solid var(--line);
+  border-radius: var(--r3);
+  padding: var(--s5);
+}
+
+.z-contextTop{
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--s4);
+}
+
+.z-contextTitle{
+  font-size: var(--t2);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-2);
+  margin: 0;
+}
+
+.z-confidence{
+  font-size: var(--t2);
+  color: var(--text-2);
+  margin: 0;
+  white-space: nowrap;
+}
+
+.z-contextGrid{
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--s4);
+  margin-top: var(--s4);
+}
+
+.z-metric{
+  display: flex;
+  flex-direction: column;
+  gap: var(--s1);
+}
+.z-metricLabel{
+  font-size: var(--t1);
+  color: var(--text-2);
+}
+.z-metricValue{
+  font-size: var(--t4);
+  color: var(--text);
+  letter-spacing: -0.01em;
+}
+
+/* ===========================
+   8) List — Card model (instrument)
+   =========================== */
+
+.z-list{
+  display: flex;
+  flex-direction: column;
+  gap: var(--s3);
+  margin-top: var(--s5);
+}
+
+/* Card */
+.z-card{
+  background: var(--surface);
+  border: var(--b1) solid var(--line);
+  border-radius: var(--r3);
+  padding: var(--s5);
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-rows: auto auto auto;
+  gap: var(--s2) var(--s4);
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+.z-card:active{ transform: scale(0.995); }
+
+/* Asset block */
+.z-asset{
+  display: flex;
+  flex-direction: column;
+  gap: var(--s1);
+  min-width: 0;
+}
+.z-symbol{
+  font-size: var(--t4);
+  letter-spacing: -0.01em;
+  font-weight: 600;
+  margin: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.z-name{
+  font-size: var(--t2);
+  color: var(--text-2);
+  margin: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Score */
+.z-score{
+  font-size: var(--t7);
+  line-height: var(--lh-tight);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  text-align: right;
+}
+
+/* Regime line */
+.z-regime{
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s2);
+  font-size: var(--t1);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-2);
+}
+.z-dot{
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: var(--volatile);
+}
+.z-dot[data-regime="STABLE"]{ background: var(--stable); }
+.z-dot[data-regime="TRANSITION"]{ background: var(--transition); }
+.z-dot[data-regime="VOLATILE"]{ background: var(--volatile); }
+
+/* Stats row */
+.z-stats{
+  display: flex;
+  gap: var(--s5);
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+.z-stat{
+  display: flex;
+  flex-direction: column;
+  gap: var(--s1);
+}
+.z-statLabel{
+  font-size: var(--t1);
+  color: var(--text-2);
+}
+.z-statValue{
+  font-size: var(--t3);
+  color: var(--text);
+}
+.z-chgPos{ color: var(--positive); }
+.z-chgNeg{ color: var(--negative); }
+
+/* Trade link */
+.z-trade{
+  grid-column: 2 / 3;
+  grid-row: 3 / 4;
+  justify-self: end;
+  align-self: end;
+  font-size: var(--t2);
+  color: var(--text);
+  text-decoration: none;
+  border: var(--b1) solid var(--line);
+  background: transparent;
+  padding: 10px 12px;
+  border-radius: 999px;
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+.z-trade:active{ transform: scale(0.98); }
+
+/* ===========================
+   9) Optional: Compact mode (desktop only)
+   =========================== */
+@media (min-width: 900px){
+  .z-container{ padding: var(--s7) var(--s6); }
+  .z-card{ padding: var(--s6); }
+}
