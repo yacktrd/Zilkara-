@@ -36,8 +36,8 @@ export type ScanAsset = {
   confidence_label?: ConfidenceLabel;
   confidence_reason?: string;
 
-  binance_url: string; // never broken (fallback to markets page)
-  affiliate_url?: string; // clean undefined if not configured
+  binance_url: string; // never empty
+  affiliate_url?: string; // undefined if not configured
 };
 
 export type ApiResponse = {
@@ -55,6 +55,12 @@ export type ApiResponse = {
     cache: "hit" | "miss" | "no-store";
     generated_at: string;
     warnings?: string[];
+
+    // ✅ additions (non-breaking)
+    fetch_size?: number;
+    cache_ttl_sec?: number;
+    no_store?: boolean;
+    discipline_mode?: "ON" | "OFF";
   };
 };
 
@@ -87,7 +93,7 @@ function parseSort(v: string | null): SortMode {
     "chg_24h_abs_asc",
     "chg_24h_abs_desc",
   ];
-  return (allowed.includes(s as SortMode) ? (s as SortMode) : DEFAULT_SORT);
+  return allowed.includes(s as SortMode) ? (s as SortMode) : DEFAULT_SORT;
 }
 
 /**
@@ -107,16 +113,6 @@ type CGMarketItem = {
 };
 
 const COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/markets";
-
-function withTimeout<T>(ms: number, promise: Promise<T>): Promise<T> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), ms);
-
-  // We cannot inject the signal into an already-created promise.
-  // So we provide a wrapper for fetch below that uses AbortController.
-  // This helper is kept for non-fetch promises if needed.
-  return promise.finally(() => clearTimeout(timeout));
-}
 
 async function fetchCoinGeckoMarkets(opts: {
   quote: string;
@@ -141,7 +137,6 @@ async function fetchCoinGeckoMarkets(opts: {
       method: "GET",
       headers: { accept: "application/json" },
       signal: controller.signal,
-      // Next.js runtime dynamic, but still ok:
       cache: "no-store",
     });
 
@@ -199,7 +194,6 @@ function safeString(v: unknown): string | undefined {
 }
 
 function cleanStr(v: unknown): string | undefined {
-  // alias explicite (lecture plus claire)
   return safeString(v);
 }
 
@@ -222,10 +216,8 @@ function normalizeName(opts: { name?: unknown; id?: unknown; symbol?: unknown })
   const name = safeString(opts.name);
   if (name) return name;
 
-  // fallback intelligent: id -> Title Case, sinon symbol
   const id = safeString(opts.id);
   if (id) {
-    // "render-token" -> "Render Token"
     return id
       .split(/[-_ ]+/)
       .filter(Boolean)
@@ -244,22 +236,18 @@ function normalizeName(opts: { name?: unknown; id?: unknown; symbol?: unknown })
  */
 
 function buildBinanceUrl(symbol: string): string {
-  // Binance spot pairs are usually SYMBOLUSDT. If it’s not listed, this may 404.
-  // We still guarantee a non-empty URL (never broken/empty).
   const s = symbol.toUpperCase().trim();
-  if (!s) return "https://www.binance.com/en/markets";
+  // Ultra safe fallback:
+  if (!s || s.length > 10 || /[^A-Z0-9]/.test(s)) return "https://www.binance.com/en/markets";
   return `https://www.binance.com/en/trade/${encodeURIComponent(s)}USDT?_from=markets`;
 }
 
 function buildAffiliateUrl(binanceUrl: string): string | undefined {
-  // If you have an affiliate format, plug it here.
-  // Example: append ?ref=XXXX or use env.
-  const ref = process.env.BINANCE_AFFILIATE_REF; // optional env
+  const ref = process.env.BINANCE_AFFILIATE_REF;
   if (!ref) return undefined;
 
   try {
     const u = new URL(binanceUrl);
-    // do not overwrite existing params, just add ref
     if (!u.searchParams.get("ref")) u.searchParams.set("ref", ref);
     return u.toString();
   } catch {
@@ -274,8 +262,8 @@ function buildAffiliateUrl(binanceUrl: string): string | undefined {
  */
 
 const REGIME_THRESHOLDS = {
-  stable_abs_pct: 3, // <= 3% => STABLE
-  transition_abs_pct: 8, // <= 8% => TRANSITION, > 8% => VOLATILE
+  stable_abs_pct: 3,
+  transition_abs_pct: 8,
 };
 
 function normalizeRegime(chg24Pct: number): Regime {
@@ -304,42 +292,23 @@ function computeConfidenceScore(input: {
   marketCap?: number;
   regime: Regime;
   discipline: boolean;
-}): {
-  score: number;
-  label: ConfidenceLabel;
-  reason: string;
-} {
+}): { score: number; label: ConfidenceLabel; reason: string } {
   const { chg24, volume24h, marketCap, regime, discipline } = input;
 
-  // Volatility penalty: lower abs change => better
-  // 0% => 1.0, 10% => 0.0 (cap)
   const volFactor = 1 - clamp01(Math.abs(chg24) / 10);
 
-  // Liquidity bonus based on market cap (log scale)
-  // If missing, neutral factor
   const mc = typeof marketCap === "number" && marketCap > 0 ? marketCap : undefined;
-  const liqBase = mc ? Math.log10(mc) : 10; // ~10 as neutral-ish (1e10)
-  // Normalize: 8 -> low, 12 -> high
+  const liqBase = mc ? Math.log10(mc) : 10;
   const liqFactor = clamp01((liqBase - 8) / 4);
 
-  // Volume confirmation (optional)
   const vol = typeof volume24h === "number" && volume24h > 0 ? volume24h : undefined;
-  const volLog = vol ? Math.log10(vol) : 9; // neutral-ish (1e9)
-  // Normalize: 7 -> low, 11 -> high
+  const volLog = vol ? Math.log10(vol) : 9;
   const volFactor2 = clamp01((volLog - 7) / 4);
 
-  // Regime modifier
-  const regimeMod =
-    regime === "STABLE" ? 1.0 : regime === "TRANSITION" ? 0.85 : 0.65;
+  const regimeMod = regime === "STABLE" ? 1.0 : regime === "TRANSITION" ? 0.85 : 0.65;
 
-  // Discipline mode: stricter penalty on volatility & volatile regime
-  const disciplinePenalty = discipline
-    ? regime === "VOLATILE"
-      ? 0.75
-      : 0.9
-    : 1.0;
+  const disciplinePenalty = discipline ? (regime === "VOLATILE" ? 0.75 : 0.9) : 1.0;
 
-  // Weighted score
   const raw =
     100 *
     (0.55 * volFactor + 0.25 * liqFactor + 0.20 * volFactor2) *
@@ -352,7 +321,6 @@ function computeConfidenceScore(input: {
   if (score >= 75) label = "GOOD";
   else if (score < 50) label = "RISK";
 
-  // Short reason (1 phrase)
   const reason =
     label === "GOOD"
       ? "Variation maîtrisée et liquidité solide."
@@ -427,15 +395,20 @@ function sortAssets(list: ScanAsset[], sort: SortMode): ScanAsset[] {
  * 9) Cache (optionnel)
  * ==================================
  *
- * Sans ajouter de dépendances, on fait un cache in-memory (best-effort).
- * Vercel serverless peut cold-start => cache non garanti, mais utile.
+ * Pack: on cache le dataset trié avant slicing => moins de recalcul entre limits.
  */
 
-type CacheEntry = { ts: number; data: ScanAsset[]; source: "cache" | "coingecko" | "fallback" };
+type CacheEntry = {
+  ts: number;
+  data: ScanAsset[]; // trié
+  source: "cache" | "coingecko" | "fallback";
+  fetchSize: number;
+};
+
 const memCache = new Map<string, CacheEntry>();
 
-function cacheKey(opts: { limit: number; sort: SortMode; discipline: boolean; quote: string }) {
-  return `scan:v1:${opts.quote}:${opts.limit}:${opts.sort}:${opts.discipline ? "D1" : "D0"}`;
+function cacheKey(opts: { sort: SortMode; discipline: boolean; quote: string }) {
+  return `scan:v1:${opts.quote}:${opts.sort}:${opts.discipline ? "D1" : "D0"}`;
 }
 
 function getCache(key: string, ttlMs: number): CacheEntry | undefined {
@@ -473,22 +446,25 @@ export async function GET(req: Request) {
   const limitRaw = toNum(searchParams.get("limit")) ?? DEFAULT_LIMIT;
   const limit = clampInt(Math.floor(limitRaw), 1, MAX_LIMIT);
 
-  // Cache controls: default on, but user can force no-store
   const noStore = parseBool(searchParams.get("noStore"));
-  const ttlMs = 45 * 1000; // 45s TTL (safe for rate limit / UX)
-  const key = cacheKey({ limit, sort, discipline, quote });
+  const ttlMs = 45 * 1000;
+  const ttlSec = Math.round(ttlMs / 1000);
+
+  const key = cacheKey({ sort, discipline, quote });
 
   if (!noStore) {
     const hit = getCache(key, ttlMs);
     if (hit) {
+      const paged = hit.data.slice(0, limit);
+
       const response: ApiResponse = {
         ok: true,
         ts,
         source: "cache",
         market,
         quote,
-        count: hit.data.length,
-        data: hit.data,
+        count: paged.length,
+        data: paged,
         meta: {
           sorted_by: sort,
           limit,
@@ -496,36 +472,31 @@ export async function GET(req: Request) {
           cache: "hit",
           generated_at: ts,
           warnings: warnings.length ? warnings : undefined,
+          fetch_size: hit.fetchSize,
+          cache_ttl_sec: ttlSec,
+          no_store: false,
+          discipline_mode: discipline ? "ON" : "OFF",
         },
       };
-      return NextResponse.json(response, {
-        status: 200,
-        headers: { "cache-control": "no-store" },
-      });
+
+      return NextResponse.json(response, { status: 200, headers: { "cache-control": "no-store" } });
     }
   }
 
   let raw: CGMarketItem[] = [];
   let source: ApiResponse["source"] = "coingecko";
 
+  // fetch stable: enough breadth for context + sorting
+  const fetchSize = clampInt(Math.max(200, limit * 2), 50, 250);
+
   try {
-    // Fetch more than needed so the scoring + sorting is meaningful
-    // (we apply limit after tri)
-    const fetchSize = clampInt(Math.max(limit * 2, 80), 50, 250);
     raw = await fetchCoinGeckoMarkets({ quote, limit: fetchSize });
-    if (!raw.length) {
-      warnings.push("CoinGecko a renvoyé une liste vide.");
-    }
+    if (!raw.length) warnings.push("CoinGecko a renvoyé une liste vide.");
   } catch (err: any) {
     source = "fallback";
     warnings.push(`Source principale indisponible: ${err?.message || "unknown"}`);
     raw = fallbackMarkets();
   }
-
-  /**
-   * V1 rule: never return holes (missing score/name/link)
-   * => we filter only items that can be normalized to a stable contract
-   */
 
   const normalized: ScanAsset[] = raw
     .map((x) => {
@@ -539,7 +510,7 @@ export async function GET(req: Request) {
       const marketCap = toNum(x?.market_cap ?? undefined);
       const volume24 = toNum(x?.total_volume ?? undefined);
 
-      if (!id || !symbol) return null; // cannot build stable links without symbol/id
+      if (!id || !symbol) return null;
 
       const regime = normalizeRegime(chg24);
 
@@ -562,13 +533,10 @@ export async function GET(req: Request) {
         chg_24h_pct: chg24,
         market_cap: marketCap,
         volume_24h: volume24,
-
         regime,
-
         confidence_score: score,
         confidence_label: label,
         confidence_reason: reason,
-
         binance_url,
         affiliate_url,
       };
@@ -578,7 +546,6 @@ export async function GET(req: Request) {
     .filter((x): x is ScanAsset => Boolean(x));
 
   if (!normalized.length) {
-    // Hard failure: return proper error
     const response: ApiResponse = {
       ok: false,
       ts,
@@ -594,25 +561,31 @@ export async function GET(req: Request) {
         cache: noStore ? "no-store" : "miss",
         generated_at: ts,
         warnings: ["Aucun actif n’a pu être normalisé. Vérifie la source et le mapping."],
+        fetch_size: fetchSize,
+        cache_ttl_sec: ttlSec,
+        no_store: noStore,
+        discipline_mode: discipline ? "ON" : "OFF",
       },
     };
-    return NextResponse.json(response, {
-      status: 200,
-      headers: { "cache-control": "no-store" },
-    });
+
+    // status utile pour debug (front le gère)
+    const status = source === "fallback" ? 502 : 500;
+
+    return NextResponse.json(response, { status, headers: { "cache-control": "no-store" } });
   }
 
   const sorted = sortAssets(normalized, sort);
-  const paged = sorted.slice(0, limit);
 
   if (!noStore) {
-    setCache(key, { ts: Date.now(), data: paged, source });
+    setCache(key, { ts: Date.now(), data: sorted, source, fetchSize });
   }
+
+  const paged = sorted.slice(0, limit);
 
   const response: ApiResponse = {
     ok: true,
     ts,
-    source: noStore ? source : source, // kept explicit
+    source,
     market,
     quote,
     count: paged.length,
@@ -624,11 +597,12 @@ export async function GET(req: Request) {
       cache: noStore ? "no-store" : "miss",
       generated_at: ts,
       warnings: warnings.length ? warnings : undefined,
+      fetch_size: fetchSize,
+      cache_ttl_sec: ttlSec,
+      no_store: noStore,
+      discipline_mode: discipline ? "ON" : "OFF",
     },
   };
 
-  return NextResponse.json(response, {
-    status: 200,
-    headers: { "cache-control": "no-store" },
-  });
+  return NextResponse.json(response, { status: 200, headers: { "cache-control": "no-store" } });
 }
