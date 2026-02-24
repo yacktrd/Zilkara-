@@ -1,7 +1,7 @@
 // app/page.tsx
 'use client';
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 
 type Regime = 'STABLE' | 'TRANSITION' | 'VOLATILE' | string;
 
@@ -9,649 +9,665 @@ type ScanAsset = {
   id?: string;
   symbol?: string;
   name?: string;
+
   price?: number | null;
   chg_24h_pct?: number | null;
+
   confidence_score?: number | null;
+  confidence_label?: string | null;
+  confidence_reason?: string | null;
+
   regime?: Regime | null;
+
+  // liens fournis par l’API (NE PAS reconstruire)
   binance_url?: string | null;
   affiliate_url?: string | null;
+
+  market_cap?: number | null;
+  volume_24h?: number | null;
 };
 
 type ScanResponse = {
   ok: boolean;
+  ts?: string;
+  source?: string;
+  market?: string;
+  quote?: string;
+  count?: number;
   data?: ScanAsset[];
+  meta?: Record<string, unknown>;
   error?: string;
   message?: string;
-  meta?: {
-    updated_at?: string;
-    confidence?: number;
-    regime?: Regime;
-  };
 };
 
-type SortKey = 'score_desc' | 'score_asc' | 'chg_desc' | 'chg_asc' | 'price_desc' | 'price_asc';
+type ContextResponse = {
+  ok: boolean;
+  ts?: string;
+  market_regime?: string | null;
+  confidence_global?: number | null; // 0..100
+  stable_ratio?: number | null;
+  transition_ratio?: number | null;
+  volatile_ratio?: number | null;
+  message?: string | null;
+  error?: string;
+};
 
-const clamp = (n: number, a: number, b: number) => Math.max(a, Math.min(b, n));
+function clampInt(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, Math.trunc(n)));
+}
 
-export default function Page() {
-  const [assets, setAssets] = useState<ScanAsset[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+function safeNumber(v: unknown): number | null {
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  return null;
+}
 
-  // barre d’info (comme sur la photo)
-  const [updatedAt, setUpdatedAt] = useState<string | null>(null);
-  const [globalConfidence, setGlobalConfidence] = useState<number | null>(null);
-  const [globalRegime, setGlobalRegime] = useState<Regime | null>(null);
+function safeString(v: unknown): string | null {
+  if (typeof v === 'string') {
+    const s = v.trim();
+    return s.length ? s : null;
+  }
+  return null;
+}
 
-  // tri (ligne "Trier / Appliquer")
-  const [sortKey, setSortKey] = useState<SortKey>('score_desc');
-  const [appliedSortKey, setAppliedSortKey] = useState<SortKey>('score_desc');
+function formatPrice(v: number | null): string {
+  if (v === null) return '—';
+  if (v >= 1000) return v.toLocaleString(undefined, { maximumFractionDigits: 0 });
+  if (v >= 1) return v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return v.toLocaleString(undefined, { minimumFractionDigits: 4, maximumFractionDigits: 6 });
+}
 
-  const load = async () => {
-    try {
-      setIsLoading(true);
-      setError(null);
+function formatPct(v: number | null): string {
+  if (v === null) return '—';
+  const sign = v > 0 ? '+' : '';
+  return `${sign}${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`;
+}
 
-      const res = await fetch('/api/scan', { cache: 'no-store' });
-      const json = (await res.json()) as ScanResponse;
+function formatScore(v: number | null): string {
+  if (v === null) return '—';
+  return String(clampInt(v, 0, 100));
+}
 
-      if (!json.ok) throw new Error(json.error || json.message || 'Erreur de chargement');
+function regimeLabel(regime: Regime | null): 'STABLE' | 'TRANSITION' | 'VOLATILE' | '—' {
+  if (!regime) return '—';
+  const r = String(regime).toUpperCase();
+  if (r === 'STABLE' || r === 'TRANSITION' || r === 'VOLATILE') return r;
+  return '—';
+}
 
-      const arr = Array.isArray(json.data) ? json.data : [];
-      setAssets(arr);
+function pickTradeUrl(a: ScanAsset): string | null {
+  // IMPORTANT: ne jamais reconstruire. On prend celui donné par l’API.
+  return safeString(a.affiliate_url) ?? safeString(a.binance_url) ?? null;
+}
 
-      const metaUpdated = json.meta?.updated_at;
-      setUpdatedAt(metaUpdated ?? new Date().toISOString());
+function getRegimeKind(r: ReturnType<typeof regimeLabel>): 'stable' | 'transition' | 'volatile' | 'neutral' {
+  if (r === 'STABLE') return 'stable';
+  if (r === 'TRANSITION') return 'transition';
+  if (r === 'VOLATILE') return 'volatile';
+  return 'neutral';
+}
 
-      const metaRegime = json.meta?.regime ?? guessRegime(arr);
-      setGlobalRegime(metaRegime ?? null);
+function dotStyle(kind: 'stable' | 'transition' | 'volatile' | 'neutral') {
+  const base: React.CSSProperties = {
+    width: 10,
+    height: 10,
+    borderRadius: 99,
+    background: 'rgba(0,0,0,0.22)',
+    display: 'inline-block',
+  };
+  // (sans couleur explicite — tu pourras typer en CSS global plus tard)
+  return base;
+}
 
-      const metaConf =
-        typeof json.meta?.confidence === 'number' ? json.meta!.confidence! : computeGlobalConfidence(arr);
-      setGlobalConfidence(Number.isFinite(metaConf) ? clamp(Math.round(metaConf), 0, 100) : null);
-    } catch (e: any) {
-      setError(e?.message ?? 'Erreur inconnue');
-      setAssets([]);
-      setUpdatedAt(null);
-      setGlobalConfidence(null);
-      setGlobalRegime(null);
-    } finally {
-      setIsLoading(false);
-    }
+function pillStyle(): React.CSSProperties {
+  return {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 10,
+    padding: '10px 14px',
+    borderRadius: 999,
+    fontSize: 13,
+    fontWeight: 900,
+    border: '1px solid rgba(0,0,0,0.10)',
+    background: 'rgba(0,0,0,0.03)',
+    userSelect: 'none',
+    whiteSpace: 'nowrap',
+  };
+}
+
+function SkeletonCard() {
+  const box: React.CSSProperties = {
+    border: '1px solid rgba(0,0,0,0.10)',
+    borderRadius: 22,
+    background: 'rgba(0,0,0,0.03)',
+    padding: 16,
+    minHeight: 128,
   };
 
-  useEffect(() => {
-    load();
-  }, []);
-
-  const displayAssets = useMemo(() => {
-    const list = [...assets];
-    const getNum = (v: number | null | undefined, fallback = -Infinity) =>
-      typeof v === 'number' && Number.isFinite(v) ? v : fallback;
-
-    switch (appliedSortKey) {
-      case 'score_desc':
-        list.sort((a, b) => getNum(b.confidence_score) - getNum(a.confidence_score));
-        break;
-      case 'score_asc':
-        list.sort((a, b) => getNum(a.confidence_score) - getNum(b.confidence_score));
-        break;
-      case 'chg_desc':
-        list.sort((a, b) => getNum(b.chg_24h_pct) - getNum(a.chg_24h_pct));
-        break;
-      case 'chg_asc':
-        list.sort((a, b) => getNum(a.chg_24h_pct) - getNum(b.chg_24h_pct));
-        break;
-      case 'price_desc':
-        list.sort((a, b) => getNum(b.price) - getNum(a.price));
-        break;
-      case 'price_asc':
-        list.sort((a, b) => getNum(a.price) - getNum(b.price));
-        break;
-    }
-    return list;
-  }, [assets, appliedSortKey]);
-
-  const applySort = () => setAppliedSortKey(sortKey);
-
-  const formatUpdated = (iso: string | null) => {
-    if (!iso) return '—';
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return iso;
-    return d.toISOString();
-  };
-
-  const formatPrice = (v: number | null): string => {
-    if (v == null || !Number.isFinite(v)) return '—';
-    if (v >= 1000) return v.toLocaleString(undefined, { maximumFractionDigits: 0 });
-    if (v >= 1) return v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    return v.toLocaleString(undefined, { minimumFractionDigits: 4, maximumFractionDigits: 6 });
-  };
-
-  const formatPct = (v: number | null): string => {
-    if (v == null || !Number.isFinite(v)) return '—';
-    const sign = v > 0 ? '+' : '';
-    return `${sign}${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`;
-  };
-
-  const formatScore = (v: number | null): string => {
-    if (v == null || !Number.isFinite(v)) return '—';
-    return String(clamp(Math.round(v), 0, 100));
-  };
-
-  const topAffiliate = useMemo(() => {
-    const u =
-      assets.find((a) => a.affiliate_url)?.affiliate_url ??
-      assets.find((a) => a.binance_url)?.binance_url ??
-      null;
-    return u;
-  }, [assets]);
+  const bar = (w: number): React.CSSProperties => ({
+    height: 12,
+    width: `${w}%`,
+    borderRadius: 999,
+    background: 'rgba(0,0,0,0.08)',
+  });
 
   return (
-    <main className="wrap">
-      <div className="container">
-        {/* header */}
-        <header className="header">
-          <div className="h-left">
-            <div className="title">Zilkara</div>
-            <div className="updated">Mis à jour : {formatUpdated(updatedAt)}</div>
-            <div className="meta">
-              <span className="meta-item">
-                <span className="meta-label">Confiance :</span>{' '}
-                <span className="meta-value">{globalConfidence == null ? '—' : `${globalConfidence}%`}</span>
-              </span>
-              <span className="meta-sep" />
-              <span className="meta-item">
-                <span className="meta-label">Régime marché :</span>{' '}
-                <span className="meta-value">{globalRegime ? String(globalRegime).toUpperCase() : '—'}</span>
-              </span>
-              <span className="meta-sep" />
-              <span className="tagline">Trier. Lire. Décider.</span>
+    <div style={box}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
+        <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+          <div style={{ width: 44, height: 44, borderRadius: 14, background: 'rgba(0,0,0,0.08)' }} />
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, width: 180 }}>
+            <div style={bar(40)} />
+            <div style={bar(65)} />
+          </div>
+        </div>
+        <div style={{ width: 56, height: 28, borderRadius: 12, background: 'rgba(0,0,0,0.08)' }} />
+      </div>
+      <div style={{ marginTop: 14, display: 'flex', justifyContent: 'space-between', gap: 12 }}>
+        <div style={bar(32)} />
+        <div style={bar(28)} />
+      </div>
+      <div style={{ marginTop: 14, display: 'flex', justifyContent: 'space-between', gap: 12 }}>
+        <div style={{ width: 110, height: 34, borderRadius: 999, background: 'rgba(0,0,0,0.08)' }} />
+        <div style={{ width: 140, height: 40, borderRadius: 16, background: 'rgba(0,0,0,0.08)' }} />
+      </div>
+    </div>
+  );
+}
+
+function Segmented({
+  value,
+  onChange,
+  options,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  options: Array<{ value: string; label: string }>;
+}) {
+  return (
+    <div
+      role="tablist"
+      style={{
+        display: 'inline-flex',
+        border: '1px solid rgba(0,0,0,0.10)',
+        background: 'rgba(0,0,0,0.03)',
+        borderRadius: 16,
+        padding: 4,
+        gap: 4,
+        overflow: 'hidden',
+      }}
+    >
+      {options.map((opt) => {
+        const active = value === opt.value;
+        return (
+          <button
+            key={opt.value}
+            role="tab"
+            aria-selected={active}
+            onClick={() => onChange(opt.value)}
+            style={{
+              padding: '10px 12px',
+              borderRadius: 14,
+              border: 'none',
+              background: active ? 'white' : 'transparent',
+              fontWeight: 950,
+              fontSize: 13,
+              cursor: 'pointer',
+            }}
+          >
+            {opt.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+export default function Page() {
+  // ✅ Interface identique mobile/desktop : une colonne, centrée
+  // ✅ UI minimal (lecture): sort + discipline + (optionnel) filtres visuels
+  const [sort, setSort] = useState<string>('confidence_score_desc');
+  const [discipline, setDiscipline] = useState<boolean>(false);
+
+  // filtres VISUELS (zéro logique métier)
+  const [minScore, setMinScore] = useState<number>(0);
+  const [regimeFilter, setRegimeFilter] = useState<'ALL' | 'STABLE' | 'TRANSITION' | 'VOLATILE'>('ALL');
+
+  // backend safety (non affiché)
+  const LIMIT_BACKEND = 250;
+
+  const [assets, setAssets] = useState<ScanAsset[]>([]);
+  const [context, setContext] = useState<ContextResponse | null>(null);
+
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const lastUpdated = useMemo(() => safeString(context?.ts) ?? null, [context]);
+
+  const buildScanUrl = useCallback(() => {
+    const params = new URLSearchParams();
+    params.set('limit', String(LIMIT_BACKEND));
+    params.set('sort', sort);
+    if (discipline) params.set('discipline', '1');
+    return `/api/scan?${params.toString()}`;
+  }, [sort, discipline]);
+
+  const fetchAll = useCallback(
+    async (mode: 'initial' | 'refresh') => {
+      try {
+        if (mode === 'initial') setIsLoading(true);
+        if (mode === 'refresh') setIsRefreshing(true);
+
+        setError(null);
+
+        const scanUrl = buildScanUrl();
+        const [scanRes, ctxRes] = await Promise.all([
+          fetch(scanUrl, { cache: 'no-store' }),
+          fetch('/api/context', { cache: 'no-store' }),
+        ]);
+
+        if (!scanRes.ok) {
+          const txt = await scanRes.text().catch(() => '');
+          throw new Error(`Scan HTTP ${scanRes.status}${txt ? ` — ${txt}` : ''}`);
+        }
+        if (!ctxRes.ok) {
+          const txt = await ctxRes.text().catch(() => '');
+          throw new Error(`Context HTTP ${ctxRes.status}${txt ? ` — ${txt}` : ''}`);
+        }
+
+        const scanJson = (await scanRes.json()) as ScanResponse;
+        const ctxJson = (await ctxRes.json()) as ContextResponse;
+
+        if (!scanJson?.ok) throw new Error(scanJson?.error || scanJson?.message || 'Scan: réponse invalide.');
+        if (!ctxJson?.ok) throw new Error(ctxJson?.error || ctxJson?.message || 'Context: réponse invalide.');
+
+        setAssets(Array.isArray(scanJson.data) ? scanJson.data : []);
+        setContext(ctxJson);
+      } catch (e: any) {
+        setError(e?.message ? String(e.message) : 'Erreur inconnue.');
+        setAssets([]);
+        setContext(null);
+      } finally {
+        setIsLoading(false);
+        setIsRefreshing(false);
+      }
+    },
+    [buildScanUrl]
+  );
+
+  useEffect(() => {
+    fetchAll('initial');
+  }, [fetchAll]);
+
+  // ✅ Filtrage purement visuel (aucune logique métier)
+  const filteredAssets = useMemo(() => {
+    const ms = clampInt(minScore, 0, 100);
+    const rf = regimeFilter;
+
+    return assets.filter((a) => {
+      const score = safeNumber(a.confidence_score) ?? 0;
+      const reg = regimeLabel(a.regime ?? null);
+
+      if (score < ms) return false;
+      if (rf !== 'ALL' && reg !== rf) return false;
+
+      return true;
+    });
+  }, [assets, minScore, regimeFilter]);
+
+  // ===== Styles (Apple-like, lisibilité, même rendu partout) =====
+  const page: React.CSSProperties = {
+    padding: 16,
+  };
+
+  // 1 seule colonne centrée pour PC = même interface que téléphone
+  const shell: React.CSSProperties = {
+    maxWidth: 560,
+    margin: '0 auto',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 14,
+  };
+
+  const headerRow: React.CSSProperties = {
+    display: 'flex',
+    alignItems: 'baseline',
+    justifyContent: 'space-between',
+    gap: 12,
+  };
+
+  const title: React.CSSProperties = {
+    fontSize: 36,
+    fontWeight: 950,
+    letterSpacing: -0.7,
+    lineHeight: 1,
+    cursor: 'pointer', // “Home/Refresh” via clic sur le titre
+  };
+
+  const subtle: React.CSSProperties = { opacity: 0.62, fontSize: 13 };
+
+  const contextCard: React.CSSProperties = {
+    border: '1px solid rgba(0,0,0,0.10)',
+    borderRadius: 24,
+    background: 'rgba(0,0,0,0.02)',
+    padding: 18,
+    display: 'flex',
+    alignItems: 'stretch',
+    justifyContent: 'space-between',
+    gap: 14,
+  };
+
+  const contextLeft: React.CSSProperties = {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 6,
+    minWidth: 170,
+  };
+
+  const bigMetric: React.CSSProperties = {
+    fontSize: 44,
+    fontWeight: 950,
+    letterSpacing: -0.9,
+    lineHeight: 1,
+  };
+
+  const filtersCard: React.CSSProperties = {
+    border: '1px solid rgba(0,0,0,0.10)',
+    borderRadius: 24,
+    background: 'white',
+    padding: 14,
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 12,
+  };
+
+  const row: React.CSSProperties = {
+    display: 'flex',
+    gap: 10,
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    flexWrap: 'wrap',
+  };
+
+  const select: React.CSSProperties = {
+    padding: '10px 12px',
+    borderRadius: 14,
+    border: '1px solid rgba(0,0,0,0.10)',
+    background: 'rgba(0,0,0,0.02)',
+    fontWeight: 900,
+  };
+
+  const primaryBtn: React.CSSProperties = {
+    padding: '10px 14px',
+    borderRadius: 16,
+    border: '1px solid rgba(0,0,0,0.12)',
+    background: 'rgba(0,0,0,0.02)',
+    fontWeight: 950,
+    cursor: 'pointer',
+    whiteSpace: 'nowrap',
+  };
+
+  const list: React.CSSProperties = {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 12,
+  };
+
+  const card: React.CSSProperties = {
+    border: '1px solid rgba(0,0,0,0.10)',
+    borderRadius: 24,
+    background: 'white',
+    padding: 16,
+  };
+
+  const iconBox: React.CSSProperties = {
+    width: 44,
+    height: 44,
+    borderRadius: 14,
+    background: 'rgba(0,0,0,0.04)',
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    fontWeight: 950,
+    fontSize: 13,
+    flexShrink: 0,
+  };
+
+  const openBtn: React.CSSProperties = {
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: '10px 12px',
+    borderRadius: 16,
+    border: '1px solid rgba(0,0,0,0.12)',
+    background: 'rgba(0,0,0,0.02)',
+    textDecoration: 'none',
+    fontWeight: 950,
+    color: 'inherit',
+    whiteSpace: 'nowrap',
+  };
+
+  const divider: React.CSSProperties = { height: 1, background: 'rgba(0,0,0,0.06)', margin: '12px 0' };
+
+  const ctxReg = regimeLabel(context?.market_regime ?? null);
+  const ctxRegKind = getRegimeKind(ctxReg);
+
+  const confidenceGlobal =
+    context?.confidence_global != null && Number.isFinite(Number(context.confidence_global))
+      ? clampInt(Number(context.confidence_global), 0, 100)
+      : null;
+
+  const stablePct =
+    context?.stable_ratio != null && Number.isFinite(Number(context.stable_ratio))
+      ? clampInt(Math.round(Number(context.stable_ratio) * 100), 0, 100)
+      : null;
+
+  return (
+    <main style={page}>
+      <div style={shell}>
+        {/* Header minimal (clic titre = refresh) */}
+        <div style={headerRow}>
+          <div>
+            <div onClick={() => fetchAll('refresh')} title="Recharger" style={title}>
+              Zilkara
+            </div>
+            <div style={subtle}>
+              {error ? 'Erreur' : 'OK'}
+              {lastUpdated ? ` — ${lastUpdated}` : ''}
+              {isRefreshing ? ' — refresh…' : ''}
             </div>
           </div>
 
-          <div className="h-right">
-            {/* bouton Refresh à droite (photo) */}
-            <button className="btn refresh" onClick={load} disabled={isLoading}>
-              Refresh
-            </button>
-          </div>
-        </header>
-
-        {/* barre tri (photo) */}
-        <div className="toolbar">
-          <select
-            className="select"
-            value={sortKey}
-            onChange={(e) => setSortKey(e.target.value as SortKey)}
-            disabled={isLoading}
-            aria-label="Tri"
-          >
-            <option value="score_desc">Score (desc)</option>
-            <option value="score_asc">Score (asc)</option>
-            <option value="chg_desc">24h (desc)</option>
-            <option value="chg_asc">24h (asc)</option>
-            <option value="price_desc">Prix (desc)</option>
-            <option value="price_asc">Prix (asc)</option>
-          </select>
-
-          <button className="btn apply" onClick={applySort} disabled={isLoading}>
-            Appliquer
+          {/* Bouton discret (optionnel), le titre fait déjà “home/refresh” */}
+          <button onClick={() => fetchAll('refresh')} disabled={isLoading || isRefreshing} style={primaryBtn}>
+            Refresh
           </button>
-
-          {/* lien Binance discret en header (tu voulais l’affiliation sur le header) */}
-          {topAffiliate ? (
-            <a className="link" href={topAffiliate} target="_blank" rel="noreferrer">
-              Binance
-            </a>
-          ) : null}
         </div>
 
-        {/* content */}
-        {error ? <div className="error">{error}</div> : null}
+        {/* Contexte (compact, utile, rapide à lire) */}
+        <section style={contextCard}>
+          <div style={contextLeft}>
+            <div style={{ fontSize: 12, opacity: 0.55, fontWeight: 950, letterSpacing: 1 }}>
+              RFS CONTEXT
+            </div>
+            <div style={{ fontSize: 14, opacity: 0.7, fontWeight: 950 }}>Confiance</div>
+            <div style={bigMetric}>{confidenceGlobal != null ? `${confidenceGlobal}%` : '—'}</div>
+            <div style={{ fontSize: 14, opacity: 0.7, fontWeight: 950 }}>
+              {stablePct != null ? `Stable ${stablePct}%` : ' '}
+            </div>
+          </div>
 
-        {/* grille cards façon photo */}
-        <section className="grid">
-          {isLoading
-            ? Array.from({ length: 9 }).map((_, i) => <SkeletonCard key={`sk-${i}`} />)
-            : displayAssets.length === 0
-              ? Array.from({ length: 9 }).map((_, i) => <EmptyCard key={`em-${i}`} />)
-              : displayAssets.map((a, idx) => {
-                  const symbol = (a.symbol ?? '—').toUpperCase();
-                  const name = a.name ?? symbol;
-                  const url = a.affiliate_url ?? a.binance_url ?? null;
-                  const chg = a.chg_24h_pct ?? null;
-                  const score = a.confidence_score ?? null;
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 10 }}>
+            <div style={pillStyle()}>
+              <span style={dotStyle(ctxRegKind)} aria-hidden="true" />
+              {ctxReg !== '—' ? ctxReg : 'RÉGIME'}
+            </div>
 
-                  return (
-                    <article className="card" key={`${symbol}-${idx}`}>
-                      <div className="dot" aria-hidden="true" />
-
-                      {/* zone “contenu” volontairement discrète pour rester proche de la photo */}
-                      <div className="card-top">
-                        <div className="badge">{symbol}</div>
-                        <div className="sub">{name}</div>
-                      </div>
-
-                      <div className="stats">
-                        <div className="stat">
-                          <div className="k">Prix</div>
-                          <div className="v mono">{formatPrice(a.price ?? null)}</div>
-                        </div>
-                        <div className="stat">
-                          <div className="k">24h</div>
-                          <div className={`v mono ${chg != null && chg < 0 ? 'neg' : chg != null && chg > 0 ? 'pos' : ''}`}>
-                            {formatPct(chg)}
-                          </div>
-                        </div>
-                        <div className="stat">
-                          <div className="k">Score</div>
-                          <div className="v mono strong">{formatScore(score)}</div>
-                        </div>
-                      </div>
-
-                      <div className="card-actions">
-                        <a
-                          className={`btn binance ${url ? '' : 'disabled'}`}
-                          href={url ?? undefined}
-                          target={url ? '_blank' : undefined}
-                          rel={url ? 'noreferrer' : undefined}
-                          aria-disabled={!url}
-                          onClick={(e) => {
-                            if (!url) e.preventDefault();
-                          }}
-                        >
-                          Ouvrir Binance
-                        </a>
-                      </div>
-                    </article>
-                  );
-                })}
+            <div style={{ fontSize: 13, opacity: 0.62, maxWidth: 260, textAlign: 'right', lineHeight: 1.3 }}>
+              Filtrer vite. Comprendre vite.
+            </div>
+          </div>
         </section>
+
+        {/* Filtres (simples, efficaces) — pas de “Top Signals” */}
+        <section style={filtersCard}>
+          <div style={row}>
+            <label style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+              <span style={{ fontSize: 13, opacity: 0.7, fontWeight: 950 }}>Tri</span>
+              <select value={sort} onChange={(e) => setSort(e.target.value)} style={select}>
+                <option value="confidence_score_desc">Score (desc)</option>
+                <option value="confidence_score_asc">Score (asc)</option>
+                <option value="market_cap_desc">Market cap (desc)</option>
+                <option value="volume_desc">Volume (desc)</option>
+                <option value="chg_24h_abs_asc">Volatilité 24h (faible)</option>
+                <option value="chg_24h_abs_desc">Volatilité 24h (forte)</option>
+              </select>
+            </label>
+
+            <button onClick={() => fetchAll('refresh')} disabled={isLoading || isRefreshing} style={primaryBtn}>
+              Appliquer
+            </button>
+          </div>
+
+          <div style={row}>
+            <label style={{ display: 'inline-flex', gap: 10, alignItems: 'center' }}>
+              <input type="checkbox" checked={discipline} onChange={(e) => setDiscipline(e.target.checked)} />
+              <span style={{ fontSize: 13, opacity: 0.8, fontWeight: 950 }}>Mode Discipline</span>
+            </label>
+
+            <Segmented
+              value={regimeFilter}
+              onChange={(v) => setRegimeFilter(v as any)}
+              options={[
+                { value: 'ALL', label: 'Tous' },
+                { value: 'STABLE', label: 'Stable' },
+                { value: 'TRANSITION', label: 'Transition' },
+                { value: 'VOLATILE', label: 'Volatile' },
+              ]}
+            />
+          </div>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, alignItems: 'baseline' }}>
+              <div style={{ fontSize: 13, opacity: 0.7, fontWeight: 950 }}>Score minimum</div>
+              <div style={{ fontSize: 13, fontWeight: 950 }}>{clampInt(minScore, 0, 100)}</div>
+            </div>
+            <input
+              type="range"
+              min={0}
+              max={100}
+              value={clampInt(minScore, 0, 100)}
+              onChange={(e) => setMinScore(Number(e.target.value))}
+              aria-label="Score minimum"
+            />
+          </div>
+        </section>
+
+        {/* États */}
+        {isLoading ? (
+          <div style={list}>
+            {Array.from({ length: 6 }).map((_, i) => (
+              <SkeletonCard key={i} />
+            ))}
+          </div>
+        ) : error ? (
+          <div style={{ padding: 16, border: '1px solid rgba(255,0,0,0.25)', borderRadius: 20 }}>
+            <div style={{ fontWeight: 950, marginBottom: 6 }}>Erreur</div>
+            <div style={{ whiteSpace: 'pre-wrap' }}>{error}</div>
+          </div>
+        ) : filteredAssets.length === 0 ? (
+          <div style={{ padding: 16, border: '1px solid rgba(0,0,0,0.10)', borderRadius: 20 }}>
+            Aucun résultat avec ces filtres.
+          </div>
+        ) : (
+          <div style={list}>
+            {filteredAssets.map((a, idx) => {
+              const symbol = safeString(a.symbol) ?? '—';
+              const name = safeString(a.name) ?? symbol;
+
+              const score = safeNumber(a.confidence_score);
+              const chg = safeNumber(a.chg_24h_pct);
+              const price = safeNumber(a.price);
+
+              const reg = regimeLabel(a.regime ?? null);
+              const regKind = getRegimeKind(reg);
+
+              const url = pickTradeUrl(a);
+
+              return (
+                <div key={`${safeString(a.id) ?? symbol}-${idx}`} style={card}>
+                  {/* Top row */}
+                  <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
+                    <div style={{ display: 'flex', gap: 12, alignItems: 'center', minWidth: 0 }}>
+                      <div style={iconBox} title={symbol}>
+                        {symbol.slice(0, 2)}
+                      </div>
+
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }}>
+                        <div style={{ fontWeight: 950, fontSize: 18, lineHeight: 1.1 }}>{symbol}</div>
+                        <div
+                          style={{
+                            opacity: 0.7,
+                            fontSize: 13,
+                            lineHeight: 1.2,
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            whiteSpace: 'nowrap',
+                          }}
+                          title={name}
+                        >
+                          {name}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div style={{ fontWeight: 950, fontSize: 36, letterSpacing: -0.7 }}>
+                      {formatScore(score)}
+                    </div>
+                  </div>
+
+                  <div style={divider} />
+
+                  {/* Middle row */}
+                  <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      <div style={{ fontSize: 12, opacity: 0.6, fontWeight: 950 }}>24h</div>
+                      <div style={{ fontWeight: 950, fontVariantNumeric: 'tabular-nums' }}>{formatPct(chg)}</div>
+                    </div>
+
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4, textAlign: 'right' }}>
+                      <div style={{ fontSize: 12, opacity: 0.6, fontWeight: 950 }}>Prix</div>
+                      <div style={{ fontWeight: 950, fontVariantNumeric: 'tabular-nums' }}>{formatPrice(price)}</div>
+                    </div>
+                  </div>
+
+                  <div style={{ marginTop: 12, display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
+                    <div style={pillStyle()}>
+                      <span style={dotStyle(regKind)} aria-hidden="true" />
+                      {reg}
+                    </div>
+
+                    {url ? (
+                      <a href={url} target="_blank" rel="noreferrer" style={openBtn}>
+                        Ouvrir Binance
+                      </a>
+                    ) : (
+                      <span style={{ opacity: 0.6, fontWeight: 950 }}>—</span>
+                    )}
+                  </div>
+
+                  {/* Reason (optionnel, ultra-court, utile) */}
+                  {safeString(a.confidence_reason) ? (
+                    <div style={{ marginTop: 10, fontSize: 12, opacity: 0.62, lineHeight: 1.35 }}>
+                      {safeString(a.confidence_reason)}
+                    </div>
+                  ) : null}
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
-
-      <style jsx global>{`
-        :root {
-          color-scheme: dark;
-        }
-
-        html,
-        body {
-          height: 100%;
-        }
-
-        body {
-          margin: 0;
-          background: radial-gradient(1200px 700px at 40% -20%, rgba(255, 255, 255, 0.06), transparent 55%),
-            radial-gradient(900px 500px at 90% 10%, rgba(255, 255, 255, 0.04), transparent 60%),
-            #080a0f;
-          color: rgba(255, 255, 255, 0.92);
-          font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, 'Apple Color Emoji',
-            'Segoe UI Emoji';
-        }
-
-        * {
-          box-sizing: border-box;
-        }
-      `}</style>
-
-      <style jsx>{`
-        .wrap {
-          padding: 18px 14px 32px;
-        }
-
-        .container {
-          max-width: 1120px;
-          margin: 0 auto;
-        }
-
-        .header {
-          display: flex;
-          align-items: flex-start;
-          justify-content: space-between;
-          gap: 14px;
-          padding: 8px 2px 10px;
-        }
-
-        .title {
-          font-size: 34px;
-          font-weight: 900;
-          letter-spacing: -0.6px;
-          line-height: 1.05;
-          margin-top: 2px;
-        }
-
-        .updated {
-          margin-top: 6px;
-          font-size: 12px;
-          opacity: 0.75;
-        }
-
-        .meta {
-          margin-top: 10px;
-          display: flex;
-          align-items: center;
-          flex-wrap: wrap;
-          gap: 10px;
-          font-size: 14px;
-        }
-
-        .meta-item {
-          display: inline-flex;
-          gap: 6px;
-          align-items: center;
-        }
-
-        .meta-label {
-          opacity: 0.75;
-        }
-
-        .meta-value {
-          font-weight: 800;
-          letter-spacing: 0.1px;
-        }
-
-        .meta-sep {
-          width: 1px;
-          height: 14px;
-          background: rgba(255, 255, 255, 0.12);
-          display: inline-block;
-        }
-
-        .tagline {
-          opacity: 0.75;
-          letter-spacing: 0.2px;
-        }
-
-        .h-right {
-          display: flex;
-          align-items: center;
-          gap: 10px;
-          padding-top: 6px;
-        }
-
-        .toolbar {
-          display: flex;
-          align-items: center;
-          gap: 10px;
-          margin-top: 8px;
-          margin-bottom: 14px;
-        }
-
-        .select {
-          height: 34px;
-          padding: 0 10px;
-          border-radius: 12px;
-          border: 1px solid rgba(255, 255, 255, 0.12);
-          background: rgba(255, 255, 255, 0.06);
-          color: rgba(255, 255, 255, 0.92);
-          outline: none;
-        }
-
-        .btn {
-          height: 34px;
-          padding: 0 12px;
-          border-radius: 12px;
-          border: 1px solid rgba(255, 255, 255, 0.14);
-          background: rgba(255, 255, 255, 0.08);
-          color: rgba(255, 255, 255, 0.92);
-          font-weight: 800;
-          cursor: pointer;
-          user-select: none;
-        }
-
-        .btn:disabled {
-          opacity: 0.55;
-          cursor: default;
-        }
-
-        .refresh {
-          border-radius: 16px;
-          padding: 0 14px;
-        }
-
-        .apply {
-          padding: 0 14px;
-        }
-
-        .link {
-          margin-left: auto;
-          font-size: 13px;
-          text-decoration: none;
-          opacity: 0.8;
-          border-bottom: 1px solid rgba(255, 255, 255, 0.2);
-          padding-bottom: 2px;
-        }
-
-        .link:hover {
-          opacity: 1;
-        }
-
-        .error {
-          margin: 10px 0 14px;
-          padding: 12px 14px;
-          border-radius: 14px;
-          background: rgba(255, 0, 0, 0.08);
-          border: 1px solid rgba(255, 0, 0, 0.18);
-          color: rgba(255, 210, 210, 0.98);
-          font-weight: 700;
-        }
-
-        .grid {
-          display: grid;
-          grid-template-columns: 1fr;
-          gap: 14px;
-        }
-
-        @media (min-width: 720px) {
-          .grid {
-            grid-template-columns: repeat(2, 1fr);
-          }
-        }
-
-        @media (min-width: 1040px) {
-          .grid {
-            grid-template-columns: repeat(3, 1fr);
-          }
-        }
-
-        .card {
-          position: relative;
-          border-radius: 18px;
-          border: 1px solid rgba(255, 255, 255, 0.10);
-          background: rgba(255, 255, 255, 0.06);
-          box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
-          padding: 16px;
-          min-height: 150px;
-          overflow: hidden;
-        }
-
-        .dot {
-          position: absolute;
-          left: 12px;
-          top: 50%;
-          transform: translateY(-50%);
-          width: 10px;
-          height: 10px;
-          border-radius: 999px;
-          background: rgba(255, 255, 255, 0.22);
-        }
-
-        .card-top {
-          padding-left: 18px; /* pour laisser respirer le point à gauche */
-          display: flex;
-          flex-direction: column;
-          gap: 6px;
-        }
-
-        .badge {
-          width: fit-content;
-          padding: 6px 10px;
-          border-radius: 999px;
-          border: 1px solid rgba(255, 255, 255, 0.12);
-          background: rgba(0, 0, 0, 0.18);
-          font-weight: 900;
-          letter-spacing: 0.4px;
-          font-size: 12px;
-        }
-
-        .sub {
-          opacity: 0.7;
-          font-size: 12px;
-          line-height: 1.2;
-          max-width: 95%;
-          white-space: nowrap;
-          overflow: hidden;
-          text-overflow: ellipsis;
-        }
-
-        .stats {
-          margin-top: 12px;
-          padding-left: 18px;
-          display: grid;
-          grid-template-columns: repeat(3, 1fr);
-          gap: 10px;
-        }
-
-        .stat .k {
-          font-size: 11px;
-          opacity: 0.65;
-          margin-bottom: 4px;
-        }
-
-        .stat .v {
-          font-size: 13px;
-          opacity: 0.92;
-        }
-
-        .mono {
-          font-variant-numeric: tabular-nums;
-        }
-
-        .strong {
-          font-weight: 900;
-        }
-
-        .pos {
-          opacity: 1;
-        }
-
-        .neg {
-          opacity: 1;
-        }
-
-        .card-actions {
-          margin-top: 14px;
-          padding-left: 18px;
-          display: flex;
-          justify-content: flex-start;
-        }
-
-        .binance {
-          display: inline-flex;
-          align-items: center;
-          justify-content: center;
-          text-decoration: none;
-          height: 36px;
-          padding: 0 14px;
-          border-radius: 14px;
-          border: 1px solid rgba(255, 255, 255, 0.12);
-          background: rgba(255, 255, 255, 0.08);
-          font-weight: 900;
-          color: rgba(255, 255, 255, 0.9);
-        }
-
-        .binance:hover {
-          background: rgba(255, 255, 255, 0.10);
-        }
-
-        .binance.disabled {
-          opacity: 0.55;
-          cursor: default;
-          pointer-events: none;
-        }
-
-        /* Skeleton / empty look très proche de la photo */
-        .skeleton,
-        .empty {
-          background: rgba(255, 255, 255, 0.07);
-        }
-
-        .skeleton::before {
-          content: '';
-          position: absolute;
-          inset: 0;
-          background: linear-gradient(
-            90deg,
-            rgba(255, 255, 255, 0) 0%,
-            rgba(255, 255, 255, 0.06) 35%,
-            rgba(255, 255, 255, 0) 70%
-          );
-          transform: translateX(-100%);
-          animation: shimmer 1.2s infinite;
-        }
-
-        @keyframes shimmer {
-          100% {
-            transform: translateX(100%);
-          }
-        }
-
-        .ghost-btn {
-          margin-top: 18px;
-          margin-left: 18px;
-          width: 170px;
-          height: 36px;
-          border-radius: 14px;
-          border: 1px solid rgba(255, 255, 255, 0.10);
-          background: rgba(255, 255, 255, 0.06);
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          font-weight: 900;
-          opacity: 0.35;
-        }
-      `}</style>
     </main>
   );
-}
-
-/** Card skeleton (gris, vide, avec bouton fantôme “Ouvrir Binance”) */
-function SkeletonCard() {
-  return (
-    <article className="card skeleton" aria-label="Chargement">
-      <div className="dot" aria-hidden="true" />
-      <div className="ghost-btn">Ouvrir Binance</div>
-    </article>
-  );
-}
-
-/** Card vide quand aucune donnée (même rendu que la photo) */
-function EmptyCard() {
-  return (
-    <article className="card empty" aria-label="Aucun actif">
-      <div className="dot" aria-hidden="true" />
-      <div className="ghost-btn">Ouvrir Binance</div>
-    </article>
-  );
-}
-
-/** Heuristique si l’API ne renvoie pas meta.regime */
-function guessRegime(arr: ScanAsset[]): Regime | null {
-  const regimes = arr.map((a) => (a.regime ? String(a.regime).toUpperCase() : null)).filter(Boolean) as string[];
-  if (regimes.length === 0) return null;
-  const count = new Map<string, number>();
-  for (const r of regimes) count.set(r, (count.get(r) ?? 0) + 1);
-  const best = [...count.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
-  return best ?? null;
-}
-
-/** Score global (moyenne des scores disponibles) */
-function computeGlobalConfidence(arr: ScanAsset[]): number | null {
-  const nums = arr
-    .map((a) => (typeof a.confidence_score === 'number' && Number.isFinite(a.confidence_score) ? a.confidence_score : null))
-    .filter((x): x is number => x != null);
-  if (nums.length === 0) return null;
-  const avg = nums.reduce((s, x) => s + x, 0) / nums.length;
-  return avg;
 }
