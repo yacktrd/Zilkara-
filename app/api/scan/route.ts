@@ -1,93 +1,177 @@
 // app/api/scan/route.ts
 import { NextResponse } from "next/server";
-import { getStateData } from "../../../lib/state";
+import { kv } from "@vercel/kv";
+
+/**
+ * Zilkara — /api/scan
+ * Objectif:
+ * - Retourner la liste des actifs triés par confidence_score DESC
+ * - Format stable, robuste, compatible anciennes sources
+ * - "name" (nom complet) TOUJOURS présent (fallback intelligent)
+ *
+ * Source de données:
+ * - KV (Upstash/Vercel KV) : clé "rfs:scan" en priorité
+ * - Fallback possible : "rfs:state:24h" (ou autres clés)
+ */
+
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-type RawItem = Record<string, any>;
+type Regime = "STABLE" | "TRANSITION" | "VOLATILE" | "UNKNOWN";
 
 type ScanAsset = {
   symbol: string;
-  name: string;
-  price: number;
-  chg_24h_pct: number;
-  confidence_score: number;
-  regime: string;
-  binance_url: string;
-  affiliate_url: string;
+  name: string; // ✅ obligatoire
+  price?: number;
+  chg_24h_pct?: number;
+  confidence_score?: number;
+  regime: Regime;
+  binance_url?: string;
+  affiliate_url?: string;
 };
 
-function toStr(v: unknown): string {
-  return typeof v === "string" ? v : v == null ? "" : String(v);
+type ScanResponse = {
+  ok: boolean;
+  count: number;
+  items: ScanAsset[];
+  meta: {
+    sorted_by: "confidence_score_desc";
+    generated_at: string;
+    source_key: string;
+    cache: "no-store";
+  };
+  error?: { code: string; message: string };
+};
+
+/** ---------------------------
+ * Utils
+ * -------------------------- */
+
+function nowIso(): string {
+  return new Date().toISOString();
 }
-function toNum(v: unknown, fallback = 0): number {
-  const n = typeof v === "number" ? v : Number(v);
-  return Number.isFinite(n) ? n : fallback;
+
+function cleanStr(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const s = v.trim();
+  return s.length ? s : null;
 }
-function clamp(n: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, n));
-}
-function pickFirstDefined<T>(...vals: T[]): T | undefined {
-  for (const v of vals) if (v !== undefined && v !== null && v !== ("" as any)) return v;
+
+function toNum(v: unknown): number | undefined {
+  if (typeof v === "number") return Number.isFinite(v) ? v : undefined;
+  if (typeof v === "string") {
+    const n = Number(v.replace(",", "."));
+    return Number.isFinite(n) ? n : undefined;
+  }
   return undefined;
 }
 
+function normalizeSymbolFromAny(x: any): string {
+  const raw =
+    cleanStr(x?.symbol) ??
+    cleanStr(x?.asset) ??
+    cleanStr(x?.ticker) ??
+    cleanStr(x?.pair) ??
+    "";
+  // ex: BTCUSDT -> BTCUSDT ; btc -> BTC ; " BTC " -> BTC
+  return raw.toUpperCase();
+}
+
+function baseSymbol(symbol: string): string {
+  // BTCUSDT -> BTC ; ETHUSD -> ETH ; BTC -> BTC
+  return symbol.replace(/(USDT|USD|USDC|BUSD)$/i, "").toUpperCase();
+}
+
 function buildBinanceUrl(symbol: string): string {
-  return `https://www.binance.com/en/trade/${encodeURIComponent(symbol)}?_from=markets`;
+  // Binance spot pair usually ends with USDT for crypto
+  const pair = symbol.toUpperCase().includes("USDT")
+    ? symbol.toUpperCase()
+    : `${baseSymbol(symbol)}USDT`;
+  return `https://www.binance.com/en/trade/${pair}?_from=markets`;
 }
 
-function buildAffiliateUrl(binanceUrl: string, symbol: string): string {
-  const base = process.env.BINANCE_AFFILIATE_BASE?.trim();
-  if (base) {
-    const u = new URL(base);
-    u.searchParams.set("utm_source", "zilkara");
-    u.searchParams.set("utm_medium", "app");
-    u.searchParams.set("utm_campaign", "scan");
-    u.searchParams.set("symbol", symbol);
-    return u.toString();
-  }
-
-  const ref = process.env.BINANCE_REF_CODE?.trim();
-  if (ref) {
-    const u = new URL(binanceUrl);
-    u.searchParams.set("ref", ref);
-    u.searchParams.set("utm_source", "zilkara");
-    u.searchParams.set("utm_medium", "app");
-    u.searchParams.set("utm_campaign", "scan");
-    return u.toString();
-  }
-
-  return binanceUrl;
+function normalizeRegime(v: unknown): Regime {
+  const s = (cleanStr(v) ?? "UNKNOWN").toUpperCase();
+  if (s === "STABLE") return "STABLE";
+  if (s === "TRANSITION") return "TRANSITION";
+  if (s === "VOLATILE") return "VOLATILE";
+  return "UNKNOWN";
 }
 
-function normalize(item: RawItem): ScanAsset | null {
-  const symbol = toStr(pickFirstDefined(item.symbol, item.ticker, item.pair)).trim().toUpperCase();
+/**
+ * Dictionnaire minimal (tu peux l’étendre au fil du temps).
+ * But: fournir un nom complet quand la source ne le donne pas.
+ */
+function prettyNameFromSymbol(symbol: string): string {
+  const map: Record<string, string> = {
+    BTC: "Bitcoin",
+    ETH: "Ethereum",
+    SOL: "Solana",
+    BNB: "BNB",
+    XRP: "XRP",
+    ADA: "Cardano",
+    DOGE: "Dogecoin",
+    DOT: "Polkadot",
+    AVAX: "Avalanche",
+    LINK: "Chainlink",
+    MATIC: "Polygon",
+    TON: "Toncoin",
+    LTC: "Litecoin",
+    BCH: "Bitcoin Cash",
+    UNI: "Uniswap",
+    ATOM: "Cosmos",
+    APT: "Aptos",
+    NEAR: "NEAR Protocol",
+    ARB: "Arbitrum",
+    OP: "Optimism",
+  };
+
+  const b = baseSymbol(symbol);
+  return map[b] ?? b; // fallback lisible > vide
+}
+
+/**
+ * Normalisation robuste:
+ * - supporte plusieurs structures de payload
+ * - force name
+ * - force regime
+ */
+function normalizeItem(x: any): ScanAsset | null {
+  const symbol = normalizeSymbolFromAny(x);
   if (!symbol) return null;
 
-  const name =
-    toStr(pickFirstDefined(item.name, item.asset_name, item.base_name, item.fullname)).trim() || symbol;
+  const rawName =
+    cleanStr(x?.name) ??
+    cleanStr(x?.asset_name) ??
+    cleanStr(x?.full_name) ??
+    cleanStr(x?.display_name);
 
-  const price = toNum(pickFirstDefined(item.price, item.last, item.last_price), 0);
+  const name = rawName ?? prettyNameFromSymbol(symbol);
 
-  const chg_24h_pct = toNum(
-    pickFirstDefined(item.chg_24h_pct, item.change_24h_pct, item.pct_24h, item.priceChangePercent),
-    0
-  );
+  const price =
+    toNum(x?.price) ??
+    toNum(x?.last_price) ??
+    toNum(x?.last) ??
+    toNum(x?.mark_price) ??
+    toNum(x?.markPrice);
 
-  const confidence_score = clamp(
-    toNum(pickFirstDefined(item.confidence_score, item.confidence, item.score_confidence, item.score), 0),
-    0,
-    100
-  );
+  const chg_24h_pct =
+    toNum(x?.chg_24h_pct) ??
+    toNum(x?.change_24h) ??
+    toNum(x?.change24h) ??
+    toNum(x?.priceChangePercent) ??
+    toNum(x?.price_change_percent_24h);
 
-  const regime = toStr(pickFirstDefined(item.regime, item.market_regime, item.context_regime)).trim() || "UNKNOWN";
+  const confidence_score =
+    toNum(x?.confidence_score) ??
+    toNum(x?.confidence) ??
+    toNum(x?.score) ??
+    toNum(x?.confidenceScore);
 
-  const binance_url =
-    toStr(pickFirstDefined(item.binance_url, item.url, item.trade_url)).trim() || buildBinanceUrl(symbol);
+  const regime = normalizeRegime(x?.regime ?? x?.market_regime ?? x?.context_regime);
 
-  const affiliate_url =
-    toStr(pickFirstDefined(item.affiliate_url, item.binance_affiliate_url)).trim() ||
-    buildAffiliateUrl(binance_url, symbol);
+  const binance_url = cleanStr(x?.binance_url) ?? buildBinanceUrl(symbol);
+  const affiliate_url = cleanStr(x?.affiliate_url);
 
   return {
     symbol,
@@ -101,44 +185,118 @@ function normalize(item: RawItem): ScanAsset | null {
   };
 }
 
+function asArray(raw: any): any[] {
+  if (Array.isArray(raw)) return raw;
+  if (raw && Array.isArray(raw.items)) return raw.items;
+  if (raw && Array.isArray(raw.data)) return raw.data;
+  if (raw && Array.isArray(raw.assets)) return raw.assets;
+  return [];
+}
+
+function sortByConfidenceDesc(a: ScanAsset, b: ScanAsset): number {
+  const aa = a.confidence_score ?? -1;
+  const bb = b.confidence_score ?? -1;
+  return bb - aa;
+}
+
+/** ---------------------------
+ * KV read
+ * -------------------------- */
+
+async function kvGetAny(keys: string[]): Promise<{ key: string; value: any } | null> {
+  for (const key of keys) {
+    const value = await kv.get(key);
+    if (value != null) return { key, value };
+  }
+  return null;
+}
+
+/** ---------------------------
+ * Handler
+ * -------------------------- */
+
 export async function GET() {
+  const generated_at = nowIso();
+
+  // Ordre de priorité: scan final > state 24h > legacy keys
+  const candidates = ["rfs:scan", "rfs:state:24h", "scan", "state:24h", "market:scan"];
+
   try {
-    // ✅ Plus aucun fetch HTTP vers /api/state → fini les 401 "Authentication Required"
-    const raw: any = await getStateData();
+    const found = await kvGetAny(candidates);
 
-    const arr: RawItem[] = Array.isArray(raw)
-      ? raw
-      : Array.isArray(raw?.items)
-      ? raw.items
-      : Array.isArray(raw?.assets)
-      ? raw.assets
-      : [];
-
-    const mapped = arr.map(normalize).filter(Boolean) as ScanAsset[];
-
-    mapped.sort((a, b) => {
-      const d = (b.confidence_score || 0) - (a.confidence_score || 0);
-      if (d !== 0) return d;
-      return a.symbol.localeCompare(b.symbol);
-    });
-
-    return NextResponse.json(
-      {
+    if (!found) {
+      const resp: ScanResponse = {
         ok: true,
-        count: mapped.length,
-        items: mapped,
+        count: 0,
+        items: [],
         meta: {
           sorted_by: "confidence_score_desc",
-          generated_at: new Date().toISOString(),
+          generated_at,
+          source_key: "none",
+          cache: "no-store",
         },
+        error: {
+          code: "NO_DATA",
+          message: "Aucune donnée trouvée dans KV (rfs:scan / rfs:state:24h).",
+        },
+      };
+      return NextResponse.json(resp, {
+        status: 200,
+        headers: { "cache-control": "no-store" },
+      });
+    }
+
+    const raw = found.value;
+    const arr = asArray(raw);
+
+    const items = arr
+      .map(normalizeItem)
+      .filter((x): x is ScanAsset => Boolean(x))
+      .sort(sortByConfidenceDesc);
+
+    // ✅ impose name non vide même après normalisation (par sécurité)
+    const hardened = items.map((it) => ({
+      ...it,
+      name: cleanStr(it.name) ?? prettyNameFromSymbol(it.symbol),
+      regime: normalizeRegime(it.regime),
+    }));
+
+    const resp: ScanResponse = {
+      ok: true,
+      count: hardened.length,
+      items: hardened,
+      meta: {
+        sorted_by: "confidence_score_desc",
+        generated_at,
+        source_key: found.key,
+        cache: "no-store",
       },
-      { status: 200, headers: { "cache-control": "no-store" } }
-    );
+    };
+
+    return NextResponse.json(resp, {
+      status: 200,
+      headers: { "cache-control": "no-store" },
+    });
   } catch (err: any) {
-    // ✅ Message différent pour confirmer qu’on n’est plus sur l’ancienne version
-    return NextResponse.json(
-      { ok: false, error: "SCAN_FAILED", detail: `STATE_LIB_FAILED: ${err?.message ?? "unknown"}` },
-      { status: 500, headers: { "cache-control": "no-store" } }
-    );
+    const resp: ScanResponse = {
+      ok: false,
+      count: 0,
+      items: [],
+      meta: {
+        sorted_by: "confidence_score_desc",
+        generated_at,
+        source_key: "error",
+        cache: "no-store",
+      },
+      error: {
+        code: "SCAN_FAILED",
+        message: err?.message ? String(err.message) : "Erreur inconnue",
+      },
+    };
+
+    return NextResponse.json(resp, {
+      status: 500,
+      headers: { "cache-control": "no-store" },
+    });
   }
 }
