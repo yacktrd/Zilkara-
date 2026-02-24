@@ -22,10 +22,6 @@ type ScanAsset = {
   // liens fournis par l’API (NE PAS reconstruire)
   binance_url?: string | null;
   affiliate_url?: string | null;
-
-  // optionnels
-  market_cap?: number | null;
-  volume_24h?: number | null;
 };
 
 type ScanResponse = {
@@ -45,7 +41,7 @@ type ContextResponse = {
   ok: boolean;
   ts?: string;
   market_regime?: string | null;
-  confidence_global?: number | null;
+  confidence_global?: number | null; // 0-100
   stable_ratio?: number | null;
   transition_ratio?: number | null;
   volatile_ratio?: number | null;
@@ -56,12 +52,10 @@ type ContextResponse = {
 function clampInt(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, Math.trunc(n)));
 }
-
 function safeNumber(v: unknown): number | null {
   if (typeof v === 'number' && Number.isFinite(v)) return v;
   return null;
 }
-
 function safeString(v: unknown): string | null {
   if (typeof v === 'string') {
     const s = v.trim();
@@ -85,8 +79,12 @@ function formatPct(v: number | null): string {
 
 function formatScore(v: number | null): string {
   if (v === null) return '—';
-  const n = clampInt(v, 0, 100);
-  return String(n);
+  return String(clampInt(v, 0, 100));
+}
+
+function normalizeRegimeLabel(regime: Regime | null): string {
+  if (!regime) return '—';
+  return String(regime).toUpperCase();
 }
 
 function pickTradeUrl(a: ScanAsset): string | null {
@@ -94,116 +92,133 @@ function pickTradeUrl(a: ScanAsset): string | null {
   return safeString(a.affiliate_url) ?? safeString(a.binance_url) ?? null;
 }
 
-function initialsFromSymbol(symbol: string) {
-  const s = symbol.trim().toUpperCase();
-  if (!s) return '—';
-  return s.slice(0, 2);
+function regimeDotStyle(regime: Regime | null): React.CSSProperties {
+  const r = String(regime ?? '').toUpperCase();
+  // style neutre (tu peux mettre des couleurs exactes ensuite en CSS global)
+  if (r === 'STABLE') return { background: 'rgba(34, 197, 94, 0.95)' }; // vert
+  if (r === 'TRANSITION') return { background: 'rgba(245, 158, 11, 0.95)' }; // ambre
+  if (r === 'VOLATILE') return { background: 'rgba(239, 68, 68, 0.95)' }; // rouge
+  return { background: 'rgba(0,0,0,0.35)' };
 }
 
-function regimeText(r: Regime | null): string {
-  if (!r) return '—';
-  return String(r).toUpperCase();
+function shortTs(tsIso: string | null): string | null {
+  if (!tsIso) return null;
+  // on garde ISO brut (fiable) mais compact en affichage
+  // ex: 2026-02-24T11:17:36.082Z -> 2026-02-24 11:17
+  const m = tsIso.match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/);
+  return m ? `${m[1]} ${m[2]}` : tsIso;
 }
 
-function regimeClass(r: Regime | null): string {
-  const t = regimeText(r);
-  if (t === 'STABLE') return 'tag stable';
-  if (t === 'TRANSITION') return 'tag transition';
-  if (t === 'VOLATILE') return 'tag volatile';
-  return 'tag';
-}
-
-function dotClass(r: Regime | null): string {
-  const t = regimeText(r);
-  if (t === 'STABLE') return 'dot stable';
-  if (t === 'TRANSITION') return 'dot transition';
-  if (t === 'VOLATILE') return 'dot volatile';
-  return 'dot';
-}
-
-function AssetMini({ a }: { a: ScanAsset }) {
-  const symbol = safeString(a.symbol) ?? '—';
-  const name = safeString(a.name) ?? symbol;
-
+function AssetIcon({ symbol }: { symbol: string }) {
   return (
-    <div className="assetMini">
-      <div className="avatar" aria-hidden="true" title={symbol}>
-        {initialsFromSymbol(symbol)}
-      </div>
-      <div className="assetMiniText">
-        <div className="assetMiniSymbol">{symbol}</div>
-        <div className="assetMiniName">{name}</div>
-      </div>
+    <div
+      aria-hidden="true"
+      style={{
+        width: 44,
+        height: 44,
+        borderRadius: 14,
+        background: 'rgba(0,0,0,0.06)',
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        fontSize: 14,
+        fontWeight: 800,
+        letterSpacing: 0.2,
+        flex: '0 0 auto',
+      }}
+      title={symbol}
+    >
+      {symbol.slice(0, 2)}
     </div>
   );
 }
 
-function ContextCard({ ctx, total }: { ctx: ContextResponse | null; total: number }) {
-  const conf = ctx?.confidence_global != null ? clampInt(ctx.confidence_global, 0, 100) : null;
-  const regime = safeString(ctx?.market_regime) ?? null;
+function AssetCard({ asset }: { asset: ScanAsset }) {
+  const symbol = (safeString(asset.symbol) ?? '—').toUpperCase();
+  const name = safeString(asset.name) ?? symbol;
 
-  // optionnel: stable X / Y (si ratios fournis)
-  const stableRatio = safeNumber(ctx?.stable_ratio);
-  const stableCount = stableRatio != null ? Math.round(stableRatio * total) : null;
+  const price = safeNumber(asset.price);
+  const chg = safeNumber(asset.chg_24h_pct);
+  const score = safeNumber(asset.confidence_score);
+  const regime = asset.regime ?? null;
 
-  return (
-    <section className="contextCard">
-      <div className="contextTitle">RFS CONTEXT</div>
-      <div className="contextMain">
-        <div className="contextLeft">
-          <div className="contextKpi">
-            <div className="kpiLabel">Confidence</div>
-            <div className="kpiValue">{conf != null ? `${conf}%` : '—'}</div>
-          </div>
-          <div className="contextSub">
-            {stableCount != null ? `Stable ${stableCount} / ${total}` : `${total} actifs`}
-          </div>
-        </div>
-
-        <div className="contextRight">
-          <div className="contextRegime">
-            <span className={dotClass(regime)} aria-hidden="true" />
-            <span>{regime ?? '—'}</span>
-          </div>
-          <div className="contextHint">Trier. Lire. Décider.</div>
-        </div>
-      </div>
-    </section>
-  );
-}
-
-function TopSignalCard({ a }: { a: ScanAsset }) {
-  const price = safeNumber(a.price);
-  const chg = safeNumber(a.chg_24h_pct);
-  const score = safeNumber(a.confidence_score);
-  const regime = a.regime ?? null;
-  const url = pickTradeUrl(a);
+  const url = pickTradeUrl(asset);
 
   return (
-    <div className="signalCard">
-      <div className="signalTop">
-        <AssetMini a={a} />
-        <div className="signalScore">{formatScore(score)}</div>
+    <div
+      style={{
+        borderRadius: 18,
+        border: '1px solid rgba(0,0,0,0.08)',
+        background: 'rgba(0,0,0,0.02)',
+        padding: 14,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 12,
+      }}
+    >
+      {/* Top row: identité + score */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, minWidth: 0 }}>
+          <AssetIcon symbol={symbol} />
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontSize: 22, fontWeight: 900, lineHeight: 1.05 }}>{symbol}</div>
+            <div style={{ opacity: 0.72, fontSize: 13, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+              {name}
+            </div>
+          </div>
+        </div>
+
+        <div style={{ textAlign: 'right', flex: '0 0 auto' }}>
+          <div style={{ fontSize: 34, fontWeight: 950, letterSpacing: -0.8, lineHeight: 1 }}>
+            {formatScore(score)}
+          </div>
+          <div style={{ opacity: 0.6, fontSize: 12 }}>Score</div>
+        </div>
       </div>
 
-      <div className="signalBottom">
-        <div className="signalMeta">
-          <span className={dotClass(regime)} aria-hidden="true" />
-          <span className="signalRegime">{regimeText(regime)}</span>
+      {/* Mid row: régime + variations + prix */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+        <div style={{ display: 'inline-flex', alignItems: 'center', gap: 10 }}>
+          <span style={{ width: 10, height: 10, borderRadius: 999, ...regimeDotStyle(regime) }} />
+          <span style={{ fontWeight: 900, letterSpacing: 0.4 }}>{normalizeRegimeLabel(regime)}</span>
         </div>
-        <div className="signalNums">
-          <span className="signalPct">{formatPct(chg)}</span>
-          <span className="signalPrice">{formatPrice(price)}</span>
+
+        <div style={{ display: 'inline-flex', alignItems: 'baseline', gap: 14, fontVariantNumeric: 'tabular-nums' }}>
+          <span style={{ fontWeight: 900 }}>{formatPct(chg)}</span>
+          <span style={{ opacity: 0.7, fontWeight: 800 }}>{formatPrice(price)}</span>
         </div>
       </div>
 
-      <div className="signalAction">
+      {/* Action */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
+        <div style={{ opacity: 0.65, fontSize: 12, lineHeight: 1.2 }}>
+          {safeString(asset.confidence_reason) ?? '—'}
+        </div>
+
         {url ? (
-          <a className="btn" href={url} target="_blank" rel="noreferrer">
+          <a
+            href={url}
+            target="_blank"
+            rel="noreferrer"
+            style={{
+              flex: '0 0 auto',
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              padding: '10px 12px',
+              borderRadius: 14,
+              border: '1px solid rgba(0,0,0,0.10)',
+              background: 'white',
+              textDecoration: 'none',
+              fontWeight: 900,
+              color: 'inherit',
+              whiteSpace: 'nowrap',
+            }}
+          >
             Ouvrir Binance
           </a>
         ) : (
-          <span className="muted">—</span>
+          <span style={{ opacity: 0.55 }}>—</span>
         )}
       </div>
     </div>
@@ -211,7 +226,7 @@ function TopSignalCard({ a }: { a: ScanAsset }) {
 }
 
 export default function Page() {
-  // ✅ State UI minimal (lecture)
+  // ✅ State UI minimal
   const [limit, setLimit] = useState<number>(50);
   const [sort, setSort] = useState<string>('confidence_score_desc');
   const [discipline, setDiscipline] = useState<boolean>(false);
@@ -223,7 +238,7 @@ export default function Page() {
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
 
-  const lastUpdated = useMemo(() => safeString(context?.ts) ?? null, [context]);
+  const lastUpdated = useMemo(() => shortTs(safeString(context?.ts) ?? null), [context]);
 
   const buildScanUrl = useCallback(() => {
     const l = clampInt(limit, 1, 250);
@@ -250,11 +265,11 @@ export default function Page() {
 
         if (!scanRes.ok) {
           const txt = await scanRes.text().catch(() => '');
-          throw new Error(`Scan HTTP ${scanRes.status} ${scanRes.statusText}${txt ? ` — ${txt}` : ''}`);
+          throw new Error(`Scan HTTP ${scanRes.status}${txt ? ` — ${txt}` : ''}`);
         }
         if (!ctxRes.ok) {
           const txt = await ctxRes.text().catch(() => '');
-          throw new Error(`Context HTTP ${ctxRes.status} ${ctxRes.statusText}${txt ? ` — ${txt}` : ''}`);
+          throw new Error(`Context HTTP ${ctxRes.status}${txt ? ` — ${txt}` : ''}`);
         }
 
         const scanJson = (await scanRes.json()) as ScanResponse;
@@ -263,8 +278,7 @@ export default function Page() {
         if (!scanJson?.ok) throw new Error(scanJson?.error || scanJson?.message || 'Scan: réponse invalide.');
         if (!ctxJson?.ok) throw new Error(ctxJson?.error || ctxJson?.message || 'Context: réponse invalide.');
 
-        const data = Array.isArray(scanJson.data) ? scanJson.data : [];
-        setAssets(data);
+        setAssets(Array.isArray(scanJson.data) ? scanJson.data : []);
         setContext(ctxJson);
       } catch (e: any) {
         setError(e?.message ? String(e.message) : 'Erreur inconnue.');
@@ -282,587 +296,182 @@ export default function Page() {
     fetchAll('initial');
   }, [fetchAll]);
 
-  const topSignals = useMemo(() => assets.slice(0, 5), [assets]);
+  const confidenceGlobal = useMemo(() => {
+    const n = safeNumber(context?.confidence_global);
+    return n == null ? null : clampInt(n, 0, 100);
+  }, [context]);
 
+  const marketRegime = useMemo(() => safeString(context?.market_regime) ?? '—', [context]);
+
+  // ✅ UI = même expérience mobile sur PC (colonne unique, cartes)
   return (
-    <main className="wrap">
-      <style jsx global>{`
-        :root {
-          --bg: #ffffff;
-          --text: rgba(0,0,0,0.92);
-          --muted: rgba(0,0,0,0.56);
-          --line: rgba(0,0,0,0.08);
-          --card: rgba(0,0,0,0.03);
-          --card2: rgba(0,0,0,0.02);
-          --shadow: 0 8px 30px rgba(0,0,0,0.06);
-          --radius: 18px;
-          --radius2: 14px;
-        }
-        body {
-          background: var(--bg);
-          color: var(--text);
-        }
-        .wrap {
-          padding: 16px;
-          max-width: 1040px;
-          margin: 0 auto;
-        }
-
-        /* Header */
-        .headerRow {
-          display: flex;
-          align-items: flex-start;
-          justify-content: space-between;
-          gap: 12px;
-          margin-bottom: 14px;
-        }
-        .title {
-          font-size: 30px;
-          font-weight: 900;
-          letter-spacing: -0.5px;
-          line-height: 1.05;
-        }
-        .subtitle {
-          margin-top: 6px;
-          font-size: 13px;
-          color: var(--muted);
-        }
-        .btn {
-          display: inline-flex;
-          align-items: center;
-          justify-content: center;
-          padding: 10px 12px;
-          border-radius: 14px;
-          border: 1px solid var(--line);
-          background: #fff;
-          font-weight: 800;
-          text-decoration: none;
-          color: inherit;
-          white-space: nowrap;
-        }
-        .btn:disabled {
-          opacity: 0.55;
-        }
-
-        /* Controls */
-        .controls {
-          display: flex;
-          flex-wrap: wrap;
-          gap: 10px;
-          align-items: center;
-          margin: 12px 0 14px;
-        }
-        .control {
-          display: inline-flex;
-          gap: 8px;
-          align-items: center;
-        }
-        .controlLabel {
-          font-size: 13px;
-          color: var(--muted);
-        }
-        select {
-          padding: 10px 12px;
-          border-radius: 14px;
-          border: 1px solid var(--line);
-          background: #fff;
-          font-weight: 700;
-        }
-        .toggle {
-          display: inline-flex;
-          gap: 8px;
-          align-items: center;
-          padding: 10px 12px;
-          border-radius: 14px;
-          border: 1px solid var(--line);
-          background: #fff;
-          font-weight: 800;
-        }
-        .toggle input {
-          transform: translateY(1px);
-        }
-
-        /* Context card */
-        .contextCard {
-          border: 1px solid var(--line);
-          border-radius: var(--radius);
-          background: linear-gradient(180deg, var(--card), var(--card2));
-          padding: 14px;
-          box-shadow: var(--shadow);
-        }
-        .contextTitle {
-          font-size: 12px;
-          letter-spacing: 0.12em;
-          font-weight: 900;
-          color: var(--muted);
-          margin-bottom: 10px;
-        }
-        .contextMain {
-          display: flex;
-          justify-content: space-between;
-          gap: 12px;
-          align-items: center;
-        }
-        .kpiLabel {
-          font-size: 13px;
-          color: var(--muted);
-          font-weight: 800;
-        }
-        .kpiValue {
-          font-size: 22px;
-          font-weight: 950;
-          letter-spacing: -0.3px;
-          margin-top: 2px;
-        }
-        .contextSub {
-          margin-top: 6px;
-          font-size: 13px;
-          color: var(--muted);
-          font-weight: 700;
-        }
-        .contextRegime {
-          display: inline-flex;
-          align-items: center;
-          gap: 8px;
-          font-weight: 900;
-          padding: 10px 12px;
-          border-radius: 999px;
-          border: 1px solid var(--line);
-          background: #fff;
-        }
-        .contextHint {
-          margin-top: 8px;
-          text-align: right;
-          font-size: 13px;
-          color: var(--muted);
-          font-weight: 700;
-        }
-
-        /* Dots & tags */
-        .dot {
-          width: 10px;
-          height: 10px;
-          border-radius: 999px;
-          background: rgba(0,0,0,0.25);
-          display: inline-block;
-        }
-        .dot.stable {
-          background: rgba(0, 160, 90, 0.9);
-        }
-        .dot.transition {
-          background: rgba(245, 158, 11, 0.95);
-        }
-        .dot.volatile {
-          background: rgba(239, 68, 68, 0.92);
-        }
-        .tag {
-          display: inline-flex;
-          align-items: center;
-          gap: 8px;
-          padding: 8px 10px;
-          border-radius: 999px;
-          border: 1px solid var(--line);
-          background: #fff;
-          font-weight: 900;
-          font-size: 12px;
-        }
-
-        /* Top signals */
-        .sectionTitle {
-          margin: 16px 0 10px;
-          font-size: 16px;
-          font-weight: 950;
-          letter-spacing: -0.2px;
-        }
-        .signalsGrid {
-          display: grid;
-          grid-template-columns: 1fr;
-          gap: 10px;
-        }
-        .signalCard {
-          border: 1px solid var(--line);
-          border-radius: var(--radius);
-          background: #fff;
-          padding: 14px;
-          box-shadow: var(--shadow);
-        }
-        .signalTop {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          gap: 12px;
-        }
-        .signalScore {
-          font-size: 26px;
-          font-weight: 950;
-          letter-spacing: -0.4px;
-        }
-        .signalBottom {
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-          gap: 12px;
-          margin-top: 10px;
-        }
-        .signalMeta {
-          display: inline-flex;
-          gap: 8px;
-          align-items: center;
-          font-weight: 900;
-          color: rgba(0,0,0,0.78);
-        }
-        .signalNums {
-          display: inline-flex;
-          gap: 10px;
-          align-items: baseline;
-          font-weight: 900;
-        }
-        .signalPct {
-          color: rgba(0,0,0,0.75);
-          font-size: 13px;
-        }
-        .signalPrice {
-          font-size: 14px;
-        }
-        .signalAction {
-          margin-top: 12px;
-        }
-
-        /* Asset mini */
-        .assetMini {
-          display: flex;
-          gap: 12px;
-          align-items: center;
-          min-width: 0;
-        }
-        .avatar {
-          width: 36px;
-          height: 36px;
-          border-radius: 14px;
-          background: rgba(0,0,0,0.06);
-          display: inline-flex;
-          align-items: center;
-          justify-content: center;
-          font-weight: 950;
-          font-size: 12px;
-        }
-        .assetMiniText {
-          display: flex;
-          flex-direction: column;
-          line-height: 1.08;
-          min-width: 0;
-        }
-        .assetMiniSymbol {
-          font-weight: 950;
-          letter-spacing: -0.2px;
-          white-space: nowrap;
-          overflow: hidden;
-          text-overflow: ellipsis;
-        }
-        .assetMiniName {
-          margin-top: 3px;
-          font-size: 12px;
-          color: var(--muted);
-          font-weight: 700;
-          white-space: nowrap;
-          overflow: hidden;
-          text-overflow: ellipsis;
-          max-width: 260px;
-        }
-
-        /* All assets: mobile list */
-        .assetsList {
-          display: grid;
-          grid-template-columns: 1fr;
-          gap: 10px;
-        }
-        .assetRow {
-          border: 1px solid var(--line);
-          border-radius: var(--radius);
-          background: #fff;
-          padding: 14px;
-          box-shadow: var(--shadow);
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          gap: 12px;
-        }
-        .assetRight {
-          display: flex;
-          flex-direction: column;
-          align-items: flex-end;
-          gap: 6px;
-          min-width: 120px;
-        }
-        .assetRightTop {
-          display: inline-flex;
-          gap: 10px;
-          align-items: baseline;
-          font-weight: 950;
-        }
-        .assetSmall {
-          font-size: 12px;
-          color: var(--muted);
-          font-weight: 800;
-        }
-
-        /* Desktop table */
-        .desktopOnly {
-          display: none;
-        }
-        .tableWrap {
-          border: 1px solid var(--line);
-          border-radius: var(--radius);
-          overflow: hidden;
-          background: #fff;
-          box-shadow: var(--shadow);
-        }
-        table {
-          width: 100%;
-          border-collapse: collapse;
-          min-width: 820px;
-        }
-        thead th {
-          text-align: left;
-          font-size: 12px;
-          color: var(--muted);
-          font-weight: 900;
-          padding: 12px;
-          border-bottom: 1px solid var(--line);
-          background: rgba(0,0,0,0.02);
-        }
-        tbody td {
-          padding: 12px;
-          border-top: 1px solid rgba(0,0,0,0.05);
-          vertical-align: middle;
-        }
-        .mono {
-          font-variant-numeric: tabular-nums;
-          font-feature-settings: "tnum" 1;
-        }
-
-        /* Messages */
-        .panel {
-          padding: 14px;
-          border-radius: var(--radius);
-          border: 1px solid var(--line);
-          background: rgba(0,0,0,0.02);
-          margin-top: 14px;
-        }
-        .panelError {
-          border-color: rgba(239, 68, 68, 0.35);
-          background: rgba(239, 68, 68, 0.05);
-        }
-        .panelTitle {
-          font-weight: 950;
-          margin-bottom: 6px;
-        }
-        .muted {
-          color: var(--muted);
-          font-weight: 700;
-        }
-
-        /* Responsive: desktop upgrades */
-        @media (min-width: 920px) {
-          .signalsGrid {
-            grid-template-columns: repeat(3, 1fr);
-          }
-          .assetMiniName {
-            max-width: 420px;
-          }
-          .desktopOnly {
-            display: block;
-          }
-          .mobileOnly {
-            display: none;
-          }
-          .controls {
-            margin-top: 14px;
-          }
-        }
-      `}</style>
-
+    <main style={{ padding: 16, maxWidth: 720, margin: '0 auto' }}>
       {/* Header */}
-      <div className="headerRow">
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12, marginBottom: 10 }}>
         <div>
-          <div className="title">Zilkara</div>
-          <div className="subtitle">
-            {error ? 'Erreur' : 'OK'} — {assets.length} actifs
-            {lastUpdated ? ` — Mis à jour : ${lastUpdated}` : ''}
+          <div style={{ fontSize: 40, fontWeight: 950, letterSpacing: -1 }}>Zilkara</div>
+          <div style={{ opacity: 0.7, fontSize: 14 }}>
+            {error ? 'Erreur' : 'OK'} — {assets.length} actifs{lastUpdated ? ` — Mis à jour : ${lastUpdated}` : ''}
           </div>
         </div>
 
         <button
-          className="btn"
           onClick={() => fetchAll('refresh')}
           disabled={isLoading || isRefreshing}
+          style={{
+            padding: '10px 14px',
+            borderRadius: 16,
+            border: '1px solid rgba(0,0,0,0.10)',
+            background: 'white',
+            fontWeight: 900,
+          }}
         >
           {isRefreshing ? 'Refresh…' : 'Refresh'}
         </button>
       </div>
 
-      {/* Context */}
-      <ContextCard ctx={context} total={assets.length} />
+      {/* Context card (Apple-like) */}
+      <div
+        style={{
+          borderRadius: 22,
+          border: '1px solid rgba(0,0,0,0.08)',
+          background: 'rgba(0,0,0,0.02)',
+          padding: 16,
+          marginBottom: 14,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: 12,
+        }}
+      >
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <div style={{ opacity: 0.6, letterSpacing: 1.2, fontWeight: 900, fontSize: 12 }}>RFS CONTEXT</div>
+          <div style={{ fontWeight: 950, fontSize: 16 }}>Confidence</div>
+          <div style={{ fontWeight: 950, fontSize: 44, letterSpacing: -1.2, lineHeight: 1 }}>
+            {confidenceGlobal != null ? `${confidenceGlobal}%` : '—'}
+          </div>
+          <div style={{ opacity: 0.7, fontSize: 14 }}>
+            Objectif : filtrage & régulation du risque, lecture rapide, discipline d’abord.
+          </div>
+        </div>
 
-      {/* Controls (UI minimal, pas de logique métier) */}
-      <div className="controls">
-        <div className="control">
-          <span className="controlLabel">Limit</span>
-          <select
-            value={limit}
-            onChange={(e) => setLimit(clampInt(Number(e.target.value), 1, 250))}
+        <div style={{ textAlign: 'right', flex: '0 0 auto' }}>
+          <div
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 10,
+              padding: '10px 12px',
+              borderRadius: 999,
+              border: '1px solid rgba(0,0,0,0.10)',
+              background: 'white',
+              fontWeight: 950,
+              letterSpacing: 0.4,
+            }}
           >
-            <option value={50}>50</option>
-            <option value={100}>100</option>
-            <option value={150}>150</option>
-            <option value={200}>200</option>
-          </select>
+            <span style={{ width: 10, height: 10, borderRadius: 999, ...regimeDotStyle(marketRegime) }} />
+            {marketRegime}
+          </div>
+          <div style={{ opacity: 0.6, fontSize: 13, marginTop: 8 }}>Trier. Lire. Décider.</div>
         </div>
-
-        <div className="control">
-          <span className="controlLabel">Sort</span>
-          <select value={sort} onChange={(e) => setSort(e.target.value)}>
-            <option value="confidence_score_desc">confidence_score_desc</option>
-            <option value="market_cap_desc">market_cap_desc</option>
-            <option value="volume_desc">volume_desc</option>
-            <option value="chg_24h_abs_asc">chg_24h_abs_asc</option>
-            <option value="chg_24h_abs_desc">chg_24h_abs_desc</option>
-          </select>
-        </div>
-
-        <label className="toggle">
-          <input
-            type="checkbox"
-            checked={discipline}
-            onChange={(e) => setDiscipline(e.target.checked)}
-          />
-          Mode Discipline
-        </label>
-
-        <button className="btn" onClick={() => fetchAll('refresh')} disabled={isLoading || isRefreshing}>
-          Appliquer
-        </button>
       </div>
 
-      {/* Loading / Error */}
+      {/* Controls */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 14 }}>
+        <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'center' }}>
+          <label style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+            <span style={{ opacity: 0.65, fontWeight: 800 }}>Limit</span>
+            <select
+              value={limit}
+              onChange={(e) => setLimit(clampInt(Number(e.target.value), 1, 250))}
+              style={{
+                padding: '10px 12px',
+                borderRadius: 14,
+                border: '1px solid rgba(0,0,0,0.10)',
+                background: 'white',
+                fontWeight: 900,
+              }}
+            >
+              <option value={50}>50</option>
+              <option value={100}>100</option>
+              <option value={150}>150</option>
+              <option value={200}>200</option>
+            </select>
+          </label>
+
+          <label style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+            <span style={{ opacity: 0.65, fontWeight: 800 }}>Sort</span>
+            <select
+              value={sort}
+              onChange={(e) => setSort(e.target.value)}
+              style={{
+                padding: '10px 12px',
+                borderRadius: 14,
+                border: '1px solid rgba(0,0,0,0.10)',
+                background: 'white',
+                fontWeight: 900,
+              }}
+            >
+              <option value="confidence_score_desc">confidence_score_desc</option>
+              <option value="market_cap_desc">market_cap_desc</option>
+              <option value="volume_24h_desc">volume_24h_desc</option>
+            </select>
+          </label>
+        </div>
+
+        <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'center' }}>
+          <label
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 12,
+              padding: '12px 14px',
+              borderRadius: 18,
+              border: '1px solid rgba(0,0,0,0.10)',
+              background: 'white',
+              fontWeight: 900,
+            }}
+          >
+            <input type="checkbox" checked={discipline} onChange={(e) => setDiscipline(e.target.checked)} />
+            Mode Discipline
+          </label>
+
+          <button
+            onClick={() => fetchAll('refresh')}
+            disabled={isLoading || isRefreshing}
+            style={{
+              padding: '12px 16px',
+              borderRadius: 18,
+              border: '1px solid rgba(0,0,0,0.10)',
+              background: 'white',
+              fontWeight: 950,
+            }}
+          >
+            Appliquer
+          </button>
+        </div>
+      </div>
+
+      {/* States */}
       {isLoading ? (
-        <div className="panel">
-          <div className="panelTitle">Chargement…</div>
-          <div className="muted">Récupération du contexte et des signaux.</div>
+        <div style={{ padding: 14, border: '1px solid rgba(0,0,0,0.08)', borderRadius: 18, background: 'rgba(0,0,0,0.02)' }}>
+          Chargement…
         </div>
       ) : error ? (
-        <div className="panel panelError">
-          <div className="panelTitle">Erreur</div>
+        <div style={{ padding: 14, border: '1px solid rgba(255,0,0,0.25)', borderRadius: 18, background: 'rgba(255,0,0,0.03)' }}>
+          <div style={{ fontWeight: 950, marginBottom: 6 }}>Erreur</div>
           <div style={{ whiteSpace: 'pre-wrap' }}>{error}</div>
         </div>
       ) : assets.length === 0 ? (
-        <div className="panel">
-          <div className="panelTitle">Aucun résultat</div>
-          <div className="muted">Aucun actif reçu depuis /api/scan.</div>
+        <div style={{ padding: 14, border: '1px solid rgba(0,0,0,0.08)', borderRadius: 18, background: 'rgba(0,0,0,0.02)' }}>
+          Aucun résultat.
         </div>
       ) : (
-        <>
-          {/* Top Signals (mobile-first, cards) */}
-          <div className="sectionTitle">Top Signals</div>
-          <div className="signalsGrid">
-            {topSignals.map((a, idx) => (
-              <TopSignalCard key={`${safeString(a.id) ?? safeString(a.symbol) ?? 'top'}-${idx}`} a={a} />
-            ))}
-          </div>
-
-          {/* All assets */}
-          <div className="sectionTitle">All Assets</div>
-
-          {/* Mobile list */}
-          <div className="assetsList mobileOnly">
-            {assets.map((a, idx) => {
-              const price = safeNumber(a.price);
-              const chg = safeNumber(a.chg_24h_pct);
-              const score = safeNumber(a.confidence_score);
-              const regime = a.regime ?? null;
-              const url = pickTradeUrl(a);
-
-              return (
-                <div key={`${safeString(a.id) ?? safeString(a.symbol) ?? 'm'}-${idx}`} className="assetRow">
-                  <AssetMini a={a} />
-
-                  <div className="assetRight">
-                    <div className="assetRightTop">
-                      <span className="mono">{formatScore(score)}</span>
-                      <span className={dotClass(regime)} aria-hidden="true" title={regimeText(regime)} />
-                    </div>
-                    <div className="assetSmall mono">{formatPrice(price)}</div>
-                    <div className="assetSmall mono">{formatPct(chg)}</div>
-                    {url ? (
-                      <a className="btn" href={url} target="_blank" rel="noreferrer">
-                        Ouvrir
-                      </a>
-                    ) : (
-                      <span className="muted">—</span>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-
-          {/* Desktop table */}
-          <div className="desktopOnly">
-            <div className="tableWrap">
-              <div style={{ overflowX: 'auto' }}>
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Actif</th>
-                      <th>Prix</th>
-                      <th>24h</th>
-                      <th>Score</th>
-                      <th>Régime</th>
-                      <th>Binance</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {assets.map((a, idx) => {
-                      const price = safeNumber(a.price);
-                      const chg = safeNumber(a.chg_24h_pct);
-                      const score = safeNumber(a.confidence_score);
-                      const regime = a.regime ?? null;
-                      const url = pickTradeUrl(a);
-
-                      return (
-                        <tr key={`${safeString(a.id) ?? safeString(a.symbol) ?? 'd'}-${idx}`}>
-                          <td>
-                            <AssetMini a={a} />
-                          </td>
-                          <td className="mono">{formatPrice(price)}</td>
-                          <td className="mono">{formatPct(chg)}</td>
-                          <td className="mono" style={{ fontWeight: 950 }}>
-                            {formatScore(score)}
-                          </td>
-                          <td>
-                            <span className={regimeClass(regime)}>
-                              <span className={dotClass(regime)} aria-hidden="true" />
-                              {regimeText(regime)}
-                            </span>
-                          </td>
-                          <td>
-                            {url ? (
-                              <a className="btn" href={url} target="_blank" rel="noreferrer">
-                                Ouvrir
-                              </a>
-                            ) : (
-                              '—'
-                            )}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
-        </>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          {assets.map((a, idx) => (
+            <AssetCard key={`${safeString(a.id) ?? safeString(a.symbol) ?? 'asset'}-${idx}`} asset={a} />
+          ))}
+        </div>
       )}
     </main>
   );
