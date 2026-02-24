@@ -1,328 +1,423 @@
-"use client";
+k// app/page.tsx
+'use client';
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 
-/**
- * HOME V2 (OFFICIELLE)
- * - Aucun filtre côté UI.
- * - La source unique est /api/scan.
- * - Le tri est verrouillé côté API (confidence_score desc).
- * - L’UI affiche exactement ce que l’API renvoie.
- */
+type Regime = 'STABLE' | 'TRANSITION' | 'VOLATILE' | string;
 
 type ScanAsset = {
-  symbol: string;
-  name: string;
-  price: number;
-  chg_24h_pct: number;
-  confidence_score: number;
-  regime: string;
-  binance_url: string;
-  affiliate_url: string;
+  id?: string;
+  symbol?: string;
+  name?: string;
+
+  price?: number | null;
+  chg_24h_pct?: number | null;
+
+  confidence_score?: number | null;
+  confidence_label?: string | null;
+  confidence_reason?: string | null;
+
+  regime?: Regime | null;
+
+  // liens fournis par l’API (NE PAS reconstruire)
+  binance_url?: string | null;
+  affiliate_url?: string | null;
+
+  // optionnels
+  market_cap?: number | null;
+  volume_24h?: number | null;
 };
 
 type ScanResponse = {
   ok: boolean;
+  ts?: string;
+  source?: string;
+  market?: string;
+  quote?: string;
   count?: number;
-  items?: ScanAsset[];
-  meta?: {
-    sorted_by?: string;
-    generated_at?: string;
-  };
+  data?: ScanAsset[];
+  meta?: Record<string, unknown>;
   error?: string;
-  detail?: string;
+  message?: string;
 };
 
-function fmtPct(n: number | null | undefined) {
-  if (n === null || n === undefined || Number.isNaN(Number(n))) return "—";
-  const sign = Number(n) > 0 ? "+" : "";
-  return `${sign}${new Intl.NumberFormat("fr-FR", { maximumFractionDigits: 2 }).format(Number(n))}%`;
+type ContextResponse = {
+  ok: boolean;
+  ts?: string;
+  market_regime?: string | null;
+  confidence_global?: number | null; // ex: 0-100
+  message?: string | null;
+  error?: string;
+};
+
+function clampInt(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, Math.trunc(n)));
 }
 
-function fmtPrice(n: number | null | undefined) {
-  if (n === null || n === undefined || Number.isNaN(Number(n))) return "—";
-  return new Intl.NumberFormat("fr-FR", { maximumFractionDigits: 8 }).format(Number(n));
+function safeNumber(v: unknown): number | null {
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  return null;
 }
 
-function safeStr(s: string | null | undefined) {
-  const v = (s ?? "").toString().trim();
-  return v.length ? v : "—";
-}
-
-function regimeDot(regime: string) {
-  const r = (regime || "").toUpperCase();
-  if (r === "STABLE") return "#1F8A4C";
-  if (r === "TRANSITION") return "#B7791F";
-  if (r === "VOLATILE") return "#C53030";
-  return "rgba(0,0,0,0.35)";
-}
-
-async function fetchScan(signal?: AbortSignal): Promise<ScanResponse> {
-  const res = await fetch("/api/scan", { cache: "no-store", signal });
-  const json = (await res.json().catch(() => null)) as ScanResponse | null;
-
-  if (!res.ok) {
-    return {
-      ok: false,
-      error: "HTTP_ERROR",
-      detail: (json as any)?.detail ?? `HTTP_${res.status}`,
-    };
+function safeString(v: unknown): string | null {
+  if (typeof v === 'string') {
+    const s = v.trim();
+    return s.length ? s : null;
   }
-  if (!json) {
-    return { ok: false, error: "BAD_JSON", detail: "Invalid JSON response" };
-  }
-  return json;
+  return null;
 }
 
-export default function Page() {
-  const [items, setItems] = useState<ScanAsset[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [syncing, setSyncing] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
+function formatPrice(v: number | null): string {
+  if (v === null) return '—';
+  // format simple; tu peux raffiner plus tard
+  if (v >= 1000) return v.toLocaleString(undefined, { maximumFractionDigits: 0 });
+  if (v >= 1) return v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return v.toLocaleString(undefined, { minimumFractionDigits: 4, maximumFractionDigits: 6 });
+}
 
-  const [lastUpdated, setLastUpdated] = useState<string>("—");
-  const [count, setCount] = useState<number>(0);
+function formatPct(v: number | null): string {
+  if (v === null) return '—';
+  const sign = v > 0 ? '+' : '';
+  return `${sign}${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`;
+}
 
-  const timerRef = useRef<number | null>(null);
-  const inflightRef = useRef(false);
+function formatScore(v: number | null): string {
+  if (v === null) return '—';
+  const n = clampInt(v, 0, 100);
+  return String(n);
+}
 
-  const header = useMemo(() => {
-    return {
-      title: "Zilkara",
-      subtitle: `OK — ${count} actifs · Mis à jour : ${lastUpdated}`,
-    };
-  }, [count, lastUpdated]);
+function regimeDot(regime: Regime | null): string {
+  // Pastille (texte seulement pour éviter style/couleurs ici)
+  // Tu mettras le style dans globals.css ensuite.
+  if (!regime) return '•';
+  const r = String(regime).toUpperCase();
+  if (r === 'STABLE') return '●';
+  if (r === 'TRANSITION') return '●';
+  if (r === 'VOLATILE') return '●';
+  return '●';
+}
 
-  async function load(isInitial = false) {
-    if (inflightRef.current) return;
-    inflightRef.current = true;
+function regimeLabel(regime: Regime | null): string {
+  if (!regime) return '—';
+  return String(regime).toUpperCase();
+}
 
-    if (isInitial) setLoading(true);
-    else setSyncing(true);
+function pickTradeUrl(a: ScanAsset): string | null {
+  // IMPORTANT: ne jamais reconstruire. On prend celui donné par l’API.
+  return safeString(a.affiliate_url) ?? safeString(a.binance_url) ?? null;
+}
 
-    setErr(null);
-
-    const ctrl = new AbortController();
-
-    try {
-      const json = await fetchScan(ctrl.signal);
-
-      if (!json.ok) {
-        setItems([]);
-        setCount(0);
-        setLastUpdated(new Date().toLocaleTimeString("fr-FR"));
-        setErr(json.detail || json.error || "SCAN_FAILED");
-        return;
-      }
-
-      const next = json.items ?? [];
-
-      // ⚠️ AUCUN FILTRE ICI
-      // Le backend gère tri/selection.
-      setItems(next);
-      setCount(typeof json.count === "number" ? json.count : next.length);
-
-      const ts = json.meta?.generated_at
-        ? new Date(json.meta.generated_at).toLocaleTimeString("fr-FR")
-        : new Date().toLocaleTimeString("fr-FR");
-      setLastUpdated(ts);
-    } catch (e: any) {
-      setItems([]);
-      setCount(0);
-      setLastUpdated(new Date().toLocaleTimeString("fr-FR"));
-      setErr(e?.message ?? "FETCH_FAILED");
-    } finally {
-      inflightRef.current = false;
-      setLoading(false);
-      setSyncing(false);
-    }
-  }
-
-  useEffect(() => {
-    // initial load
-    load(true);
-
-    // auto refresh léger (toutes les 60s)
-    timerRef.current = window.setInterval(() => {
-      load(false);
-    }, 60_000);
-
-    return () => {
-      if (timerRef.current) window.clearInterval(timerRef.current);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+// (Option) logo via CoinGecko CDN basé sur symbol : risqué / pas fiable.
+// Ici on ne fait RIEN => pas de trous visuels.
+// Tu pourras ajouter plus tard un champ "logo_url" côté API.
+function AssetCell({ asset }: { asset: ScanAsset }) {
+  const symbol = safeString(asset.symbol) ?? '—';
+  const name = safeString(asset.name) ?? symbol;
 
   return (
-    <main style={{ padding: 16, maxWidth: 1100, margin: "0 auto" }}>
-      <header style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 12 }}>
-        <div>
-          <h1 style={{ margin: 0 }}>{header.title}</h1>
-          <div style={{ opacity: 0.7, marginTop: 4 }}>{header.subtitle}</div>
-        </div>
+    <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+      <div
+        aria-hidden="true"
+        style={{
+          width: 28,
+          height: 28,
+          borderRadius: 8,
+          background: 'rgba(0,0,0,0.06)',
+          display: 'inline-flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          fontSize: 12,
+          fontWeight: 600,
+        }}
+        title={symbol}
+      >
+        {symbol.slice(0, 2)}
+      </div>
 
-        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-          <button
-            onClick={() => load(false)}
-            disabled={loading || syncing}
-            style={{
-              padding: "8px 12px",
-              borderRadius: 10,
-              border: "1px solid rgba(0,0,0,0.12)",
-              background: "white",
-              cursor: loading || syncing ? "not-allowed" : "pointer",
-            }}
-            title="Rafraîchir"
-          >
-            {syncing ? "Sync…" : "Refresh"}
-          </button>
-        </div>
-      </header>
-
-      <section style={{ marginTop: 16 }}>
-        <div
-          style={{
-            padding: 14,
-            borderRadius: 14,
-            border: "1px solid rgba(0,0,0,0.08)",
-            background: "rgba(0,0,0,0.02)",
-          }}
-        >
-          <div style={{ fontWeight: 600, marginBottom: 6 }}>Indice contextuel</div>
-          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-            <span
-              style={{
-                padding: "6px 10px",
-                borderRadius: 999,
-                border: "1px solid rgba(0,0,0,0.10)",
-                background: "white",
-                fontSize: 13,
-              }}
-            >
-              Référence: 24h
-            </span>
-            <span
-              style={{
-                padding: "6px 10px",
-                borderRadius: 999,
-                border: "1px solid rgba(0,0,0,0.10)",
-                background: "white",
-                fontSize: 13,
-              }}
-            >
-              Tri: score (desc)
-            </span>
-            <span style={{ opacity: 0.7, fontSize: 13 }}>
-              RFS: Filtrage & régulation du risque. Lecture rapide, discipline d’abord.
-            </span>
-          </div>
-        </div>
-      </section>
-
-      <section style={{ marginTop: 16 }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-          <h2 style={{ margin: 0, fontSize: 18 }}>Mouvements 24h</h2>
-          {err ? (
-            <span style={{ color: "#C53030", fontSize: 13 }}>Erreur: {err}</span>
-          ) : (
-            <span style={{ opacity: 0.6, fontSize: 13 }}>{loading ? "Chargement…" : "—"}</span>
-          )}
-        </div>
-
-        <div style={{ marginTop: 10, borderRadius: 14, border: "1px solid rgba(0,0,0,0.08)", overflow: "hidden" }}>
-          <div style={{ width: "100%", overflowX: "auto" }}>
-            <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 760 }}>
-              <thead>
-                <tr style={{ background: "rgba(0,0,0,0.03)" }}>
-                  <th style={thStyle}>Actif</th>
-                  <th style={thStyle}>Prix</th>
-                  <th style={thStyle}>24h</th>
-                  <th style={thStyle}>Score</th>
-                  <th style={thStyle}>Régime</th>
-                  <th style={{ ...thStyle, textAlign: "right" }}>Binance</th>
-                </tr>
-              </thead>
-
-              <tbody>
-                {loading ? (
-                  <tr>
-                    <td style={tdStyle} colSpan={6}>
-                      Chargement…
-                    </td>
-                  </tr>
-                ) : items.length === 0 ? (
-                  <tr>
-                    <td style={tdStyle} colSpan={6}>
-                      Aucun résultat.
-                    </td>
-                  </tr>
-                ) : (
-                  items.map((row) => {
-                    const openUrl = row.affiliate_url || row.binance_url;
-                    return (
-                      <tr key={row.symbol} style={{ borderTop: "1px solid rgba(0,0,0,0.06)" }}>
-                        <td style={tdStyle}>
-                          <div style={{ fontWeight: 600 }}>{safeStr(row.symbol)}</div>
-                          <div style={{ opacity: 0.7, fontSize: 13 }}>{safeStr(row.name)}</div>
-                        </td>
-                        <td style={tdStyle}>{fmtPrice(row.price)}</td>
-                        <td style={tdStyle}>{fmtPct(row.chg_24h_pct)}</td>
-                        <td style={tdStyle}>{safeStr(String(row.confidence_score))}</td>
-                        <td style={tdStyle}>
-                          <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
-                            <span
-                              style={{
-                                width: 10,
-                                height: 10,
-                                borderRadius: 999,
-                                background: regimeDot(row.regime),
-                                display: "inline-block",
-                              }}
-                            />
-                            {safeStr(row.regime)}
-                          </span>
-                        </td>
-                        <td style={{ ...tdStyle, textAlign: "right" }}>
-                          <a
-                            href={openUrl}
-                            target="_blank"
-                            rel="noreferrer"
-                            style={{
-                              display: "inline-block",
-                              padding: "6px 10px",
-                              borderRadius: 10,
-                              border: "1px solid rgba(0,0,0,0.12)",
-                              textDecoration: "none",
-                              color: "inherit",
-                              background: "white",
-                            }}
-                          >
-                            Ouvrir
-                          </a>
-                        </td>
-                      </tr>
-                    );
-                  })
-                )}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </section>
-    </main>
+      <div style={{ display: 'flex', flexDirection: 'column', lineHeight: 1.15 }}>
+        <div style={{ fontWeight: 700 }}>{symbol}</div>
+        <div style={{ opacity: 0.7, fontSize: 12 }}>{name}</div>
+      </div>
+    </div>
   );
 }
 
-const thStyle: React.CSSProperties = {
-  textAlign: "left",
-  padding: "10px 12px",
-  fontSize: 13,
-  opacity: 0.75,
-  fontWeight: 600,
-};
+export default function Page() {
+  // ✅ State UI minimal
+  const [limit, setLimit] = useState<number>(50);
+  const [sort, setSort] = useState<string>('confidence_score_desc');
+  const [discipline, setDiscipline] = useState<boolean>(false);
 
-const tdStyle: React.CSSProperties = {
-  padding: "12px",
-  verticalAlign: "top",
-  fontSize: 14,
-};
+  const [assets, setAssets] = useState<ScanAsset[]>([]);
+  const [context, setContext] = useState<ContextResponse | null>(null);
+
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const lastUpdated = useMemo(() => {
+    const ts = safeString(context?.ts) ?? null;
+    return ts;
+  }, [context]);
+
+  const buildScanUrl = useCallback(() => {
+    const l = clampInt(limit, 1, 250);
+    const params = new URLSearchParams();
+    params.set('limit', String(l));
+    params.set('sort', sort);
+    if (discipline) params.set('discipline', '1');
+    return `/api/scan?${params.toString()}`;
+  }, [limit, sort, discipline]);
+
+  const fetchAll = useCallback(async (mode: 'initial' | 'refresh') => {
+    try {
+      if (mode === 'initial') setIsLoading(true);
+      if (mode === 'refresh') setIsRefreshing(true);
+      setError(null);
+
+      const scanUrl = buildScanUrl();
+
+      const [scanRes, ctxRes] = await Promise.all([
+        fetch(scanUrl, { cache: 'no-store' }),
+        fetch('/api/context', { cache: 'no-store' }),
+      ]);
+
+      if (!scanRes.ok) {
+        const txt = await scanRes.text().catch(() => '');
+        throw new Error(`Scan HTTP ${scanRes.status} ${scanRes.statusText}${txt ? ` — ${txt}` : ''}`);
+      }
+      if (!ctxRes.ok) {
+        const txt = await ctxRes.text().catch(() => '');
+        throw new Error(`Context HTTP ${ctxRes.status} ${ctxRes.statusText}${txt ? ` — ${txt}` : ''}`);
+      }
+
+      const scanJson = (await scanRes.json()) as ScanResponse;
+      const ctxJson = (await ctxRes.json()) as ContextResponse;
+
+      if (!scanJson?.ok) throw new Error(scanJson?.error || scanJson?.message || 'Scan: réponse invalide.');
+      if (!ctxJson?.ok) throw new Error(ctxJson?.error || ctxJson?.message || 'Context: réponse invalide.');
+
+      const data = Array.isArray(scanJson.data) ? scanJson.data : [];
+      setAssets(data);
+      setContext(ctxJson);
+    } catch (e: any) {
+      setError(e?.message ? String(e.message) : 'Erreur inconnue.');
+      setAssets([]);
+      setContext(null);
+    } finally {
+      setIsLoading(false);
+      setIsRefreshing(false);
+    }
+  }, [buildScanUrl]);
+
+  useEffect(() => {
+    fetchAll('initial');
+  }, [fetchAll]);
+
+  // ✅ Rendu (zéro logique métier)
+  return (
+    <main style={{ padding: 16, maxWidth: 980, margin: '0 auto' }}>
+      {/* Header Contexte */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 16 }}>
+        <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 12 }}>
+          <div>
+            <div style={{ fontSize: 28, fontWeight: 800, letterSpacing: -0.3 }}>Zilkara</div>
+            <div style={{ opacity: 0.7, fontSize: 13 }}>
+              {error ? 'Erreur' : 'OK'} — {assets.length} actifs{lastUpdated ? ` — Mis à jour : ${lastUpdated}` : ''}
+            </div>
+          </div>
+
+          <button
+            onClick={() => fetchAll('refresh')}
+            disabled={isLoading || isRefreshing}
+            style={{
+              padding: '10px 12px',
+              borderRadius: 12,
+              border: '1px solid rgba(0,0,0,0.12)',
+              background: 'white',
+              fontWeight: 700,
+            }}
+          >
+            {isRefreshing ? 'Refresh…' : 'Refresh'}
+          </button>
+        </div>
+
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <div
+            style={{
+              padding: '8px 10px',
+              borderRadius: 12,
+              border: '1px solid rgba(0,0,0,0.10)',
+              background: 'rgba(0,0,0,0.03)',
+              fontSize: 13,
+            }}
+          >
+            <b>Confiance</b> : {context?.confidence_global != null ? `${clampInt(context.confidence_global, 0, 100)}%` : '—'}
+          </div>
+          <div
+            style={{
+              padding: '8px 10px',
+              borderRadius: 12,
+              border: '1px solid rgba(0,0,0,0.10)',
+              background: 'rgba(0,0,0,0.03)',
+              fontSize: 13,
+            }}
+          >
+            <b>Régime marché</b> : {safeString(context?.market_regime) ?? '—'}
+          </div>
+          <div style={{ opacity: 0.75, fontSize: 13, alignSelf: 'center' }}>
+            Objectif : filtrage & régulation du risque, lecture rapide, discipline d’abord.
+          </div>
+        </div>
+      </div>
+
+      {/* Controls (UI state minimal) */}
+      <div
+        style={{
+          display: 'flex',
+          gap: 10,
+          flexWrap: 'wrap',
+          alignItems: 'center',
+          marginBottom: 12,
+        }}
+      >
+        <label style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <span style={{ fontSize: 13, opacity: 0.75 }}>Limit</span>
+          <select
+            value={limit}
+            onChange={(e) => setLimit(clampInt(Number(e.target.value), 1, 250))}
+            style={{ padding: '8px 10px', borderRadius: 10 }}
+          >
+            <option value={50}>50</option>
+            <option value={100}>100</option>
+            <option value={150}>150</option>
+            <option value={200}>200</option>
+          </select>
+        </label>
+
+        <label style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <span style={{ fontSize: 13, opacity: 0.75 }}>Sort</span>
+          <select
+            value={sort}
+            onChange={(e) => setSort(e.target.value)}
+            style={{ padding: '8px 10px', borderRadius: 10 }}
+          >
+            <option value="confidence_score_desc">confidence_score_desc</option>
+            <option value="market_cap_desc">market_cap_desc</option>
+            <option value="volume_24h_desc">volume_24h_desc</option>
+          </select>
+        </label>
+
+        <label style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <input
+            type="checkbox"
+            checked={discipline}
+            onChange={(e) => setDiscipline(e.target.checked)}
+          />
+          <span style={{ fontSize: 13, opacity: 0.75 }}>Discipline</span>
+        </label>
+
+        <button
+          onClick={() => fetchAll('refresh')}
+          disabled={isLoading || isRefreshing}
+          style={{
+            padding: '8px 10px',
+            borderRadius: 10,
+            border: '1px solid rgba(0,0,0,0.12)',
+            background: 'white',
+            fontWeight: 700,
+          }}
+        >
+          Appliquer
+        </button>
+      </div>
+
+      {/* Loading / Error */}
+      {isLoading ? (
+        <div style={{ padding: 14, border: '1px solid rgba(0,0,0,0.1)', borderRadius: 14 }}>
+          Chargement…
+        </div>
+      ) : error ? (
+        <div style={{ padding: 14, border: '1px solid rgba(255,0,0,0.25)', borderRadius: 14 }}>
+          <div style={{ fontWeight: 800, marginBottom: 6 }}>Erreur</div>
+          <div style={{ whiteSpace: 'pre-wrap' }}>{error}</div>
+        </div>
+      ) : assets.length === 0 ? (
+        <div style={{ padding: 14, border: '1px solid rgba(0,0,0,0.1)', borderRadius: 14 }}>
+          Aucun résultat.
+        </div>
+      ) : (
+        // Table
+        <div style={{ overflowX: 'auto', border: '1px solid rgba(0,0,0,0.10)', borderRadius: 14 }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 720 }}>
+            <thead>
+              <tr style={{ textAlign: 'left', fontSize: 12, opacity: 0.75 }}>
+                <th style={{ padding: 12 }}>Actif</th>
+                <th style={{ padding: 12 }}>Prix</th>
+                <th style={{ padding: 12 }}>24h</th>
+                <th style={{ padding: 12 }}>Score</th>
+                <th style={{ padding: 12 }}>Régime</th>
+                <th style={{ padding: 12 }}>Binance</th>
+              </tr>
+            </thead>
+            <tbody>
+              {assets.map((a, idx) => {
+                const price = safeNumber(a.price);
+                const chg = safeNumber(a.chg_24h_pct);
+                const score = safeNumber(a.confidence_score);
+                const regime = a.regime ?? null;
+                const url = pickTradeUrl(a);
+
+                return (
+                  <tr key={`${safeString(a.id) ?? safeString(a.symbol) ?? 'asset'}-${idx}`} style={{ borderTop: '1px solid rgba(0,0,0,0.06)' }}>
+                    <td style={{ padding: 12 }}>
+                      <AssetCell asset={a} />
+                    </td>
+                    <td style={{ padding: 12, fontVariantNumeric: 'tabular-nums' }}>
+                      {formatPrice(price)}
+                    </td>
+                    <td style={{ padding: 12, fontVariantNumeric: 'tabular-nums' }}>
+                      {formatPct(chg)}
+                    </td>
+                    <td style={{ padding: 12, fontVariantNumeric: 'tabular-nums', fontWeight: 800 }}>
+                      {formatScore(score)}
+                    </td>
+                    <td style={{ padding: 12 }}>
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                        <span aria-hidden="true">{regimeDot(regime)}</span>
+                        <span>{regimeLabel(regime)}</span>
+                      </span>
+                    </td>
+                    <td style={{ padding: 12 }}>
+                      {url ? (
+                        <a
+                          href={url}
+                          target="_blank"
+                          rel="noreferrer"
+                          style={{
+                            display: 'inline-flex',
+                            padding: '8px 10px',
+                            borderRadius: 10,
+                            border: '1px solid rgba(0,0,0,0.12)',
+                            textDecoration: 'none',
+                            fontWeight: 700,
+                            color: 'inherit',
+                          }}
+                        >
+                          Ouvrir
+                        </a>
+                      ) : (
+                        '—'
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </main>
+  );
+}
