@@ -6,100 +6,91 @@ export const dynamic = "force-dynamic";
 
 /**
  * =========================
- * 1) Contrat de sortie clair
+ * TYPES / CONTRAT
  * =========================
  */
 
 type Regime = "STABLE" | "TRANSITION" | "VOLATILE";
-type SortMode =
-  | "confidence_score_desc"
-  | "confidence_score_asc"
-  | "market_cap_desc"
-  | "volume_desc"
-  | "chg_24h_abs_asc"
-  | "chg_24h_abs_desc";
+type SortMode = "score_desc" | "score_asc" | "price_desc" | "price_asc";
 
-type ConfidenceLabel = "GOOD" | "OK" | "RISK";
+type ScoreTrend = "up" | "down" | "flat";
 
 export type ScanAsset = {
-  id: string; // coingecko id (stable)
-  symbol: string; // ex: BTC
-  name: string; // ex: Bitcoin (full name)
-  price: number; // last price
-  chg_24h_pct: number; // % change 24h
-  market_cap?: number;
-  volume_24h?: number;
+  id: string;
+  symbol: string;
+  name: string;
+
+  price: number;
+  chg_24h_pct: number;
+
+  timeframe: "H24";
+
+  confidence_score: number; // 0..100
+  score_delta: number; // delta vs snapshot précédent (même cacheKey)
+  score_trend: ScoreTrend; // up/down/flat (pour tes flèches)
 
   regime: Regime;
 
-  confidence_score: number; // 0..100
-  confidence_label?: ConfidenceLabel;
-  confidence_reason?: string;
-
-  binance_url: string; // never empty
-  affiliate_url?: string; // undefined if not configured
+  // liens fournis par l’API (ne jamais reconstruire côté UI)
+  binance_url: string;
+  affiliate_url?: string;
 };
 
 export type ApiResponse = {
   ok: boolean;
-  ts: string; // ISO timestamp
+  ts: string;
   source: "coingecko" | "fallback" | "cache";
-  market: string; // ex: "crypto"
-  quote: string; // ex: "usd"
+  market: "crypto";
+  quote: string;
   count: number;
   data: ScanAsset[];
   meta: {
     sorted_by: SortMode;
     limit: number;
-    discipline: boolean;
     cache: "hit" | "miss" | "no-store";
-    generated_at: string;
-    warnings?: string[];
-
-    // ✅ additions (non-breaking)
-    fetch_size?: number;
-    cache_ttl_sec?: number;
-    no_store?: boolean;
-    discipline_mode?: "ON" | "OFF";
   };
+  error?: string;
 };
 
 /**
- * ==================================
- * 2) Paramètres d’entrée (query)
- * ==================================
+ * =========================
+ * QUERY PARAMS
+ * =========================
  */
 
-const DEFAULT_LIMIT = 50;
+const DEFAULT_LIMIT = 250;
 const MAX_LIMIT = 250;
-const DEFAULT_SORT: SortMode = "confidence_score_desc";
+const DEFAULT_SORT: SortMode = "score_desc";
 
-function clampInt(v: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, v));
+function clampInt(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, Math.trunc(n)));
 }
 
-function parseBool(v: string | null): boolean {
-  if (!v) return false;
-  return ["1", "true", "yes", "on"].includes(v.toLowerCase());
+function safeString(v: unknown): string | undefined {
+  if (typeof v !== "string") return undefined;
+  const s = v.trim();
+  return s.length ? s : undefined;
+}
+
+function toNum(v: unknown): number | undefined {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string") {
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return undefined;
 }
 
 function parseSort(v: string | null): SortMode {
   const s = (v || "").trim();
-  const allowed: SortMode[] = [
-    "confidence_score_desc",
-    "confidence_score_asc",
-    "market_cap_desc",
-    "volume_desc",
-    "chg_24h_abs_asc",
-    "chg_24h_abs_desc",
-  ];
+  const allowed: SortMode[] = ["score_desc", "score_asc", "price_desc", "price_asc"];
   return allowed.includes(s as SortMode) ? (s as SortMode) : DEFAULT_SORT;
 }
 
 /**
- * ==================================
- * 3) Récupération des données “brutes”
- * ==================================
+ * =========================
+ * COINGECKO FETCH
+ * =========================
  */
 
 type CGMarketItem = {
@@ -140,24 +131,15 @@ async function fetchCoinGeckoMarkets(opts: {
       cache: "no-store",
     });
 
-    if (!res.ok) {
-      throw new Error(`CoinGecko error: HTTP ${res.status}`);
-    }
-
+    if (!res.ok) throw new Error(`CoinGecko HTTP ${res.status}`);
     const json = (await res.json()) as unknown;
-    if (!Array.isArray(json)) {
-      throw new Error("CoinGecko error: response is not an array");
-    }
+    if (!Array.isArray(json)) throw new Error("CoinGecko response not array");
     return json as CGMarketItem[];
   } finally {
     clearTimeout(timeout);
   }
 }
 
-/**
- * Fallback minimal (si API down)
- * => garantit une réponse stable sans casser l’UI
- */
 function fallbackMarkets(): CGMarketItem[] {
   return [
     {
@@ -182,29 +164,10 @@ function fallbackMarkets(): CGMarketItem[] {
 }
 
 /**
- * ==================================
- * 4) Normalisation / sanitation
- * ==================================
+ * =========================
+ * NORMALIZATION
+ * =========================
  */
-
-function safeString(v: unknown): string | undefined {
-  if (typeof v !== "string") return undefined;
-  const s = v.trim();
-  return s.length ? s : undefined;
-}
-
-function cleanStr(v: unknown): string | undefined {
-  return safeString(v);
-}
-
-function toNum(v: unknown): number | undefined {
-  if (typeof v === "number" && Number.isFinite(v)) return v;
-  if (typeof v === "string") {
-    const n = Number(v);
-    if (Number.isFinite(n)) return n;
-  }
-  return undefined;
-}
 
 function normalizeSymbol(v: unknown): string | undefined {
   const s = safeString(v);
@@ -213,8 +176,8 @@ function normalizeSymbol(v: unknown): string | undefined {
 }
 
 function normalizeName(opts: { name?: unknown; id?: unknown; symbol?: unknown }): string {
-  const name = safeString(opts.name);
-  if (name) return name;
+  const n = safeString(opts.name);
+  if (n) return n;
 
   const id = safeString(opts.id);
   if (id) {
@@ -225,21 +188,21 @@ function normalizeName(opts: { name?: unknown; id?: unknown; symbol?: unknown })
       .join(" ");
   }
 
-  const sym = normalizeSymbol(opts.symbol);
-  return sym || "Unknown";
+  return normalizeSymbol(opts.symbol) || "Unknown";
 }
 
 /**
- * ==================================
- * 5) Construction des liens
- * ==================================
+ * =========================
+ * BINANCE LINKS (FIABLES)
+ * =========================
+ *
+ * Format recommandé (fonctionne mieux) :
+ * https://www.binance.com/en/trade/BTC_USDT?type=spot
  */
-
 function buildBinanceUrl(symbol: string): string {
-  const s = symbol.toUpperCase().trim();
-  // Ultra safe fallback:
-  if (!s || s.length > 10 || /[^A-Z0-9]/.test(s)) return "https://www.binance.com/en/markets";
-  return `https://www.binance.com/en/trade/${encodeURIComponent(s)}USDT?_from=markets`;
+  const s = symbol.trim().toUpperCase();
+  if (!s) return "https://www.binance.com/en/markets";
+  return `https://www.binance.com/en/trade/${encodeURIComponent(s)}_USDT?type=spot`;
 }
 
 function buildAffiliateUrl(binanceUrl: string): string | undefined {
@@ -248,6 +211,7 @@ function buildAffiliateUrl(binanceUrl: string): string | undefined {
 
   try {
     const u = new URL(binanceUrl);
+    // ne remplace pas si déjà présent
     if (!u.searchParams.get("ref")) u.searchParams.set("ref", ref);
     return u.toString();
   } catch {
@@ -256,9 +220,9 @@ function buildAffiliateUrl(binanceUrl: string): string | undefined {
 }
 
 /**
- * ==================================
- * 6) Calcul du régime
- * ==================================
+ * =========================
+ * REGIME (lisible, testable)
+ * =========================
  */
 
 const REGIME_THRESHOLDS = {
@@ -274,9 +238,11 @@ function normalizeRegime(chg24Pct: number): Regime {
 }
 
 /**
- * ==================================
- * 7) Calcul du score de confiance
- * ==================================
+ * =========================
+ * CONFIDENCE SCORE (0..100)
+ * =========================
+ * Simple, stable, explicable.
+ * (CoinGecko ne fournit pas ce score → on le calcule)
  */
 
 function clamp01(v: number) {
@@ -291,95 +257,57 @@ function computeConfidenceScore(input: {
   volume24h?: number;
   marketCap?: number;
   regime: Regime;
-  discipline: boolean;
-}): { score: number; label: ConfidenceLabel; reason: string } {
-  const { chg24, volume24h, marketCap, regime, discipline } = input;
+}): number {
+  const { chg24, volume24h, marketCap, regime } = input;
 
+  // 1) Volatility factor (0..1) : 0% -> 1.0 / 10%+ -> 0.0
   const volFactor = 1 - clamp01(Math.abs(chg24) / 10);
 
+  // 2) Liquidity factors (log scale), neutral if missing
   const mc = typeof marketCap === "number" && marketCap > 0 ? marketCap : undefined;
-  const liqBase = mc ? Math.log10(mc) : 10;
-  const liqFactor = clamp01((liqBase - 8) / 4);
-
   const vol = typeof volume24h === "number" && volume24h > 0 ? volume24h : undefined;
-  const volLog = vol ? Math.log10(vol) : 9;
-  const volFactor2 = clamp01((volLog - 7) / 4);
 
+  const mcLog = mc ? Math.log10(mc) : 10; // ~neutral
+  const volLog = vol ? Math.log10(vol) : 9; // ~neutral
+
+  const liqFactor = clamp01((mcLog - 8) / 4); // 1e8..1e12
+  const volFactor2 = clamp01((volLog - 7) / 4); // 1e7..1e11
+
+  // 3) Regime modifier
   const regimeMod = regime === "STABLE" ? 1.0 : regime === "TRANSITION" ? 0.85 : 0.65;
 
-  const disciplinePenalty = discipline ? (regime === "VOLATILE" ? 0.75 : 0.9) : 1.0;
-
-  const raw =
-    100 *
-    (0.55 * volFactor + 0.25 * liqFactor + 0.20 * volFactor2) *
-    regimeMod *
-    disciplinePenalty;
-
-  const score = clampScore(raw);
-
-  let label: ConfidenceLabel = "OK";
-  if (score >= 75) label = "GOOD";
-  else if (score < 50) label = "RISK";
-
-  const reason =
-    label === "GOOD"
-      ? "Variation maîtrisée et liquidité solide."
-      : label === "OK"
-      ? "Contexte exploitable, mais stabilité moyenne."
-      : "Risque élevé : volatilité ou liquidité défavorable.";
-
-  return { score, label, reason };
+  const raw = 100 * (0.55 * volFactor + 0.25 * liqFactor + 0.20 * volFactor2) * regimeMod;
+  return clampScore(raw);
 }
 
 /**
- * ==================================
- * 8) Tri + pagination logique
- * ==================================
+ * =========================
+ * SORTING
+ * =========================
  */
-
-function abs(n: number) {
-  return Math.abs(n);
-}
 
 function sortAssets(list: ScanAsset[], sort: SortMode): ScanAsset[] {
   const arr = [...list];
 
-  const tieBreak = (a: ScanAsset, b: ScanAsset) => {
-    const amc = a.market_cap ?? -1;
-    const bmc = b.market_cap ?? -1;
-    if (bmc !== amc) return bmc - amc;
-
-    const av = a.volume_24h ?? -1;
-    const bv = b.volume_24h ?? -1;
-    if (bv !== av) return bv - av;
-
-    return a.symbol.localeCompare(b.symbol);
-  };
+  // tie-breakers stables
+  const tieBreak = (a: ScanAsset, b: ScanAsset) => a.symbol.localeCompare(b.symbol);
 
   arr.sort((a, b) => {
     switch (sort) {
-      case "confidence_score_desc": {
+      case "score_desc": {
         const d = b.confidence_score - a.confidence_score;
         return d !== 0 ? d : tieBreak(a, b);
       }
-      case "confidence_score_asc": {
+      case "score_asc": {
         const d = a.confidence_score - b.confidence_score;
         return d !== 0 ? d : tieBreak(a, b);
       }
-      case "market_cap_desc": {
-        const d = (b.market_cap ?? -1) - (a.market_cap ?? -1);
+      case "price_desc": {
+        const d = b.price - a.price;
         return d !== 0 ? d : tieBreak(a, b);
       }
-      case "volume_desc": {
-        const d = (b.volume_24h ?? -1) - (a.volume_24h ?? -1);
-        return d !== 0 ? d : tieBreak(a, b);
-      }
-      case "chg_24h_abs_asc": {
-        const d = abs(a.chg_24h_pct) - abs(b.chg_24h_pct);
-        return d !== 0 ? d : tieBreak(a, b);
-      }
-      case "chg_24h_abs_desc": {
-        const d = abs(b.chg_24h_pct) - abs(a.chg_24h_pct);
+      case "price_asc": {
+        const d = a.price - b.price;
         return d !== 0 ? d : tieBreak(a, b);
       }
       default:
@@ -391,30 +319,32 @@ function sortAssets(list: ScanAsset[], sort: SortMode): ScanAsset[] {
 }
 
 /**
- * ==================================
- * 9) Cache (optionnel)
- * ==================================
+ * =========================
+ * CACHE (in-memory) + SCORE DELTA SNAPSHOT
+ * =========================
  *
- * Pack: on cache le dataset trié avant slicing => moins de recalcul entre limits.
+ * - TTL = 75s (performance stable)
+ * - Le delta de score est calculé vs dernier snapshot pour le même cacheKey
  */
 
 type CacheEntry = {
   ts: number;
-  data: ScanAsset[]; // trié
+  data: ScanAsset[];
   source: "cache" | "coingecko" | "fallback";
-  fetchSize: number;
 };
 
 const memCache = new Map<string, CacheEntry>();
 
-function cacheKey(opts: { sort: SortMode; discipline: boolean; quote: string }) {
-  return `scan:v1:${opts.quote}:${opts.sort}:${opts.discipline ? "D1" : "D0"}`;
+const TTL_MS = 75 * 1000;
+
+function cacheKey(opts: { quote: string; limit: number; sort: SortMode }) {
+  return `scan:v2:${opts.quote}:${opts.limit}:${opts.sort}`;
 }
 
-function getCache(key: string, ttlMs: number): CacheEntry | undefined {
+function getCache(key: string): CacheEntry | undefined {
   const e = memCache.get(key);
   if (!e) return undefined;
-  if (Date.now() - e.ts > ttlMs) {
+  if (Date.now() - e.ts > TTL_MS) {
     memCache.delete(key);
     return undefined;
   }
@@ -425,83 +355,96 @@ function setCache(key: string, entry: CacheEntry) {
   memCache.set(key, entry);
 }
 
+  if (prev) {
+    prev.forEach((a) => {
+      if (typeof a.confidence_score === "number") {
+        prevMap.set(a.id, a.confidence_score);
+      }
+    });
+  }
+
+  return curr.map((a) => {
+    const previousScore = prevMap.get(a.id);
+
+    // Si pas d'historique → delta = 0 (jamais null)
+    const delta =
+      typeof previousScore === "number"
+        ? a.confidence_score - previousScore
+        : 0;
+
+    let trend: "up" | "down" | "flat" = "flat";
+
+    if (delta > 0) trend = "up";
+    else if (delta < 0) trend = "down";
+
+    return {
+      ...a,
+      score_delta: delta,
+      score_trend: trend,
+    };
+  });
+}
 /**
  * =========================
- * MAIN /api/scan
+ * MAIN
  * =========================
  */
 
 export async function GET(req: Request) {
   const ts = new Date().toISOString();
-  const warnings: string[] = [];
-
   const { searchParams } = new URL(req.url);
 
   const quote = (safeString(searchParams.get("quote")) || "usd").toLowerCase();
-  const market = (safeString(searchParams.get("market")) || "crypto").toLowerCase();
-
   const sort = parseSort(searchParams.get("sort"));
-  const discipline = parseBool(searchParams.get("discipline"));
-
   const limitRaw = toNum(searchParams.get("limit")) ?? DEFAULT_LIMIT;
   const limit = clampInt(Math.floor(limitRaw), 1, MAX_LIMIT);
 
-  const noStore = parseBool(searchParams.get("noStore"));
-  const ttlMs = 45 * 1000;
-  const ttlSec = Math.round(ttlMs / 1000);
+  const noStore = (safeString(searchParams.get("noStore")) || "") === "1";
 
-  const key = cacheKey({ sort, discipline, quote });
+  const key = cacheKey({ quote, limit, sort });
 
+  // CACHE HIT
   if (!noStore) {
-    const hit = getCache(key, ttlMs);
+    const hit = getCache(key);
     if (hit) {
-      const paged = hit.data.slice(0, limit);
-
       const response: ApiResponse = {
         ok: true,
         ts,
         source: "cache",
-        market,
+        market: "crypto",
         quote,
-        count: paged.length,
-        data: paged,
-        meta: {
-          sorted_by: sort,
-          limit,
-          discipline,
-          cache: "hit",
-          generated_at: ts,
-          warnings: warnings.length ? warnings : undefined,
-          fetch_size: hit.fetchSize,
-          cache_ttl_sec: ttlSec,
-          no_store: false,
-          discipline_mode: discipline ? "ON" : "OFF",
-        },
+        count: hit.data.length,
+        data: hit.data,
+        meta: { sorted_by: sort, limit, cache: "hit" },
       };
-
       return NextResponse.json(response, { status: 200, headers: { "cache-control": "no-store" } });
     }
   }
 
+  // FETCH RAW
   let raw: CGMarketItem[] = [];
   let source: ApiResponse["source"] = "coingecko";
 
-  // fetch stable: enough breadth for context + sorting
-  const fetchSize = clampInt(Math.max(200, limit * 2), 50, 250);
-
   try {
+    // fetch bigger for better sorting stability
+    const fetchSize = clampInt(Math.max(limit * 2, 80), 50, 250);
     raw = await fetchCoinGeckoMarkets({ quote, limit: fetchSize });
-    if (!raw.length) warnings.push("CoinGecko a renvoyé une liste vide.");
-  } catch (err: any) {
+    if (!raw.length) throw new Error("CoinGecko empty list");
+  } catch {
     source = "fallback";
-    warnings.push(`Source principale indisponible: ${err?.message || "unknown"}`);
     raw = fallbackMarkets();
   }
 
-  const normalized: ScanAsset[] = raw
+  // PREVIOUS snapshot for score delta
+  const prev = !noStore ? memCache.get(key)?.data : undefined;
+
+  // NORMALIZE -> compute
+  const computedBase: Omit<ScanAsset, "score_delta" | "score_trend">[] = raw
     .map((x) => {
-      const id = cleanStr(x?.id) || "";
+      const id = safeString(x?.id) || "";
       const symbol = normalizeSymbol(x?.symbol) || "";
+      if (!id || !symbol) return null;
+
       const name = normalizeName({ name: x?.name, id: x?.id, symbol: x?.symbol });
 
       const price = toNum(x?.current_price) ?? 0;
@@ -510,98 +453,47 @@ export async function GET(req: Request) {
       const marketCap = toNum(x?.market_cap ?? undefined);
       const volume24 = toNum(x?.total_volume ?? undefined);
 
-      if (!id || !symbol) return null;
-
       const regime = normalizeRegime(chg24);
-
-      const { score, label, reason } = computeConfidenceScore({
-        chg24,
-        volume24h: volume24,
-        marketCap,
-        regime,
-        discipline,
-      });
+      const confidence_score = computeConfidenceScore({ chg24, volume24h: volume24, marketCap, regime });
 
       const binance_url = buildBinanceUrl(symbol);
-      const affiliate_url = buildAffiliateUrl(binance_url) ?? undefined;
+      const affiliate_url = buildAffiliateUrl(binance_url);
 
-      const asset: ScanAsset = {
+      return {
         id,
         symbol,
         name,
         price,
         chg_24h_pct: chg24,
-        market_cap: marketCap,
-        volume_24h: volume24,
+        timeframe: "H24" as const,
+        confidence_score,
         regime,
-        confidence_score: score,
-        confidence_label: label,
-        confidence_reason: reason,
         binance_url,
         affiliate_url,
       };
-
-      return asset;
     })
-    .filter((x): x is ScanAsset => Boolean(x));
+    .filter((x): x is Omit<ScanAsset, "score_delta" | "score_trend"> => Boolean(x));
 
-  if (!normalized.length) {
-    const response: ApiResponse = {
-      ok: false,
-      ts,
-      source,
-      market,
-      quote,
-      count: 0,
-      data: [],
-      meta: {
-        sorted_by: sort,
-        limit,
-        discipline,
-        cache: noStore ? "no-store" : "miss",
-        generated_at: ts,
-        warnings: ["Aucun actif n’a pu être normalisé. Vérifie la source et le mapping."],
-        fetch_size: fetchSize,
-        cache_ttl_sec: ttlSec,
-        no_store: noStore,
-        discipline_mode: discipline ? "ON" : "OFF",
-      },
-    };
-
-    // status utile pour debug (front le gère)
-    const status = source === "fallback" ? 502 : 500;
-
-    return NextResponse.json(response, { status, headers: { "cache-control": "no-store" } });
-  }
-
-  const sorted = sortAssets(normalized, sort);
-
-  if (!noStore) {
-    setCache(key, { ts: Date.now(), data: sorted, source, fetchSize });
-  }
-
+  // APPLY sort + limit
+  // First add delta/trend based on previous snapshot (same key)
+  const withDelta = makeDelta(prev, computedBase);
+  const sorted = sortAssets(withDelta, sort);
   const paged = sorted.slice(0, limit);
+
+  // SAVE cache
+  if (!noStore) {
+    setCache(key, { ts: Date.now(), data: paged, source });
+  }
 
   const response: ApiResponse = {
     ok: true,
     ts,
-    source,
-    market,
+    source: noStore ? source : source,
+    market: "crypto",
     quote,
     count: paged.length,
     data: paged,
-    meta: {
-      sorted_by: sort,
-      limit,
-      discipline,
-      cache: noStore ? "no-store" : "miss",
-      generated_at: ts,
-      warnings: warnings.length ? warnings : undefined,
-      fetch_size: fetchSize,
-      cache_ttl_sec: ttlSec,
-      no_store: noStore,
-      discipline_mode: discipline ? "ON" : "OFF",
-    },
+    meta: { sorted_by: sort, limit, cache: noStore ? "no-store" : "miss" },
   };
 
   return NextResponse.json(response, { status: 200, headers: { "cache-control": "no-store" } });
