@@ -1,209 +1,182 @@
 // app/api/scan/route.ts
-import { NextResponse } from "next/server";
+import { NextResponse } from 'next/server';
 
-export const runtime = "nodejs"; // ou "edge" si ton code est compatible
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
-type Regime = "STABLE" | "TRANSITION" | "VOLATILE" | string;
+type Regime = 'STABLE' | 'TRANSITION' | 'VOLATILE' | string;
 
-type ScanAsset = {
-  id: string;
-  symbol: string;
-  name: string;
+export type ScanAsset = {
+  id?: string;
+  symbol?: string;
+  name?: string;
 
-  // lecture H24
-  timeframe: "H24";
-  price: number | null;
-  chg_24h_pct: number | null;
+  price?: number | null;
+  chg_24h_pct?: number | null;
 
-  // score
-  confidence_score: number | null; // 0-100
-  regime: Regime;
+  confidence_score?: number | null;
+  confidence_label?: string | null;
+  confidence_reason?: string | null;
 
-  // deltas optionnels (si tu as une base historique)
-  score_delta: number | null;
-  score_trend: "up" | "down" | "flat" | null;
+  regime?: Regime | null;
 
-  // liens (NE JAMAIS reconstruire côté UI)
-  binance_url: string | null;
-  affiliate_url: string | null;
+  // liens fournis (NE PAS reconstruire côté UI)
+  binance_url?: string | null;
+  affiliate_url?: string | null;
 
-  // optionnels
-  market_cap: number | null;
-  volume_24h: number | null;
+  // extras éventuels
+  market_cap?: number | null;
+  volume_24h?: number | null;
+
+  // optionnels (si tu les ajoutes plus tard)
+  score_delta?: number | null; // variation du score vs précédente exécution
+  score_trend?: 'up' | 'down' | 'flat' | null;
 };
 
 type ScanResponse = {
   ok: boolean;
   ts: string;
+  source: string;
+  market: string;
+  quote: string;
   count: number;
   data: ScanAsset[];
   error?: string;
   message?: string;
 };
 
-// ---------------------------
-// Helpers (0 undefined)
-// ---------------------------
-function safeString(v: unknown): string | null {
-  if (typeof v !== "string") return null;
+function asNullableNumber(v: unknown): number | null {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+
+function asNullableString(v: unknown): string | null {
+  if (typeof v !== 'string') return null;
   const s = v.trim();
   return s.length ? s : null;
 }
 
-function safeNumber(v: unknown): number | null {
-  if (typeof v !== "number") return null;
-  if (!Number.isFinite(v)) return null;
-  return v;
+function toUpperSymbol(v: unknown): string | null {
+  const s = asNullableString(v);
+  return s ? s.toUpperCase() : null;
 }
 
 function clampInt(n: number, min: number, max: number) {
-  const x = Math.trunc(n);
-  return Math.max(min, Math.min(max, x));
+  return Math.max(min, Math.min(max, Math.trunc(n)));
 }
 
-function normalizeSymbol(v: unknown): string | null {
-  const s = safeString(v);
-  if (!s) return null;
-  // nettoie: garde lettres/chiffres/._- et upper
-  const cleaned = s.replace(/[^a-zA-Z0-9._-]/g, "").toUpperCase();
-  return cleaned.length ? cleaned : null;
+function parseIntSafe(v: string | null, fallback: number, min: number, max: number) {
+  const n = v ? Number(v) : NaN;
+  if (!Number.isFinite(n)) return fallback;
+  return clampInt(n, min, max);
 }
 
-function toRegime(v: unknown): Regime {
-  const s = safeString(v);
-  if (!s) return "STABLE";
-  const u = s.toUpperCase();
-  if (u === "STABLE" || u === "TRANSITION" || u === "VOLATILE") return u;
-  return u; // fallback string
+function normalizeAsset(raw: any): ScanAsset {
+  // IMPORTANT : toujours renvoyer null (pas undefined) pour les champs "nullable"
+  const asset: ScanAsset = {
+    id: asNullableString(raw?.id) ?? undefined,
+    symbol: toUpperSymbol(raw?.symbol) ?? undefined,
+    name: asNullableString(raw?.name) ?? undefined,
+
+    price: asNullableNumber(raw?.price),
+    chg_24h_pct: asNullableNumber(raw?.chg_24h_pct),
+
+    confidence_score: asNullableNumber(raw?.confidence_score),
+    confidence_label: asNullableString(raw?.confidence_label),
+    confidence_reason: asNullableString(raw?.confidence_reason),
+
+    regime: (asNullableString(raw?.regime) ?? null) as Regime | null,
+
+    binance_url: asNullableString(raw?.binance_url),
+    affiliate_url: asNullableString(raw?.affiliate_url),
+
+    market_cap: asNullableNumber(raw?.market_cap),
+    volume_24h: asNullableNumber(raw?.volume_24h),
+
+    score_delta: asNullableNumber(raw?.score_delta),
+    score_trend:
+      raw?.score_trend === 'up' || raw?.score_trend === 'down' || raw?.score_trend === 'flat'
+        ? raw.score_trend
+        : null,
+  };
+
+  // Petite sécurité : si symbol absent, on tente id
+  if (!asset.symbol && asset.id) asset.symbol = asset.id.toUpperCase();
+
+  return asset;
 }
 
-function parseSort(v: string | null): "score_desc" | "score_asc" | "price_desc" | "price_asc" {
-  if (!v) return "score_desc";
-  const s = v.toLowerCase();
-  if (s === "score_asc") return "score_asc";
-  if (s === "price_desc") return "price_desc";
-  if (s === "price_asc") return "price_asc";
-  return "score_desc";
-}
-
-function sortAssets(list: ScanAsset[], sort: ReturnType<typeof parseSort>) {
-  const byScore = (a: ScanAsset) => (a.confidence_score ?? -1);
-  const byPrice = (a: ScanAsset) => (a.price ?? -1);
-
-  if (sort === "score_asc") return list.sort((a, b) => byScore(a) - byScore(b));
-  if (sort === "price_desc") return list.sort((a, b) => byPrice(b) - byPrice(a));
-  if (sort === "price_asc") return list.sort((a, b) => byPrice(a) - byPrice(b));
-  return list.sort((a, b) => byScore(b) - byScore(a));
-}
-
-// ---------------------------
-// Source des données
-// ⚠️ Remplace ce fetch par TON pipeline réel
-// (KV, CoinGecko, Binance, etc.)
-// ---------------------------
+/**
+ * 🔌 BRANCHE ICI ton pipeline actuel
+ * - soit tu lis depuis KV / fichier / DB
+ * - soit tu appelles ton “engine”
+ *
+ * Doit retourner un tableau brut (any[]), ensuite normalisé.
+ */
 async function getRawUniverse(): Promise<any[]> {
-  // Exemple: si tu as déjà un endpoint interne / fichier / KV.
-  // Ici, on renvoie [] par défaut pour éviter de casser le build.
+  // ✅ Par défaut, on ne casse jamais le build : retourne [] si rien.
+  // Remplace cette partie par ton vrai générateur.
   return [];
 }
 
-// ---------------------------
-// Route
-// ---------------------------
-export async function GET(req: Request) {
-  const url = new URL(req.url);
+function sortAssets(data: ScanAsset[], sortKey: string): ScanAsset[] {
+  const copy = [...data];
 
-  const limitParam = safeString(url.searchParams.get("limit"));
-  const sortParam = safeString(url.searchParams.get("sort"));
+  if (sortKey === 'price_asc') {
+    copy.sort((a, b) => (a.price ?? -Infinity) - (b.price ?? -Infinity));
+    return copy;
+  }
+  if (sortKey === 'price_desc') {
+    copy.sort((a, b) => (b.price ?? -Infinity) - (a.price ?? -Infinity));
+    return copy;
+  }
+  if (sortKey === 'score_asc') {
+    copy.sort((a, b) => (a.confidence_score ?? -Infinity) - (b.confidence_score ?? -Infinity));
+    return copy;
+  }
 
-  const limit = clampInt(Number(limitParam ?? "250"), 1, 1000);
-  const sort = parseSort(sortParam);
+  // default: score desc
+  copy.sort((a, b) => (b.confidence_score ?? -Infinity) - (a.confidence_score ?? -Infinity));
+  return copy;
+}
+
+export async function GET(request: Request) {
+  const url = new URL(request.url);
+  const limit = parseIntSafe(url.searchParams.get('limit'), 200, 1, 500);
+
+  // ✅ tes filtres actuels: Prix/Score asc/desc
+  const sort = asNullableString(url.searchParams.get('sort')) ?? 'score_desc';
 
   try {
     const raw = await getRawUniverse();
+    const normalized = (Array.isArray(raw) ? raw : []).map(normalizeAsset);
 
-    // NORMALIZE -> 0 undefined -> filtrage des null
-    const normalized: ScanAsset[] = raw
-      .map((x): ScanAsset | null => {
-        const symbol = normalizeSymbol(x?.symbol);
-        if (!symbol) return null;
+    const sorted = sortAssets(normalized, sort);
 
-        const id = safeString(x?.id) ?? symbol;
-        const name = safeString(x?.name) ?? symbol;
-
-        const confidenceScore = safeNumber(x?.confidence_score);
-        const confidence_score = confidenceScore !== null ? clampInt(confidenceScore, 0, 100) : null;
-
-        // Si tu as une base historique : calcule score_delta ici.
-        // Sinon: null (propre, TS-safe)
-        const score_delta = safeNumber(x?.score_delta);
-        const scoreDelta = score_delta !== null ? Math.trunc(score_delta) : null;
-
-        let score_trend: ScanAsset["score_trend"] = null;
-        if (scoreDelta !== null) {
-          if (scoreDelta > 0) score_trend = "up";
-          else if (scoreDelta < 0) score_trend = "down";
-          else score_trend = "flat";
-        }
-
-        return {
-          id,
-          symbol,
-          name,
-
-          timeframe: "H24",
-          price: safeNumber(x?.price),
-          chg_24h_pct: safeNumber(x?.chg_24h_pct),
-
-          confidence_score,
-          regime: toRegime(x?.regime),
-
-          score_delta: scoreDelta,
-          score_trend,
-
-          // IMPORTANT: jamais undefined
-          binance_url: safeString(x?.binance_url) ?? null,
-          affiliate_url: safeString(x?.affiliate_url) ?? null,
-
-          market_cap: safeNumber(x?.market_cap),
-          volume_24h: safeNumber(x?.volume_24h),
-        };
-      })
-      .filter((a): a is ScanAsset => a !== null);
-
-    // tri
-    sortAssets(normalized, sort);
-
-    // limit (côté backend seulement)
-    const data = normalized.slice(0, limit);
+    const sliced = sorted.slice(0, limit);
 
     const res: ScanResponse = {
       ok: true,
       ts: new Date().toISOString(),
-      count: data.length,
-      data,
+      source: 'scan',
+      market: 'crypto',
+      quote: 'USD',
+      count: sliced.length,
+      data: sliced,
     };
 
-    return NextResponse.json(res, {
-      status: 200,
-      headers: {
-        "Cache-Control": "no-store",
-      },
-    });
+    return NextResponse.json(res, { status: 200 });
   } catch (e: any) {
     const res: ScanResponse = {
       ok: false,
       ts: new Date().toISOString(),
+      source: 'scan',
+      market: 'crypto',
+      quote: 'USD',
       count: 0,
       data: [],
-      error: e?.message ? String(e.message) : "Erreur inconnue",
+      error: e?.message ? String(e.message) : 'Scan failed',
     };
 
-    return NextResponse.json(res, {
-      status: 500,
-      headers: {
-        "Cache-Control": "no-store",
-      },
-    });
+    return NextResponse.json(res, { status: 500 });
   }
 }

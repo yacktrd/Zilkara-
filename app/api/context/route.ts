@@ -1,251 +1,114 @@
 // app/api/context/route.ts
-import { NextResponse } from "next/server";
+import { NextResponse } from 'next/server';
 
-type Regime = "STABLE" | "TRANSITION" | "VOLATILE";
-
-type ScanAsset = {
-  id?: string;
-  symbol?: string;
-  name?: string;
-  price?: number;
-  chg_24h_pct?: number;
-  regime?: Regime | string;
-  confidence_score?: number;
-};
-
-type ScanResponse = {
-  ok?: boolean;
-  ts?: string;
-  market?: string;
-  quote?: string;
-  count?: number;
-  data?: ScanAsset[];
-  items?: ScanAsset[]; // tolère ton ancien format
-  error?: string;
-  message?: string;
-  meta?: any;
-};
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
 type ContextResponse = {
   ok: boolean;
   ts: string;
-  source: "scan" | "fallback";
-  market: "crypto";
-  quote: "usd";
-  market_regime: Regime;
-  confidence_global: number; // 0-100
-  stable_ratio: number; // 0-1
-  transition_ratio: number; // 0-1
-  volatile_ratio: number; // 0-1
-  meta: {
-    scan_url?: string;
-    scan_count?: number;
-    generated_at: string;
-    cache: "no-store";
-  };
+  market_regime?: string | null;
+  confidence_global?: number | null; // 0-100
+  stable_ratio?: number | null;
+  transition_ratio?: number | null;
+  volatile_ratio?: number | null;
+  message?: string | null;
   error?: string;
 };
 
-function clamp(n: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, n));
+function clampInt(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, Math.trunc(n)));
 }
 
-function toNum(v: any, fallback = 0): number {
-  const n = typeof v === "number" ? v : Number(v);
-  return Number.isFinite(n) ? n : fallback;
+function asNullableNumber(v: unknown): number | null {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
 }
 
-function normalizeRegime(v: any): Regime {
-  const s = String(v ?? "").toUpperCase().trim();
-  if (s === "STABLE") return "STABLE";
-  if (s === "TRANSITION") return "TRANSITION";
-  if (s === "VOLATILE") return "VOLATILE";
-  return "TRANSITION";
+function upperRegime(v: unknown): 'STABLE' | 'TRANSITION' | 'VOLATILE' | null {
+  const s = typeof v === 'string' ? v.trim().toUpperCase() : '';
+  if (s === 'STABLE' || s === 'TRANSITION' || s === 'VOLATILE') return s;
+  return null;
 }
 
-function safeJson<T>(v: any, fallback: T): T {
-  try {
-    return v as T;
-  } catch {
-    return fallback;
-  }
-}
-
-async function fetchWithTimeout(url: string, timeoutMs: number) {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, {
-      method: "GET",
-      headers: { accept: "application/json" },
-      cache: "no-store",
-      signal: controller.signal,
-    });
-    return res;
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-function computeContextFromAssets(assets: ScanAsset[]) {
-  const total = assets.length;
-
-  if (!total) {
-    return {
-      market_regime: "TRANSITION" as Regime,
-      confidence_global: 0,
-      stable_ratio: 0,
-      transition_ratio: 0,
-      volatile_ratio: 0,
-    };
-  }
-
-  let stable = 0;
-  let transition = 0;
-  let volatile = 0;
-
-  let sumScore = 0;
-  let scoreCount = 0;
-
-  for (const a of assets) {
-    const r = normalizeRegime(a.regime);
-    if (r === "STABLE") stable++;
-    else if (r === "VOLATILE") volatile++;
-    else transition++;
-
-    const s = toNum(a.confidence_score, NaN);
-    if (Number.isFinite(s)) {
-      sumScore += clamp(s, 0, 100);
-      scoreCount++;
-    }
-  }
-
-  const stable_ratio = stable / total;
-  const transition_ratio = transition / total;
-  const volatile_ratio = volatile / total;
-
-  // moyenne des scores (fallback = 0 si aucun score)
-  const confidence_global =
-    scoreCount > 0 ? Math.round(sumScore / scoreCount) : 0;
-
-  // régime global = majorité
-  let market_regime: Regime = "TRANSITION";
-  if (stable_ratio >= transition_ratio && stable_ratio >= volatile_ratio) {
-    market_regime = "STABLE";
-  } else if (
-    volatile_ratio >= stable_ratio &&
-    volatile_ratio >= transition_ratio
-  ) {
-    market_regime = "VOLATILE";
-  } else {
-    market_regime = "TRANSITION";
-  }
-
-  return {
-    market_regime,
-    confidence_global: clamp(confidence_global, 0, 100),
-    stable_ratio: clamp(stable_ratio, 0, 1),
-    transition_ratio: clamp(transition_ratio, 0, 1),
-    volatile_ratio: clamp(volatile_ratio, 0, 1),
-  };
-}
-
-export async function GET(req: Request) {
+export async function GET(request: Request) {
   const ts = new Date().toISOString();
 
-  // V1: contexte calculé depuis /api/scan côté serveur
-  // -> pas dépendant du front
-  const baseUrl = new URL(req.url);
-  const origin = baseUrl.origin;
-
-  // On prend assez large pour que les ratios soient représentatifs
-  const scanUrl = `${origin}/api/scan?limit=200&sort=confidence_score_desc`;
-
   try {
-    const res = await fetchWithTimeout(scanUrl, 8000);
+    // ✅ IMPORTANT : fetch interne via origin courant (évite 401 dû à Deployment Protection / domaine hardcodé)
+    const origin = new URL(request.url).origin;
 
-    if (!res.ok) {
-      const out: ContextResponse = {
+    const scanUrl = new URL('/api/scan', origin);
+    scanUrl.searchParams.set('limit', '250');
+    scanUrl.searchParams.set('sort', 'score_desc');
+
+    const scanRes = await fetch(scanUrl.toString(), { cache: 'no-store' });
+
+    if (!scanRes.ok) {
+      const txt = await scanRes.text().catch(() => '');
+      const res: ContextResponse = {
         ok: false,
         ts,
-        source: "fallback",
-        market: "crypto",
-        quote: "usd",
-        market_regime: "TRANSITION",
-        confidence_global: 0,
-        stable_ratio: 0,
-        transition_ratio: 0,
-        volatile_ratio: 0,
-        meta: {
-          scan_url: scanUrl,
-          scan_count: 0,
-          generated_at: ts,
-          cache: "no-store",
-        },
-        error: `Context fetch failed (scan status ${res.status})`,
+        error: `Context: scan failed (HTTP ${scanRes.status})${txt ? ` — ${txt}` : ''}`,
       };
-
-      return NextResponse.json(out, {
-        status: 500,
-        headers: { "Cache-Control": "no-store" },
-      });
+      return NextResponse.json(res, { status: 200 }); // 200 pour ne pas casser l’UI, mais ok:false
     }
 
-    const json = safeJson<ScanResponse>(await res.json(), {});
-    const list = Array.isArray(json.data)
-      ? json.data
-      : Array.isArray(json.items)
-      ? json.items
-      : [];
+    const scanJson = await scanRes.json();
 
-    const computed = computeContextFromAssets(list);
+    // scanJson.data attendu: array
+    const data: any[] = Array.isArray(scanJson?.data) ? scanJson.data : [];
 
-    const out: ContextResponse = {
+    // ratios par régime
+    let stable = 0;
+    let transition = 0;
+    let volatile = 0;
+
+    for (const a of data) {
+      const r = upperRegime(a?.regime);
+      if (r === 'STABLE') stable++;
+      else if (r === 'TRANSITION') transition++;
+      else if (r === 'VOLATILE') volatile++;
+    }
+
+    const total = data.length || 1;
+    const stable_ratio = stable / total;
+    const transition_ratio = transition / total;
+    const volatile_ratio = volatile / total;
+
+    // confiance globale simple : moyenne des confidence_score (si présent)
+    const scores = data
+      .map((a) => asNullableNumber(a?.confidence_score))
+      .filter((x): x is number => x != null);
+
+    const avg = scores.length ? scores.reduce((s, n) => s + n, 0) / scores.length : null;
+    const confidence_global = avg != null ? clampInt(avg, 0, 100) : null;
+
+    // marché = régime dominant
+    const market_regime =
+      stable >= transition && stable >= volatile
+        ? 'STABLE'
+        : transition >= stable && transition >= volatile
+        ? 'TRANSITION'
+        : 'VOLATILE';
+
+    const res: ContextResponse = {
       ok: true,
       ts,
-      source: "scan",
-      market: "crypto",
-      quote: "usd",
-      ...computed,
-      meta: {
-        scan_url: scanUrl,
-        scan_count: list.length,
-        generated_at: ts,
-        cache: "no-store",
-      },
+      market_regime,
+      confidence_global,
+      stable_ratio: Number.isFinite(stable_ratio) ? stable_ratio : null,
+      transition_ratio: Number.isFinite(transition_ratio) ? transition_ratio : null,
+      volatile_ratio: Number.isFinite(volatile_ratio) ? volatile_ratio : null,
+      message: null,
     };
 
-    return NextResponse.json(out, {
-      headers: { "Cache-Control": "no-store" },
-    });
-  } catch (err: any) {
-    const out: ContextResponse = {
+    return NextResponse.json(res, { status: 200 });
+  } catch (e: any) {
+    const res: ContextResponse = {
       ok: false,
       ts,
-      source: "fallback",
-      market: "crypto",
-      quote: "usd",
-      market_regime: "TRANSITION",
-      confidence_global: 0,
-      stable_ratio: 0,
-      transition_ratio: 0,
-      volatile_ratio: 0,
-      meta: {
-        scan_url: scanUrl,
-        scan_count: 0,
-        generated_at: ts,
-        cache: "no-store",
-      },
-      error:
-        err?.name === "AbortError"
-          ? "Context fetch timeout (scan)"
-          : "Context computation failed",
+      error: e?.message ? String(e.message) : 'Context failed',
     };
-
-    return NextResponse.json(out, {
-      status: 500,
-      headers: { "Cache-Control": "no-store" },
-    });
+    return NextResponse.json(res, { status: 200 }); // 200 ok:false pour UI stable
   }
 }
-
