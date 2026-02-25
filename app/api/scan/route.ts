@@ -355,18 +355,21 @@ function setCache(key: string, entry: CacheEntry) {
   memCache.set(key, entry);
 }
 
+function makeDelta(
+  prev: ScanAsset[] | undefined,
+  curr: Omit<ScanAsset, "score_delta" | "score_trend">[]
+): ScanAsset[] {
+  const prevMap = new Map<string, number>();
+
   if (prev) {
-    prev.forEach((a) => {
-      if (typeof a.confidence_score === "number") {
-        prevMap.set(a.id, a.confidence_score);
-      }
-    });
+    for (const asset of prev) {
+      prevMap.set(asset.id, asset.confidence_score);
+    }
   }
 
   return curr.map((a) => {
     const previousScore = prevMap.get(a.id);
 
-    // Si pas d'historique → delta = 0 (jamais null)
     const delta =
       typeof previousScore === "number"
         ? a.confidence_score - previousScore
