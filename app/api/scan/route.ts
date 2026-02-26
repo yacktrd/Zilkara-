@@ -2,22 +2,26 @@
 import { NextResponse } from 'next/server';
 
 /**
- * ZILKARA — /api/scan (V1 robuste + prêt pour V2)
- * Objectifs :
- * - Réponse stable, typée, lisible côté UI
- * - Fallback garanti (6 actifs) si pipeline vide / en panne
- * - Paramètres: market, quote, sort, order, limit
- * - Prépare les prochains besoins: CoinGecko / KV / score engine / deltas
+ * ZILKARA /api/scan
+ * Objectifs (prod-ready):
+ * - Réponse stable (schéma JSON constant)
+ * - Typage strict (pas de undefined non prévu)
+ * - Fallback garanti (même si provider down)
+ * - Cache serveur + "last good snapshot"
+ * - Prépare les besoins futurs (tri, limite, filtre, score_delta/trend)
  */
 
-export const runtime = 'nodejs';
-export const dynamic = 'force-dynamic';
+/* ----------------------------- Types ----------------------------- */
 
-type Market = 'crypto' | string;
-type Quote = 'USD' | 'USDT' | 'EUR' | string;
+type Regime = 'STABLE' | 'TRANSITION' | 'VOLATILE';
 
-type Regime = 'STABLE' | 'TRANSITION' | 'VOLATILE' | string;
-type ScoreTrend = 'up' | 'down' | null;
+type Market = 'crypto';
+type Quote = 'USD' | 'USDT' | 'EUR';
+
+type SortKey = 'score' | 'price';
+type SortDir = 'asc' | 'desc';
+
+type Trend = 'up' | 'down' | null;
 
 export type ScanAsset = {
   id: string;
@@ -28,115 +32,289 @@ export type ScanAsset = {
   chg_24h_pct: number | null;
 
   confidence_score: number | null;
-  regime: Regime | null;
+  regime: Regime;
 
-  // liens (UI peut rendre tout le bloc cliquable)
   binance_url: string | null;
   affiliate_url: string | null;
 
-  // optionnels (V2+)
   market_cap: number | null;
   volume_24h: number | null;
 
-  // UI helpers (optionnels)
+  // UI helpers
   score_delta: number | null;
-  score_trend: ScoreTrend;
+  score_trend: Trend;
 };
 
 export type ScanResponse = {
   ok: boolean;
   ts: string;
 
-  source: 'scan' | 'fallback';
+  source: 'provider' | 'cache' | 'fallback';
   market: Market;
   quote: Quote;
 
   count: number;
   data: ScanAsset[];
 
-  // Contexte global (header)
-  market_regime: Regime;
-  confidence_global: number | null;
-  stable_ratio: number;
-  transition_ratio: number;
-  volatile_ratio: number;
-
   message: string | null;
   error?: string;
 };
+
+/* ----------------------------- Utils ----------------------------- */
 
 const NOW_ISO = () => new Date().toISOString();
 
 const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, n));
 
-const safeNum = (v: unknown): number | null =>
-  typeof v === 'number' && Number.isFinite(v) ? v : null;
-
-const safeStr = (v: unknown): string | null =>
+const isFiniteNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+const asNum = (v: unknown): number | null => (isFiniteNum(v) ? v : null);
+const asStr = (v: unknown): string | null =>
   typeof v === 'string' && v.trim().length > 0 ? v.trim() : null;
 
-const sanitizeSymbol = (s: string) =>
-  s
-    .toUpperCase()
-    .replace(/[^A-Z0-9]/g, '')
-    .slice(0, 20);
+function parseMarket(v: string | null): Market {
+  // extensible plus tard (stocks, etc.)
+  return 'crypto';
+}
 
-const normalizeQuote = (q: string): Quote => {
-  const up = q.toUpperCase();
-  if (up === 'USD' || up === 'USDT' || up === 'EUR') return up;
-  return up;
-};
+function parseQuote(v: string | null): Quote {
+  const q = (v ?? 'USD').toUpperCase();
+  if (q === 'EUR') return 'EUR';
+  if (q === 'USDT') return 'USDT';
+  return 'USD';
+}
 
-const normalizeMarket = (m: string): Market => (m || 'crypto').toLowerCase();
+function parseSortKey(v: string | null): SortKey {
+  const k = (v ?? 'score').toLowerCase();
+  if (k === 'price') return 'price';
+  return 'score';
+}
 
-const normalizeSort = (s: string): 'score' | 'price' => {
-  const v = (s || 'score').toLowerCase();
-  return v === 'price' ? 'price' : 'score';
-};
+function parseSortDir(v: string | null): SortDir {
+  const d = (v ?? 'desc').toLowerCase();
+  if (d === 'asc') return 'asc';
+  return 'desc';
+}
 
-const normalizeOrder = (o: string): 'asc' | 'desc' => {
-  const v = (o || 'desc').toLowerCase();
-  return v === 'asc' ? 'asc' : 'desc';
-};
-
-const parseLimit = (v: string | null): number => {
-  const n = Number(v);
+function parseLimit(v: string | null): number {
+  const n = Number(v ?? 6);
   if (!Number.isFinite(n)) return 6;
-  return clamp(Math.trunc(n), 1, 200);
-};
+  return clamp(Math.trunc(n), 1, 50);
+}
 
-/** Binance */
-function toBinancePair(base: string, quote: Quote) {
-  // Pour V1: si quote = USD, on map en USDT (Binance spot)
-  const q = quote === 'USD' ? 'USDT' : quote;
-  return `${sanitizeSymbol(base)}${String(q).toUpperCase()}`;
+function parseRegimeFilter(v: string | null): Regime | 'ALL' {
+  const r = (v ?? 'ALL').toUpperCase();
+  if (r === 'STABLE') return 'STABLE';
+  if (r === 'TRANSITION') return 'TRANSITION';
+  if (r === 'VOLATILE') return 'VOLATILE';
+  return 'ALL';
+}
+
+/* ----------------------------- Links ----------------------------- */
+
+// Binance (stable): utiliser USDT en quote par défaut si USD demandé.
+function normalizeQuoteForBinance(quote: Quote): 'USDT' | 'EUR' {
+  if (quote === 'EUR') return 'EUR';
+  return 'USDT';
+}
+
+function toBinanceSymbol(baseSymbol: string, quote: Quote) {
+  const q = normalizeQuoteForBinance(quote);
+  return `${baseSymbol.toUpperCase()}${q}`;
 }
 
 function makeBinanceUrls(symbol: string, quote: Quote) {
-  const pair = toBinancePair(symbol, quote);
+  const pair = toBinanceSymbol(symbol, quote);
 
-  // URL “trade” (spot)
+  // Spot trade page
   const binance_url = `https://www.binance.com/en/trade/${pair}`;
 
-  // Affiliate ref (env)
-  const ref = process.env.BINANCE_REF?.trim();
-  const affiliate_url = ref ? `https://www.binance.com/en/trade/${pair}?ref=${encodeURIComponent(ref)}` : binance_url;
+  // Affiliate (placeholder). Remplace YOUR_REF par ton code.
+  // (Tu peux aussi le mettre en env plus tard.)
+  const affiliate_url = `https://www.binance.com/en/trade/${pair}?ref=YOUR_REF`;
 
   return { binance_url, affiliate_url };
 }
 
+/* ----------------------------- Confidence Engine (V1 stable) ----------------------------- */
 /**
- * Fallback: univers minimal (6 blocs visibles)
- * IMPORTANT: sert à valider l’UI et éviter "aucun résultat" en V1.
+ * V1 simple, robuste, déterministe.
+ * - Base 50
+ * - Bonus market cap (log scale)
+ * - Pénalité volatilité forte (|chg| élevé) car "risque"
+ * - Bonus léger si volume élevé (liquidité)
+ *
+ * (Tu pourras swapper ce bloc par ton moteur plus tard sans casser l’API)
  */
+function computeRegime(chg24: number | null): Regime {
+  if (chg24 === null) return 'TRANSITION';
+  const a = Math.abs(chg24);
+  if (a < 1) return 'STABLE';
+  if (a > 4) return 'VOLATILE';
+  return 'TRANSITION';
+}
+
+function computeConfidenceScore(params: {
+  chg24: number | null;
+  marketCap: number | null;
+  volume24: number | null;
+}): number | null {
+  const { chg24, marketCap, volume24 } = params;
+
+  // Si rien, score neutre mais exploitable
+  let score = 50;
+
+  // Market cap: log10(cap) ~ 6..12+ => bonus 0..20
+  if (marketCap !== null && marketCap > 0) {
+    const bonusCap = clamp(Math.log10(marketCap) - 6, 0, 20);
+    score += bonusCap;
+  }
+
+  // Volume: bonus 0..10
+  if (volume24 !== null && volume24 > 0) {
+    const bonusVol = clamp(Math.log10(volume24) - 5, 0, 10);
+    score += bonusVol;
+  }
+
+  // Volatilité (risque): pénalité 0..25
+  if (chg24 !== null) {
+    const penalty = clamp(Math.abs(chg24) * 4, 0, 25);
+    score -= penalty;
+  }
+
+  return clamp(Math.round(score), 0, 100);
+}
+
+/* ----------------------------- Provider (CoinGecko) ----------------------------- */
+
+type ProviderCoinGecko = {
+  id?: unknown;
+  symbol?: unknown;
+  name?: unknown;
+  current_price?: unknown;
+  price_change_percentage_24h?: unknown;
+  market_cap?: unknown;
+  total_volume?: unknown;
+};
+
+function coinGeckoUrl(vs: Quote) {
+  // CoinGecko vs_currency: "usd", "eur"
+  const vc = vs === 'EUR' ? 'eur' : 'usd';
+
+  const url = new URL('https://api.coingecko.com/api/v3/coins/markets');
+  url.searchParams.set('vs_currency', vc);
+  url.searchParams.set('order', 'market_cap_desc');
+  url.searchParams.set('per_page', '50');
+  url.searchParams.set('page', '1');
+  url.searchParams.set('price_change_percentage', '24h');
+  return url.toString();
+}
+
+async function fetchCoinGecko(quote: Quote): Promise<ScanAsset[]> {
+  const url = coinGeckoUrl(quote);
+
+  const res = await fetch(url, {
+    headers: { Accept: 'application/json' },
+    cache: 'no-store',
+  });
+
+  if (!res.ok) throw new Error(`CoinGecko HTTP ${res.status}`);
+
+  const json = await res.json();
+  if (!Array.isArray(json)) throw new Error('CoinGecko invalid payload');
+
+  const assets: ScanAsset[] = json
+    .map((raw: ProviderCoinGecko) => {
+      const id = asStr(raw?.id);
+      const symbol = asStr(raw?.symbol)?.toUpperCase();
+      const name = asStr(raw?.name);
+
+      if (!id || !symbol || !name) return null;
+
+      const price = asNum(raw?.current_price);
+      const chg24 = asNum(raw?.price_change_percentage_24h);
+      const marketCap = asNum(raw?.market_cap);
+      const volume24 = asNum(raw?.total_volume);
+
+      const regime = computeRegime(chg24);
+      const confidence = computeConfidenceScore({ chg24, marketCap, volume24 });
+
+      const { binance_url, affiliate_url } = makeBinanceUrls(symbol, quote);
+
+      const a: ScanAsset = {
+        id,
+        symbol,
+        name,
+        price,
+        chg_24h_pct: chg24,
+
+        confidence_score: confidence,
+        regime,
+
+        binance_url,
+        affiliate_url,
+
+        market_cap: marketCap,
+        volume_24h: volume24,
+
+        score_delta: null,
+        score_trend: null,
+      };
+
+      return a;
+    })
+    .filter((x): x is ScanAsset => x !== null);
+
+  return assets;
+}
+
+/* ----------------------------- Cache + Snapshot ----------------------------- */
+
+type CacheEntry = {
+  ts: number;
+  data: ScanAsset[];
+};
+
+// 60s cache pour éviter rate limit
+const CACHE_TTL_MS = 60_000;
+
+// Cache mémoire (runtime server). Suffisant pour V1.
+let CACHE: CacheEntry | null = null;
+
+// Dernier snapshot "bon" (si provider down)
+let LAST_GOOD: CacheEntry | null = null;
+
+function withDeltaAndTrend(current: ScanAsset[], previous: ScanAsset[] | null): ScanAsset[] {
+  if (!previous || previous.length === 0) return current;
+
+  const prevMap = new Map<string, ScanAsset>();
+  for (const p of previous) prevMap.set(p.id, p);
+
+  return current.map((c) => {
+    const p = prevMap.get(c.id);
+    const cScore = c.confidence_score;
+    const pScore = p?.confidence_score ?? null;
+
+    if (cScore === null || pScore === null) {
+      return { ...c, score_delta: null, score_trend: null };
+    }
+
+    const delta = cScore - pScore;
+    const trend: Trend = delta > 0 ? 'up' : delta < 0 ? 'down' : null;
+
+    return { ...c, score_delta: delta, score_trend: trend };
+  });
+}
+
+/* ----------------------------- Fallback (UI stable 6 blocs) ----------------------------- */
+
 function fallbackUniverse(quote: Quote): ScanAsset[] {
   const base = [
-    { symbol: 'BTC', name: 'Bitcoin', price: 64456, chg: +0.03, score: 98, regime: 'STABLE' as Regime, delta: -1, trend: 'down' as const },
-    { symbol: 'USDT', name: 'Tether', price: 1.0, chg: +0.02, score: 95, regime: 'STABLE' as Regime, delta: -1, trend: 'down' as const },
-    { symbol: 'ETH', name: 'Ethereum', price: 1853, chg: +0.13, score: 92, regime: 'STABLE' as Regime, delta: +1, trend: 'up' as const },
-    { symbol: 'XRP', name: 'XRP', price: 1.36, chg: -0.34, score: 86, regime: 'TRANSITION' as Regime, delta: -1, trend: 'down' as const },
-    { symbol: 'BNB', name: 'BNB', price: 596.2, chg: +0.21, score: 89, regime: 'STABLE' as Regime, delta: -1, trend: 'down' as const },
-    { symbol: 'SOL', name: 'Solana', price: 149.07, chg: +3.42, score: 88, regime: 'VOLATILE' as Regime, delta: +1, trend: 'up' as const },
+    { symbol: 'BTC', name: 'Bitcoin', price: 64456, chg: +0.03, score: 98, regime: 'STABLE' as Regime },
+    { symbol: 'USDT', name: 'Tether', price: 1.0, chg: +0.02, score: 95, regime: 'STABLE' as Regime },
+    { symbol: 'ETH', name: 'Ethereum', price: 1853, chg: +0.13, score: 92, regime: 'STABLE' as Regime },
+    { symbol: 'XRP', name: 'XRP', price: 1.36, chg: -0.34, score: 86, regime: 'TRANSITION' as Regime },
+    { symbol: 'BNB', name: 'BNB', price: 596.2, chg: +0.21, score: 89, regime: 'STABLE' as Regime },
+    { symbol: 'SOL', name: 'Solana', price: 149.07, chg: +3.42, score: 88, regime: 'VOLATILE' as Regime },
   ];
 
   return base.map((x) => {
@@ -145,157 +323,45 @@ function fallbackUniverse(quote: Quote): ScanAsset[] {
       id: x.symbol,
       symbol: x.symbol,
       name: x.name,
-
       price: x.price,
       chg_24h_pct: x.chg,
-
       confidence_score: x.score,
       regime: x.regime,
-
       binance_url,
       affiliate_url,
-
       market_cap: null,
       volume_24h: null,
-
-      score_delta: x.delta,
-      score_trend: x.trend,
+      score_delta: null,
+      score_trend: null,
     };
   });
 }
 
-/**
- * V2/V3: brancher ici le vrai pipeline
- * - CoinGecko -> normalize()
- * - KV snapshot -> delta/trend
- * - Confidence Engine -> confidence_score + regime
- *
- * Pour V1: on renvoie [] => fallback automatique.
- */
+/* ----------------------------- Sorting / Filtering ----------------------------- */
 
-async function getRawUniverse(market: Market, quote: Quote): Promise<any[]> {
-  try {
-    if (market !== 'crypto') return [];
+function sortAssets(data: ScanAsset[], key: SortKey, dir: SortDir): ScanAsset[] {
+  const mul = dir === 'asc' ? 1 : -1;
 
-    const vs = quote === 'USD' ? 'usd' : quote.toLowerCase();
+  const get = (a: ScanAsset) => {
+    if (key === 'price') return a.price ?? -Infinity;
+    return a.confidence_score ?? -Infinity;
+  };
 
-    const url = new URL('https://api.coingecko.com/api/v3/coins/markets');
-    url.searchParams.set('vs_currency', vs);
-    url.searchParams.set('order', 'market_cap_desc');
-    url.searchParams.set('per_page', '50');
-    url.searchParams.set('page', '1');
-    url.searchParams.set('price_change_percentage', '24h');
-
-    const res = await fetch(url.toString(), {
-      method: 'GET',
-      headers: {
-        Accept: 'application/json',
-      },
-      next: { revalidate: 60 }, // cache 60s (propre pour Vercel)
-    });
-
-    if (!res.ok) return [];
-
-    const json = await res.json();
-
-    if (!Array.isArray(json)) return [];
-
-    return json.map((c: any) => {
-      const price = typeof c.current_price === 'number' ? c.current_price : null;
-      const chg = typeof c.price_change_percentage_24h === 'number'
-        ? c.price_change_percentage_24h
-        : null;
-
-      // Confidence V1 simple et stable
-      let score = 50;
-
-      if (chg !== null) {
-        score += clamp(chg * 3, -20, 20);
-      }
-
-      if (typeof c.market_cap === 'number') {
-        score += clamp(Math.log10(c.market_cap) - 6, 0, 20);
-      }
-
-      score = clamp(Math.round(score), 0, 100);
-
-      let regime: Regime = 'TRANSITION';
-      if (chg !== null) {
-        if (Math.abs(chg) < 1) regime = 'STABLE';
-        else if (Math.abs(chg) > 4) regime = 'VOLATILE';
-      }
-
-      return {
-        id: c.id,
-        symbol: c.symbol?.toUpperCase(),
-        name: c.name,
-        price,
-        chg_24h_pct: chg,
-        confidence_score: score,
-        regime,
-        market_cap: c.market_cap ?? null,
-        volume_24h: c.total_volume ?? null,
-      };
-    });
-  } catch {
-    return [];
-  }
-}
-
-/** Contexte global */
-function computeContext(data: ScanAsset[]) {
-  const total = data.length || 1;
-
-  let stable = 0;
-  let transition = 0;
-  let volatile = 0;
-
-  for (const a of data) {
-    const r = (a.regime || '').toUpperCase();
-    if (r === 'STABLE') stable++;
-    else if (r === 'TRANSITION') transition++;
-    else if (r === 'VOLATILE') volatile++;
-  }
-
-  const stable_ratio = stable / total;
-  const transition_ratio = transition / total;
-  const volatile_ratio = volatile / total;
-
-  // Règle simple et stable (V1)
-  let market_regime: Regime = 'TRANSITION';
-  const max = Math.max(stable_ratio, transition_ratio, volatile_ratio);
-  if (max === stable_ratio) market_regime = 'STABLE';
-  else if (max === volatile_ratio) market_regime = 'VOLATILE';
-
-  // Global confidence: moyenne des confidence_score valides (V1)
-  const scores = data.map((d) => d.confidence_score).filter((x): x is number => typeof x === 'number' && Number.isFinite(x));
-  const confidence_global =
-    scores.length > 0 ? Math.round((scores.reduce((a, b) => a + b, 0) / scores.length) * 10) / 10 : null;
-
-  return { market_regime, confidence_global, stable_ratio, transition_ratio, volatile_ratio };
-}
-
-/** Tri */
-function sortData(data: ScanAsset[], sort: 'score' | 'price', order: 'asc' | 'desc') {
-  const dir = order === 'asc' ? 1 : -1;
-
-  data.sort((a, b) => {
-    const av = sort === 'price' ? a.price : a.confidence_score;
-    const bv = sort === 'price' ? b.price : b.confidence_score;
-
-    const ax = typeof av === 'number' ? av : -Infinity;
-    const bx = typeof bv === 'number' ? bv : -Infinity;
-
-    if (ax === bx) {
-      // tie-breaker stable: score desc puis symbol
-      const as = a.confidence_score ?? -Infinity;
-      const bs = b.confidence_score ?? -Infinity;
-      if (as !== bs) return (bs - as) * dir;
-      return a.symbol.localeCompare(b.symbol);
-    }
-    return (ax - bx) * dir;
+  // tri stable: score desc par défaut
+  return [...data].sort((a, b) => {
+    const av = get(a);
+    const bv = get(b);
+    if (av === bv) return a.symbol.localeCompare(b.symbol);
+    return (av - bv) * mul;
   });
 }
+
+function filterAssets(data: ScanAsset[], regimeFilter: Regime | 'ALL'): ScanAsset[] {
+  if (regimeFilter === 'ALL') return data;
+  return data.filter((a) => a.regime === regimeFilter);
+}
+
+/* ----------------------------- Handler ----------------------------- */
 
 export async function GET(req: Request) {
   const ts = NOW_ISO();
@@ -303,84 +369,95 @@ export async function GET(req: Request) {
   try {
     const url = new URL(req.url);
 
-    const market = normalizeMarket(url.searchParams.get('market') || 'crypto');
-    const quote = normalizeQuote(url.searchParams.get('quote') || 'USD');
+    const market = parseMarket(url.searchParams.get('market'));
+    const quote = parseQuote(url.searchParams.get('quote'));
 
-    const sort = normalizeSort(url.searchParams.get('sort') || 'score');
-    const order = normalizeOrder(url.searchParams.get('order') || 'desc');
-    const limit = parseLimit(url.searchParams.get('limit'));
+    const sortKey = parseSortKey(url.searchParams.get('sort'));
+    const sortDir = parseSortDir(url.searchParams.get('dir'));
 
-    const q = safeStr(url.searchParams.get('q'))?.toLowerCase() ?? null;
+    const limit = parseLimit(url.searchParams.get('limit')); // 6 par défaut (UI)
+    const regimeFilter = parseRegimeFilter(url.searchParams.get('regime')); // ALL par défaut
 
-    const raw = await getRawUniverse(market, quote);
-    const normalized = raw as ScanAsset[];
-  
-    // fallback garanti
-    const source: 'scan' | 'fallback' = normalized.length > 0 ? 'scan' : 'fallback';
-    let data = normalized.length > 0 ? normalized : fallbackUniverse(quote);
+    // 1) Cache hit ?
+    if (CACHE && Date.now() - CACHE.ts < CACHE_TTL_MS) {
+      const enriched = withDeltaAndTrend(CACHE.data, LAST_GOOD?.data ?? null);
+      const filtered = filterAssets(enriched, regimeFilter);
+      const sorted = sortAssets(filtered, sortKey, sortDir).slice(0, limit);
 
-    // Recherche (minimaliste, rapide)
-    if (q) {
-      data = data.filter((a) => a.symbol.toLowerCase().includes(q) || a.name.toLowerCase().includes(q));
+      const res: ScanResponse = {
+        ok: true,
+        ts,
+        source: 'cache',
+        market,
+        quote,
+        count: sorted.length,
+        data: sorted,
+        message: null,
+      };
+
+      return NextResponse.json(res, { status: 200 });
     }
 
-    // Tri (par défaut: score desc, conforme à ta règle)
-    sortData(data, sort, order);
+    // 2) Provider
+    let providerData: ScanAsset[] = [];
+    try {
+      providerData = await fetchCoinGecko(quote);
+    } catch {
+      providerData = [];
+    }
 
-    // Limite (UI veut 6 visibles fixes)
-    data = data.slice(0, limit);
+    // 3) Choix source + snapshot
+    let source: ScanResponse['source'] = 'provider';
+    let data: ScanAsset[] = providerData;
 
-    const ctx = computeContext(data);
+    if (data.length > 0) {
+      // delta/trend basé sur LAST_GOOD
+      data = withDeltaAndTrend(data, LAST_GOOD?.data ?? null);
+
+      // update caches
+      CACHE = { ts: Date.now(), data };
+      LAST_GOOD = { ts: Date.now(), data };
+    } else if (LAST_GOOD?.data?.length) {
+      // Provider down -> last good
+      source = 'cache';
+      data = withDeltaAndTrend(LAST_GOOD.data, null);
+      CACHE = { ts: Date.now(), data };
+    } else {
+      // Rien -> fallback garanti
+      source = 'fallback';
+      data = fallbackUniverse(quote);
+      CACHE = { ts: Date.now(), data };
+    }
+
+    // 4) Filter + sort + limit (UI)
+    const filtered = filterAssets(data, regimeFilter);
+    const sorted = sortAssets(filtered, sortKey, sortDir).slice(0, limit);
 
     const res: ScanResponse = {
       ok: true,
       ts,
-
       source,
       market,
       quote,
-
-      count: data.length,
-      data,
-
-      market_regime: ctx.market_regime,
-      confidence_global: ctx.confidence_global,
-      stable_ratio: ctx.stable_ratio,
-      transition_ratio: ctx.transition_ratio,
-      volatile_ratio: ctx.volatile_ratio,
-
+      count: sorted.length,
+      data: sorted,
       message: null,
     };
 
-    // Headers utiles (debug + anti-cache si besoin)
-    return NextResponse.json(res, {
-      status: 200,
-      headers: {
-        'cache-control': 'no-store',
-      },
-    });
+    return NextResponse.json(res, { status: 200 });
   } catch (e: any) {
     const res: ScanResponse = {
       ok: false,
       ts,
-
       source: 'fallback',
       market: 'crypto',
       quote: 'USD',
-
       count: 0,
       data: [],
-
-      market_regime: 'TRANSITION',
-      confidence_global: null,
-      stable_ratio: 0,
-      transition_ratio: 0,
-      volatile_ratio: 0,
-
       message: 'scan_failed',
       error: e?.message ?? 'Unknown error',
     };
 
-    return NextResponse.json(res, { status: 500, headers: { 'cache-control': 'no-store' } });
+    return NextResponse.json(res, { status: 500 });
   }
 }
