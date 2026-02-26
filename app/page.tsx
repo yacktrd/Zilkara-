@@ -1,645 +1,680 @@
 // app/page.tsx
 'use client';
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 
 type Regime = 'STABLE' | 'TRANSITION' | 'VOLATILE' | string;
 
 type ScanAsset = {
-  id: string;
-  symbol: string;
-  name: string;
+  id?: string;
+  symbol?: string;
+  name?: string;
 
-  price: number | null;
-  chg_24h_pct: number | null; // ex: 0.34 pour +0,34%
+  price?: number | null;
+  chg_24h_pct?: number | null;
 
-  confidence_score: number | null; // 0..100
-  regime: Regime | null;
+  confidence_score?: number | null;
+  regime?: Regime | null;
 
-  binance_url: string | null;
-  affiliate_url: string | null;
+  binance_url?: string | null;
+  affiliate_url?: string | null;
 
-  // optionnels si ton API les expose (sinon null)
-  score_delta?: number | null; // variation du score
-  score_trend?: 'up' | 'down' | null; // direction du score
+  market_cap?: number | null;
+  volume_24h?: number | null;
+
+  score_delta?: number | null;
+  score_trend?: 'up' | 'down' | null;
 };
 
 type ScanResponse = {
   ok: boolean;
   ts?: string;
-  data?: ScanAsset[];
-  count?: number;
   source?: string;
   market?: string;
   quote?: string;
+  count?: number;
+  data?: ScanAsset[];
+  message?: string | null;
   error?: string;
-  message?: string;
 };
 
 type ContextResponse = {
   ok: boolean;
   ts?: string;
-  market_regime?: Regime;
-  confidence_global?: number | null;
-  stable_ratio?: number;
-  transition_ratio?: number;
-  volatile_ratio?: number;
+  market_regime?: Regime | null;
+
+  // ✅ IMPORTANT: pas de confidence_global (supprimée)
+  stable_ratio?: number | null;
+  transition_ratio?: number | null;
+  volatile_ratio?: number | null;
+
+  message?: string | null;
   error?: string;
-  message?: string;
 };
 
 type SortMode = 'score_desc' | 'score_asc' | 'price_desc' | 'price_asc';
 
-const MAX_VISIBLE = 6;
+const DEFAULT_QUOTE = 'USD';
+const DEFAULT_MARKET = 'crypto';
 
-function clamp(n: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, n));
-}
-
-function toNumberOrNull(v: unknown): number | null {
-  if (v === null || v === undefined) return null;
-  const n = typeof v === 'number' ? v : Number(v);
-  return Number.isFinite(n) ? n : null;
-}
-
-function toStringSafe(v: unknown): string {
-  return typeof v === 'string' ? v : String(v ?? '');
-}
-
-function safeRegime(v: unknown): Regime | null {
-  const s = typeof v === 'string' ? v.toUpperCase() : '';
-  if (s === 'STABLE' || s === 'TRANSITION' || s === 'VOLATILE') return s;
-  return typeof v === 'string' && v.trim() ? v : null;
-}
-
-function formatPriceUSD(price: number | null): string {
-  if (price === null) return '—';
+const fmtPrice = (n: number | null | undefined, quote: string) => {
+  if (n == null || !Number.isFinite(n)) return '—';
+  const isSmall = Math.abs(n) < 1 && n !== 0;
+  const digits = isSmall ? 6 : n < 100 ? 2 : 0;
   try {
-    // compact mais lisible
-    return new Intl.NumberFormat('fr-FR', {
-      style: 'currency',
-      currency: 'USD',
-      maximumFractionDigits: price >= 1000 ? 0 : price >= 1 ? 2 : 6,
-    }).format(price);
+    // "USD" affiché par ton UI comme "$US"
+    const suffix = quote === 'USD' ? '$US' : quote;
+    const formatted = n.toLocaleString('fr-FR', {
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+    });
+    return `${formatted} ${suffix}`;
   } catch {
-    return `${price}`;
+    return `${n} ${quote}`;
   }
-}
+};
 
-function formatPct(p: number | null): { text: string; sign: 'pos' | 'neg' | 'neu' } {
-  if (p === null) return { text: 'H24 —', sign: 'neu' };
-  const sign = p > 0 ? 'pos' : p < 0 ? 'neg' : 'neu';
-  const abs = Math.abs(p);
-  // p est en % (0.34 = 0,34%) => on garde % comme affichage
-  const txt = `${p > 0 ? '+' : p < 0 ? '−' : ''}${abs.toLocaleString('fr-FR', {
+const fmtPct = (n: number | null | undefined) => {
+  if (n == null || !Number.isFinite(n)) return '—';
+  const sign = n > 0 ? '+' : '';
+  // UI: H24 +0,03% (virgule FR)
+  const formatted = n.toLocaleString('fr-FR', {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
-  })}%`;
-  return { text: `H24 ${txt}`, sign };
+  });
+  return `${sign}${formatted}%`;
+};
+
+const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, n));
+
+const normStr = (v: unknown) => (typeof v === 'string' ? v.trim() : '');
+const upper = (v: string) => v.toUpperCase();
+
+function regimeLabel(r?: Regime | null) {
+  if (!r) return '—';
+  const x = upper(String(r));
+  if (x === 'STABLE' || x === 'TRANSITION' || x === 'VOLATILE') return x;
+  return x;
 }
 
-function normalizeAsset(x: any): ScanAsset {
-  const symbolRaw = toStringSafe(x?.symbol || x?.id || '').trim();
-  const symbol = symbolRaw.toUpperCase();
+function regimeDotClass(r?: Regime | null) {
+  const x = upper(String(r ?? ''));
+  if (x === 'STABLE') return 'dot dot-stable';
+  if (x === 'TRANSITION') return 'dot dot-transition';
+  if (x === 'VOLATILE') return 'dot dot-volatile';
+  return 'dot dot-unknown';
+}
 
-  const id = toStringSafe(x?.id || symbol).trim() || symbol || 'UNK';
+function safeNum(v: unknown): number | null {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
 
-  const nameRaw = toStringSafe(x?.name || symbol).trim();
-  const name = nameRaw || symbol || 'Unknown';
-
-  const price = toNumberOrNull(x?.price);
-  const chg = toNumberOrNull(x?.chg_24h_pct);
-
-  const confidence = toNumberOrNull(x?.confidence_score);
-  const confidence_score = confidence === null ? null : clamp(confidence, 0, 100);
-
-  const regime = safeRegime(x?.regime);
-
-  const binance_url = x?.binance_url ? toStringSafe(x.binance_url) : null;
-  const affiliate_url = x?.affiliate_url ? toStringSafe(x.affiliate_url) : null;
-
-  const score_delta = toNumberOrNull(x?.score_delta);
-  const score_trend =
-    x?.score_trend === 'up' || x?.score_trend === 'down' ? x.score_trend : null;
+function normalizeAsset(x: ScanAsset): ScanAsset {
+  const symbol = normStr(x.symbol || x.id || '');
+  const name = normStr(x.name || symbol);
 
   return {
-    id,
+    id: normStr(x.id || symbol),
     symbol,
     name,
-    price,
-    chg_24h_pct: chg,
-    confidence_score,
-    regime,
-    binance_url,
-    affiliate_url,
-    score_delta,
-    score_trend,
+
+    price: safeNum(x.price),
+    chg_24h_pct: safeNum(x.chg_24h_pct),
+
+    confidence_score: safeNum(x.confidence_score),
+    regime: x.regime ?? null,
+
+    binance_url: x.binance_url ?? null,
+    affiliate_url: x.affiliate_url ?? null,
+
+    market_cap: safeNum(x.market_cap),
+    volume_24h: safeNum(x.volume_24h),
+
+    score_delta: safeNum(x.score_delta),
+    score_trend: x.score_trend === 'up' || x.score_trend === 'down' ? x.score_trend : null,
   };
 }
 
-function sortAssets(data: ScanAsset[], mode: SortMode) {
-  const copy = [...data];
-  const scoreVal = (a: ScanAsset) => (a.confidence_score ?? -1);
-  const priceVal = (a: ScanAsset) => (a.price ?? -1);
+function sortAssets(list: ScanAsset[], mode: SortMode) {
+  const arr = [...list];
+  arr.sort((a, b) => {
+    const as = a.confidence_score ?? -1;
+    const bs = b.confidence_score ?? -1;
+    const ap = a.price ?? -1;
+    const bp = b.price ?? -1;
 
-  switch (mode) {
-    case 'score_desc':
-      return copy.sort((a, b) => scoreVal(b) - scoreVal(a));
-    case 'score_asc':
-      return copy.sort((a, b) => (a.confidence_score ?? 999) - (b.confidence_score ?? 999));
-    case 'price_desc':
-      return copy.sort((a, b) => priceVal(b) - priceVal(a));
-    case 'price_asc':
-      return copy.sort((a, b) => (a.price ?? 999999999) - (b.price ?? 999999999));
-    default:
-      return copy;
-  }
-}
-
-function getScoreArrow(a: ScanAsset): { arrow: '↑' | '↓' | ''; tone: 'pos' | 'neg' | 'neu' } {
-  // priorité à score_trend si fourni par l’API
-  if (a.score_trend === 'up') return { arrow: '↑', tone: 'pos' };
-  if (a.score_trend === 'down') return { arrow: '↓', tone: 'neg' };
-
-  // sinon on déduit via score_delta si dispo
-  const d = a.score_delta ?? null;
-  if (d === null) return { arrow: '', tone: 'neu' };
-  if (d > 0) return { arrow: '↑', tone: 'pos' };
-  if (d < 0) return { arrow: '↓', tone: 'neg' };
-  return { arrow: '', tone: 'neu' };
-}
-
-function regimeLabel(r: Regime | null): string {
-  if (!r) return '';
-  const s = String(r).toUpperCase();
-  if (s === 'STABLE') return 'STABLE';
-  if (s === 'TRANSITION') return 'TRANSITION';
-  if (s === 'VOLATILE') return 'VOLATILE';
-  return s;
+    switch (mode) {
+      case 'score_asc':
+        return as - bs;
+      case 'score_desc':
+        return bs - as;
+      case 'price_asc':
+        return ap - bp;
+      case 'price_desc':
+        return bp - ap;
+      default:
+        return bs - as;
+    }
+  });
+  return arr;
 }
 
 export default function Page() {
+  // Data
   const [assets, setAssets] = useState<ScanAsset[]>([]);
-  const [ts, setTs] = useState<string>('');
   const [context, setContext] = useState<ContextResponse | null>(null);
 
+  // UI state
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const [query, setQuery] = useState('');
   const [sortMode, setSortMode] = useState<SortMode>('score_desc');
 
-  async function load() {
+  // Regime filter
+  const [regimeFilter, setRegimeFilter] = useState<'ALL' | 'STABLE' | 'TRANSITION' | 'VOLATILE'>('ALL');
+
+  // Mode demandé: exclude (on le supporte nativement)
+  const [filterMode, setFilterMode] = useState<'include' | 'exclude'>('exclude');
+
+  // Control
+  const abortRef = useRef<AbortController | null>(null);
+
+  async function fetchJSON<T>(path: string, signal: AbortSignal): Promise<T> {
+    const res = await fetch(path, {
+      method: 'GET',
+      signal,
+      headers: { 'Accept': 'application/json' },
+      cache: 'no-store',
+    });
+
+    // IMPORTANT: gérer Vercel Deployment Protection (401) sans casser l’UI
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      // on évite d’afficher l’HTML brut dans l’UI
+      const msg = `HTTP ${res.status}${text ? ' — ' + (text.includes('<html') ? 'Authentication required' : text.slice(0, 120)) : ''}`;
+      throw new Error(msg);
+    }
+
+    return (await res.json()) as T;
+  }
+
+  async function refresh() {
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     setIsLoading(true);
     setError(null);
 
+    const quote = DEFAULT_QUOTE;
+    const market = DEFAULT_MARKET;
+
     try {
+      // Scan + Context
       const [scanRes, ctxRes] = await Promise.allSettled([
-        fetch('/api/scan', { cache: 'no-store' }),
-        fetch('/api/context', { cache: 'no-store' }),
+        fetchJSON<ScanResponse>(`/api/scan?market=${encodeURIComponent(market)}&quote=${encodeURIComponent(quote)}`, controller.signal),
+        fetchJSON<ContextResponse>(`/api/context?market=${encodeURIComponent(market)}&quote=${encodeURIComponent(quote)}`, controller.signal),
       ]);
 
-      // scan
-      if (scanRes.status === 'fulfilled') {
-        const json: ScanResponse = await scanRes.value.json();
-        if (!json.ok) {
-          setError(json.error || json.message || 'Scan error');
-          setAssets([]);
-          setTs(json.ts || '');
-        } else {
-          const normalized = Array.isArray(json.data) ? json.data.map(normalizeAsset) : [];
-          setAssets(normalized);
-          setTs(json.ts || '');
-        }
+      // Context
+      if (ctxRes.status === 'fulfilled') {
+        setContext({
+          ok: !!ctxRes.value.ok,
+          ts: ctxRes.value.ts,
+          market_regime: ctxRes.value.market_regime ?? null,
+          stable_ratio: ctxRes.value.stable_ratio ?? null,
+          transition_ratio: ctxRes.value.transition_ratio ?? null,
+          volatile_ratio: ctxRes.value.volatile_ratio ?? null,
+          message: ctxRes.value.message ?? null,
+          error: ctxRes.value.error,
+        });
       } else {
-        setError('Scan fetch failed');
-        setAssets([]);
+        // context non-bloquant
+        setContext({
+          ok: false,
+          market_regime: null,
+          message: 'context_failed',
+          error: ctxRes.reason?.message ?? String(ctxRes.reason ?? 'Unknown error'),
+        });
       }
 
-      // context
-      if (ctxRes.status === 'fulfilled') {
-        const cj: ContextResponse = await ctxRes.value.json();
-        setContext(cj.ok ? cj : null);
+      // Scan
+      if (scanRes.status === 'fulfilled') {
+        const raw = Array.isArray(scanRes.value.data) ? scanRes.value.data : [];
+        const normalized = raw.map(normalizeAsset).filter((x) => x.symbol);
+        setAssets(normalized);
+
+        // Si backend renvoie ok:true mais vide, on laisse l’UI afficher “Aucun résultat.”
+        if (!scanRes.value.ok && scanRes.value.error) {
+          setError(scanRes.value.error);
+        }
       } else {
-        setContext(null);
+        setAssets([]);
+        setError(scanRes.reason?.message ?? String(scanRes.reason ?? 'scan_failed'));
       }
     } catch (e: any) {
-      setError(e?.message || 'Unexpected error');
+      if (e?.name === 'AbortError') return;
       setAssets([]);
-      setContext(null);
+      setError(e?.message ?? 'Unknown error');
     } finally {
       setIsLoading(false);
     }
   }
 
   useEffect(() => {
-    load();
-    // auto-refresh léger (optionnel)
-    const t = setInterval(load, 60_000);
-    return () => clearInterval(t);
+    refresh();
+    return () => abortRef.current?.abort();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Filtering
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return assets;
-    return assets.filter((a) => {
-      const s = `${a.symbol} ${a.name}`.toLowerCase();
-      return s.includes(q);
-    });
-  }, [assets, query]);
+    let list = assets;
 
-  const sorted = useMemo(() => sortAssets(filtered, sortMode), [filtered, sortMode]);
+    // Regime include/exclude
+    if (regimeFilter !== 'ALL') {
+      list =
+        filterMode === 'include'
+          ? list.filter((a) => upper(String(a.regime ?? '')) === regimeFilter)
+          : list.filter((a) => upper(String(a.regime ?? '')) !== regimeFilter);
+    }
 
-  const visible = useMemo(() => sorted.slice(0, MAX_VISIBLE), [sorted]);
+    // Search
+    if (q) {
+      list = list.filter((a) => {
+        const s = `${a.symbol ?? ''} ${a.name ?? ''}`.toLowerCase();
+        return s.includes(q);
+      });
+    }
 
-  const ctxRegime = regimeLabel(context?.market_regime ?? null);
-  const ctxConfidence =
-    context?.confidence_global === null || context?.confidence_global === undefined
-      ? null
-      : clamp(context.confidence_global, 0, 100);
+    // Sort
+    list = sortAssets(list, sortMode);
 
-  const sortLabel =
-    sortMode === 'score_desc'
-      ? 'Score ↓'
-      : sortMode === 'score_asc'
-      ? 'Score ↑'
-      : sortMode === 'price_desc'
-      ? 'Prix ↓'
-      : 'Prix ↑';
+    return list;
+  }, [assets, query, sortMode, regimeFilter, filterMode]);
 
-  const toggleScore = () =>
-    setSortMode((m) => (m === 'score_desc' ? 'score_asc' : 'score_desc'));
-  const togglePrice = () =>
-    setSortMode((m) => (m === 'price_desc' ? 'price_asc' : 'price_desc'));
+  // UI derived
+  const ctxRegime = context?.ok ? context?.market_regime ?? null : null;
 
   return (
     <main className="wrap">
-      <header className="top">
-        <div className="brandRow">
-          <h1 className="brand">Zilkara</h1>
-          <button className="refresh" onClick={load} aria-label="Rafraîchir">
-            ⟳
-          </button>
+      <div className="hero">
+        <div className="title">Zilkara</div>
+
+        <div className="searchRow">
+          <div className="search">
+            <span className="searchIcon">⌕</span>
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Rechercher…"
+              aria-label="Rechercher"
+            />
+          </div>
+
+          <div className="sortChip">
+            <select
+              value={sortMode}
+              onChange={(e) => setSortMode(e.target.value as SortMode)}
+              aria-label="Tri"
+            >
+              <option value="score_desc">Score ↓</option>
+              <option value="score_asc">Score ↑</option>
+              <option value="price_desc">Prix ↓</option>
+              <option value="price_asc">Prix ↑</option>
+            </select>
+          </div>
         </div>
-        <div className="sub">
-          {error ? <span className="err">{error}</span> : <span className="ok">OK</span>}
-          <span className="ts">{ts ? `— ${ts}` : ''}</span>
+
+        {/* RFS CONTEXT (sans score global) */}
+        <section className="card contextCard" aria-label="RFS Context">
+          <div className="contextTop">
+            <div className="contextMeta">
+              <div className="contextKicker">RFS CONTEXT</div>
+              <div className="contextTitle">Confiance</div>
+            </div>
+
+            {/* ✅ Pas de % global */}
+            <div className="contextRight" />
+          </div>
+
+          <div className="contextBottom">
+            <div className="pill">
+              <span className={regimeDotClass(ctxRegime)} />
+              <span className="pillText">{regimeLabel(ctxRegime)}</span>
+            </div>
+
+            <button className="ghostBtn" onClick={refresh} disabled={isLoading}>
+              {isLoading ? '…' : 'Rafraîchir'}
+            </button>
+          </div>
+        </section>
+
+        {/* Filters */}
+        <div className="filters">
+          <div className="seg">
+            <button
+              className={regimeFilter === 'ALL' ? 'segBtn active' : 'segBtn'}
+              onClick={() => setRegimeFilter('ALL')}
+            >
+              Tous
+            </button>
+            <button
+              className={regimeFilter === 'STABLE' ? 'segBtn active' : 'segBtn'}
+              onClick={() => setRegimeFilter('STABLE')}
+            >
+              Stable
+            </button>
+            <button
+              className={regimeFilter === 'TRANSITION' ? 'segBtn active' : 'segBtn'}
+              onClick={() => setRegimeFilter('TRANSITION')}
+            >
+              Transition
+            </button>
+            <button
+              className={regimeFilter === 'VOLATILE' ? 'segBtn active' : 'segBtn'}
+              onClick={() => setRegimeFilter('VOLATILE')}
+            >
+              Volatile
+            </button>
+          </div>
+
+          {/* Mode: include / exclude (tu as demandé exclude) */}
+          <div className="mode">
+            <span className="modeLabel">Mode</span>
+            <select value={filterMode} onChange={(e) => setFilterMode(e.target.value as any)}>
+              <option value="exclude">exclude</option>
+              <option value="include">include</option>
+            </select>
+          </div>
         </div>
-      </header>
 
-      <section className="searchBox">
-        <div className="search">
-          <span className="icon">⌕</span>
-          <input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Rechercher…"
-            aria-label="Rechercher un actif"
-          />
-        </div>
+        {/* Error (sans HTML brut) */}
+        {error ? (
+          <div className="errorBox" role="alert">
+            <div className="errorTitle">Erreur</div>
+            <div className="errorText">{error}</div>
+          </div>
+        ) : null}
 
-        <div className="sortBar" role="group" aria-label="Tri">
-          <button
-            className={`pill ${sortMode.startsWith('score') ? 'active' : ''}`}
-            onClick={toggleScore}
-            type="button"
-            aria-label="Trier par score"
-          >
-            Score {sortMode === 'score_desc' ? '↓' : sortMode === 'score_asc' ? '↑' : ''}
-          </button>
-
-          <span className="sep">|</span>
-
-          <button
-            className={`pill ${sortMode.startsWith('price') ? 'active' : ''}`}
-            onClick={togglePrice}
-            type="button"
-            aria-label="Trier par prix"
-          >
-            Prix {sortMode === 'price_desc' ? '↓' : sortMode === 'price_asc' ? '↑' : ''}
-          </button>
-
-          <span className="current">{sortLabel}</span>
-        </div>
-      </section>
-
-      <section className="contextCard" aria-label="RFS Context">
-        <div className="ctxHead">RFS CONTEXT</div>
-        <div className="ctxLine">
-          <div className="ctxTitle">Confiance</div>
-          <div className="ctxValue">{ctxConfidence === null ? '—' : `${ctxConfidence}%`}</div>
-        </div>
-        <div className="ctxBadgeRow">
-          <span className={`badge ${ctxRegime ? ctxRegime.toLowerCase() : ''}`}>
-            <span className="dot" /> {ctxRegime || '—'}
-          </span>
-        </div>
-      </section>
-
-      <section className="list" aria-label="Liste des actifs">
-        {isLoading ? (
-          <>
-            {Array.from({ length: MAX_VISIBLE }).map((_, i) => (
-              <div className="row skeleton" key={i} />
-            ))}
-          </>
-        ) : visible.length === 0 ? (
-          <div className="empty">Aucun résultat.</div>
-        ) : (
-          visible.map((a) => {
-            const href = a.affiliate_url || a.binance_url || '';
-            const clickable = Boolean(href);
-            const pct = formatPct(a.chg_24h_pct);
-            const score = a.confidence_score === null ? '—' : `${Math.round(a.confidence_score)}`;
-            const r = regimeLabel(a.regime);
-            const sa = getScoreArrow(a);
-
-            return (
-              <a
-                key={a.id}
-                className={`row ${clickable ? 'clickable' : 'disabled'}`}
-                href={href || undefined}
-                target={href ? '_blank' : undefined}
-                rel={href ? 'noreferrer noopener' : undefined}
-                aria-label={href ? `Ouvrir ${a.symbol} sur Binance` : `${a.symbol}`}
-              >
+        {/* List */}
+        <section className="list">
+          {isLoading ? (
+            <div className="empty">Chargement…</div>
+          ) : filtered.length === 0 ? (
+            <div className="empty">Aucun résultat.</div>
+          ) : (
+            filtered.map((a) => (
+              <article key={a.id || a.symbol} className="card assetCard">
                 <div className="left">
-                  <div className="coin">
-                    <span className="coinText">{a.symbol.slice(0, 2)}</span>
+                  <div className="monogram">
+                    {(a.symbol ?? '—').slice(0, 2).toUpperCase()}
                   </div>
                   <div className="names">
-                    <div className="sym">{a.symbol}</div>
-                    <div className="nm">{a.name}</div>
+                    <div className="sym">{(a.symbol ?? '—').toUpperCase()}</div>
+                    <div className="nm">{a.name ?? '—'}</div>
                   </div>
                 </div>
 
                 <div className="mid">
-                  <div className="price">{formatPriceUSD(a.price)}</div>
-                  <div className={`h24 ${pct.sign}`}>{pct.text}</div>
+                  <div className="price">{fmtPrice(a.price ?? null, DEFAULT_QUOTE)}</div>
+                  <div className={((a.chg_24h_pct ?? 0) >= 0) ? 'h24 pos' : 'h24 neg'}>
+                    H24 {fmtPct(a.chg_24h_pct ?? null)}
+                  </div>
                 </div>
 
                 <div className="right">
-                  <div className="score">
-                    <span className="scoreNum">{score}</span>
-                    <span className={`trend ${sa.tone}`}>{sa.arrow}</span>
+                  <div className="scoreRow">
+                    <div className="score">{a.confidence_score ?? '—'}</div>
+
+                    {/* flèche = direction volatilité/score_trend (pas de caractères descriptifs) */}
+                    <div
+                      className={
+                        a.score_trend === 'up' ? 'arrow up' : a.score_trend === 'down' ? 'arrow down' : 'arrow none'
+                      }
+                      aria-label={a.score_trend ?? 'none'}
+                    >
+                      {a.score_trend === 'up' ? '↑' : a.score_trend === 'down' ? '↓' : ''}
+                    </div>
                   </div>
-                  <div className="reg">{r || '—'}</div>
+
+                  <div className="reg">{regimeLabel(a.regime)}</div>
                 </div>
-              </a>
-            );
-          })
-        )}
-      </section>
 
+                {/* CTA (optionnel) */}
+                {(a.affiliate_url || a.binance_url) ? (
+                  <a
+                    className="hit"
+                    href={a.affiliate_url || a.binance_url || undefined}
+                    target="_blank"
+                    rel="noreferrer"
+                    aria-label={`Ouvrir ${a.symbol}`}
+                  />
+                ) : null}
+              </article>
+            ))
+          )}
+        </section>
+      </div>
+
+      {/* Styles: garantie d’un rendu proche du modèle (glass + cards) */}
       <style jsx>{`
-        :global(html, body) {
-          height: 100%;
-        }
-        :global(body) {
-          margin: 0;
-          background: radial-gradient(1200px 800px at 20% 0%, #1a1f2a 0%, #0a0d13 55%, #07090e 100%);
-          color: rgba(255, 255, 255, 0.92);
-          font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial,
-            'Apple Color Emoji', 'Segoe UI Emoji';
-        }
-
         .wrap {
-          max-width: 560px;
-          margin: 0 auto;
-          padding: 22px 16px 28px;
+          min-height: 100vh;
+          padding: 28px 18px 64px;
+          background: radial-gradient(1200px 700px at 20% 10%, rgba(255,255,255,0.10), transparent 55%),
+                      radial-gradient(900px 500px at 70% 30%, rgba(255,255,255,0.08), transparent 60%),
+                      #0a0d14;
+          color: rgba(255,255,255,0.92);
+          display: flex;
+          justify-content: center;
         }
-
-        .top {
+        .hero {
+          width: 100%;
+          max-width: 760px;
+        }
+        .title {
+          font-size: 44px;
+          letter-spacing: -0.02em;
+          font-weight: 700;
+          margin: 6px 0 14px;
+        }
+        .searchRow {
+          display: flex;
+          gap: 10px;
+          align-items: center;
           margin-bottom: 14px;
         }
-
-        .brandRow {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          gap: 10px;
-        }
-
-        .brand {
-          font-size: 44px;
-          letter-spacing: -1.2px;
-          margin: 0;
-          font-weight: 800;
-        }
-
-        .refresh {
-          width: 44px;
-          height: 44px;
-          border-radius: 14px;
-          border: 1px solid rgba(255, 255, 255, 0.12);
-          background: rgba(255, 255, 255, 0.06);
-          color: rgba(255, 255, 255, 0.9);
-          cursor: pointer;
-          display: grid;
-          place-items: center;
-          transition: transform 120ms ease, background 120ms ease, border 120ms ease;
-        }
-        .refresh:active {
-          transform: scale(0.98);
-        }
-        .refresh:hover {
-          background: rgba(255, 255, 255, 0.09);
-          border-color: rgba(255, 255, 255, 0.18);
-        }
-
-        .sub {
-          margin-top: 6px;
-          display: flex;
-          gap: 8px;
-          align-items: center;
-          color: rgba(255, 255, 255, 0.55);
-          font-size: 14px;
-        }
-        .ok {
-          color: rgba(255, 255, 255, 0.7);
-        }
-        .err {
-          color: rgba(255, 120, 120, 0.95);
-        }
-        .ts {
-          white-space: nowrap;
-          overflow: hidden;
-          text-overflow: ellipsis;
-        }
-
-        .searchBox {
-          margin: 10px 0 14px;
-        }
-
         .search {
-          height: 44px;
-          border-radius: 16px;
-          border: 1px solid rgba(255, 255, 255, 0.10);
-          background: rgba(255, 255, 255, 0.06);
-          display: flex;
-          align-items: center;
-          gap: 10px;
-          padding: 0 14px;
-          box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+          flex: 1;
+          position: relative;
         }
-        .icon {
+        .searchIcon {
+          position: absolute;
+          left: 14px;
+          top: 50%;
+          transform: translateY(-50%);
           opacity: 0.55;
+          font-size: 14px;
         }
         .search input {
           width: 100%;
-          border: 0;
-          outline: 0;
-          background: transparent;
-          color: rgba(255, 255, 255, 0.9);
-          font-size: 16px;
+          border-radius: 18px;
+          padding: 14px 14px 14px 40px;
+          border: 1px solid rgba(255,255,255,0.10);
+          background: rgba(255,255,255,0.06);
+          color: rgba(255,255,255,0.92);
+          outline: none;
         }
         .search input::placeholder {
-          color: rgba(255, 255, 255, 0.38);
+          color: rgba(255,255,255,0.45);
+        }
+        .sortChip select {
+          border-radius: 16px;
+          padding: 12px 12px;
+          border: 1px solid rgba(255,255,255,0.10);
+          background: rgba(255,255,255,0.06);
+          color: rgba(255,255,255,0.85);
+          outline: none;
         }
 
-        .sortBar {
-          margin-top: 10px;
-          height: 42px;
-          border-radius: 16px;
-          border: 1px solid rgba(255, 255, 255, 0.10);
-          background: rgba(255, 255, 255, 0.05);
-          display: flex;
-          align-items: center;
-          padding: 0 10px;
-          gap: 10px;
-        }
-        .pill {
-          height: 30px;
-          padding: 0 12px;
-          border-radius: 999px;
-          border: 1px solid rgba(255, 255, 255, 0.10);
-          background: rgba(255, 255, 255, 0.06);
-          color: rgba(255, 255, 255, 0.86);
-          font-size: 14px;
-          cursor: pointer;
-          transition: background 120ms ease, border 120ms ease;
-        }
-        .pill:hover {
-          background: rgba(255, 255, 255, 0.09);
-          border-color: rgba(255, 255, 255, 0.16);
-        }
-        .pill.active {
-          background: rgba(255, 255, 255, 0.12);
-          border-color: rgba(255, 255, 255, 0.18);
-        }
-        .sep {
-          opacity: 0.35;
-        }
-        .current {
-          margin-left: auto;
-          font-size: 13px;
-          opacity: 0.5;
+        .card {
+          position: relative;
+          border-radius: 18px;
+          border: 1px solid rgba(255,255,255,0.10);
+          background: rgba(255,255,255,0.06);
+          box-shadow: 0 18px 60px rgba(0,0,0,0.45);
+          backdrop-filter: blur(12px);
+          overflow: hidden;
         }
 
         .contextCard {
-          margin-top: 10px;
-          border-radius: 22px;
-          border: 1px solid rgba(255, 255, 255, 0.10);
-          background: linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.03));
-          padding: 16px 16px 14px;
-          box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+          padding: 16px;
+          margin-bottom: 12px;
         }
-        .ctxHead {
-          font-size: 12px;
-          letter-spacing: 2px;
-          opacity: 0.55;
-          font-weight: 700;
-          margin-bottom: 8px;
-        }
-        .ctxLine {
+        .contextTop {
           display: flex;
           align-items: baseline;
           justify-content: space-between;
+          gap: 12px;
+        }
+        .contextKicker {
+          font-size: 12px;
+          letter-spacing: 0.16em;
+          opacity: 0.55;
+          font-weight: 600;
+        }
+        .contextTitle {
+          margin-top: 6px;
+          font-size: 18px;
+          font-weight: 600;
+          opacity: 0.9;
+        }
+        .contextBottom {
+          margin-top: 12px;
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
           gap: 10px;
         }
-        .ctxTitle {
-          font-size: 18px;
-          opacity: 0.85;
-          font-weight: 650;
-        }
-        .ctxValue {
-          font-size: 28px;
-          font-weight: 800;
-          letter-spacing: -0.6px;
-        }
-        .ctxBadgeRow {
-          margin-top: 10px;
-        }
-        .badge {
+        .pill {
           display: inline-flex;
           align-items: center;
           gap: 10px;
-          height: 34px;
-          padding: 0 14px;
+          padding: 10px 12px;
           border-radius: 999px;
-          border: 1px solid rgba(255, 255, 255, 0.10);
-          background: rgba(255, 255, 255, 0.05);
+          border: 1px solid rgba(255,255,255,0.10);
+          background: rgba(0,0,0,0.10);
+        }
+        .pillText {
           font-weight: 700;
-          letter-spacing: 0.5px;
-          font-size: 13px;
-          text-transform: uppercase;
-          opacity: 0.92;
+          letter-spacing: 0.02em;
         }
-        .dot {
-          width: 10px;
-          height: 10px;
+        .ghostBtn {
           border-radius: 999px;
-          background: rgba(255, 255, 255, 0.35);
-          box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.06);
+          padding: 10px 12px;
+          border: 1px solid rgba(255,255,255,0.10);
+          background: rgba(255,255,255,0.04);
+          color: rgba(255,255,255,0.78);
+          cursor: pointer;
         }
-        .badge.stable .dot {
-          background: rgba(120, 255, 160, 0.85);
-          box-shadow: 0 0 0 3px rgba(120, 255, 160, 0.10);
+        .ghostBtn:disabled {
+          opacity: 0.5;
+          cursor: default;
         }
-        .badge.transition .dot {
-          background: rgba(255, 210, 120, 0.9);
-          box-shadow: 0 0 0 3px rgba(255, 210, 120, 0.10);
+
+        .filters {
+          display: flex;
+          gap: 10px;
+          align-items: center;
+          justify-content: space-between;
+          margin: 10px 0 12px;
         }
-        .badge.volatile .dot {
-          background: rgba(255, 120, 120, 0.9);
-          box-shadow: 0 0 0 3px rgba(255, 120, 120, 0.10);
+        .seg {
+          display: inline-flex;
+          gap: 6px;
+          padding: 6px;
+          border-radius: 16px;
+          border: 1px solid rgba(255,255,255,0.10);
+          background: rgba(255,255,255,0.05);
+        }
+        .segBtn {
+          border: 0;
+          border-radius: 14px;
+          padding: 10px 12px;
+          background: transparent;
+          color: rgba(255,255,255,0.70);
+          cursor: pointer;
+          font-weight: 600;
+        }
+        .segBtn.active {
+          background: rgba(255,255,255,0.10);
+          color: rgba(255,255,255,0.92);
+        }
+        .mode {
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          padding: 6px 10px;
+          border-radius: 16px;
+          border: 1px solid rgba(255,255,255,0.10);
+          background: rgba(255,255,255,0.05);
+        }
+        .modeLabel {
+          opacity: 0.6;
+          font-size: 12px;
+          font-weight: 600;
+          letter-spacing: 0.08em;
+        }
+        .mode select {
+          border: 0;
+          outline: none;
+          background: transparent;
+          color: rgba(255,255,255,0.85);
+          font-weight: 700;
+        }
+
+        .errorBox {
+          margin: 10px 0 12px;
+          padding: 14px 14px;
+          border-radius: 16px;
+          border: 1px solid rgba(255,120,120,0.25);
+          background: rgba(120,20,20,0.18);
+        }
+        .errorTitle {
+          font-weight: 800;
+          margin-bottom: 6px;
+        }
+        .errorText {
+          opacity: 0.9;
+          font-size: 13px;
+          line-height: 1.35;
+          word-break: break-word;
         }
 
         .list {
-          margin-top: 14px;
           display: flex;
           flex-direction: column;
-          gap: 12px;
-        }
-
-        .row {
-          border-radius: 18px;
-          border: 1px solid rgba(255, 255, 255, 0.10);
-          background: rgba(255, 255, 255, 0.05);
-          padding: 14px 14px;
-          display: grid;
-          grid-template-columns: 1.2fr 1fr 0.7fr;
-          align-items: center;
           gap: 10px;
-          text-decoration: none;
-          color: inherit;
-          box-shadow: 0 18px 55px rgba(0, 0, 0, 0.35);
-          transition: transform 120ms ease, background 120ms ease, border 120ms ease;
+          margin-top: 10px;
+        }
+        .empty {
+          padding: 18px 6px;
+          opacity: 0.7;
         }
 
-        .row.clickable:hover {
-          transform: translateY(-1px);
-          background: rgba(255, 255, 255, 0.07);
-          border-color: rgba(255, 255, 255, 0.16);
+        .assetCard {
+          padding: 14px;
+          display: grid;
+          grid-template-columns: 1.2fr 1fr 0.8fr;
+          gap: 12px;
+          align-items: center;
         }
-        .row.clickable:active {
-          transform: translateY(0px);
-        }
-        .row.disabled {
-          opacity: 0.6;
-          cursor: default;
-          pointer-events: none;
+        .assetCard .hit {
+          position: absolute;
+          inset: 0;
         }
 
         .left {
@@ -648,37 +683,35 @@ export default function Page() {
           gap: 12px;
           min-width: 0;
         }
-
-        .coin {
+        .monogram {
           width: 44px;
           height: 44px;
-          border-radius: 999px;
-          border: 1px solid rgba(255, 255, 255, 0.12);
-          background: rgba(255, 255, 255, 0.06);
+          border-radius: 14px;
           display: grid;
           place-items: center;
+          border: 1px solid rgba(255,255,255,0.10);
+          background: rgba(0,0,0,0.12);
+          font-weight: 800;
+          letter-spacing: 0.06em;
+          opacity: 0.9;
           flex: 0 0 auto;
         }
-        .coinText {
-          font-weight: 900;
-          letter-spacing: 0.5px;
-          opacity: 0.85;
-        }
-
         .names {
           min-width: 0;
         }
         .sym {
-          font-size: 18px;
-          font-weight: 900;
-          letter-spacing: -0.3px;
-          line-height: 1.1;
+          font-size: 16px;
+          font-weight: 800;
+          letter-spacing: 0.02em;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
         }
         .nm {
-          font-size: 14px;
+          font-size: 13px;
           opacity: 0.55;
-          overflow: hidden;
           white-space: nowrap;
+          overflow: hidden;
           text-overflow: ellipsis;
           margin-top: 2px;
         }
@@ -687,103 +720,102 @@ export default function Page() {
           text-align: center;
         }
         .price {
-          font-size: 22px;
-          font-weight: 900;
-          letter-spacing: -0.6px;
-          line-height: 1.1;
+          font-size: 18px;
+          font-weight: 800;
+          letter-spacing: -0.01em;
         }
         .h24 {
-          margin-top: 6px;
-          font-size: 14px;
-          font-weight: 800;
-          letter-spacing: 0.2px;
-          opacity: 0.85;
+          margin-top: 4px;
+          font-size: 13px;
+          font-weight: 700;
+          letter-spacing: 0.02em;
         }
         .h24.pos {
-          color: rgba(120, 255, 160, 0.90);
+          color: rgba(120, 255, 160, 0.95);
         }
         .h24.neg {
-          color: rgba(255, 120, 120, 0.90);
-        }
-        .h24.neu {
-          color: rgba(255, 255, 255, 0.6);
+          color: rgba(255, 120, 120, 0.95);
         }
 
         .right {
           text-align: right;
+          display: grid;
+          gap: 6px;
+          justify-items: end;
+        }
+        .scoreRow {
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
         }
         .score {
-          display: inline-flex;
-          align-items: baseline;
-          gap: 6px;
-          justify-content: flex-end;
-        }
-        .scoreNum {
           font-size: 34px;
           font-weight: 900;
-          letter-spacing: -0.8px;
-          line-height: 1;
+          letter-spacing: -0.03em;
         }
-        .trend {
+        .arrow {
           font-size: 18px;
           font-weight: 900;
-          opacity: 0.95;
+          width: 18px;
+          text-align: center;
+          opacity: 0.9;
         }
-        .trend.pos {
-          color: rgba(120, 255, 160, 0.92);
+        .arrow.up {
+          color: rgba(120, 255, 160, 0.95);
         }
-        .trend.neg {
-          color: rgba(255, 120, 120, 0.92);
+        .arrow.down {
+          color: rgba(255, 120, 120, 0.95);
         }
-        .trend.neu {
-          color: rgba(255, 255, 255, 0.45);
+        .arrow.none {
+          opacity: 0.25;
         }
         .reg {
-          margin-top: 6px;
           font-size: 12px;
+          letter-spacing: 0.14em;
+          opacity: 0.65;
           font-weight: 800;
-          letter-spacing: 1.1px;
-          text-transform: uppercase;
-          opacity: 0.55;
         }
 
-        .empty {
-          border-radius: 18px;
-          border: 1px solid rgba(255, 255, 255, 0.10);
-          background: rgba(255, 255, 255, 0.04);
-          padding: 18px 16px;
-          opacity: 0.75;
+        /* Dots */
+        .dot {
+          width: 10px;
+          height: 10px;
+          border-radius: 999px;
+          display: inline-block;
+          box-shadow: 0 0 0 4px rgba(255,255,255,0.06);
+        }
+        .dot-stable {
+          background: rgba(120,255,160,0.95);
+        }
+        .dot-transition {
+          background: rgba(255,205,120,0.95);
+        }
+        .dot-volatile {
+          background: rgba(255,120,120,0.95);
+        }
+        .dot-unknown {
+          background: rgba(200,200,200,0.7);
         }
 
-        .skeleton {
-          height: 86px;
-          background: linear-gradient(
-            90deg,
-            rgba(255, 255, 255, 0.03),
-            rgba(255, 255, 255, 0.07),
-            rgba(255, 255, 255, 0.03)
-          );
-          background-size: 220% 100%;
-          animation: shimmer 1.2s infinite linear;
-        }
-        @keyframes shimmer {
-          0% {
-            background-position: 0% 0%;
+        /* Mobile */
+        @media (max-width: 560px) {
+          .title {
+            font-size: 38px;
           }
-          100% {
-            background-position: 220% 0%;
+          .assetCard {
+            grid-template-columns: 1fr;
+            gap: 10px;
+            text-align: left;
           }
-        }
-
-        @media (max-width: 390px) {
-          .brand {
-            font-size: 40px;
+          .mid {
+            text-align: left;
           }
-          .row {
-            grid-template-columns: 1.15fr 0.95fr 0.7fr;
+          .right {
+            justify-items: start;
+            text-align: left;
           }
-          .scoreNum {
-            font-size: 32px;
+          .score {
+            font-size: 30px;
           }
         }
       `}</style>
