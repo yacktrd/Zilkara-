@@ -172,63 +172,74 @@ function fallbackUniverse(quote: Quote): ScanAsset[] {
  *
  * Pour V1: on renvoie [] => fallback automatique.
  */
-async function getRawUniverse(_market: Market, _quote: Quote): Promise<unknown[]> {
-  // Feature flag possible (si tu veux forcer fallback)
-  if (process.env.SCAN_FALLBACK_ONLY === '1') return [];
 
-  // TODO (V2): intégrer fetch CoinGecko / cache KV
-  return [];
-}
+async function getRawUniverse(market: Market, quote: Quote): Promise<any[]> {
+  try {
+    if (market !== 'crypto') return [];
 
-/** Normalisation stricte d’un item brut vers ScanAsset */
-function normalize(raw: unknown, quote: Quote): ScanAsset | null {
-  const r = raw as any;
+    const vs = quote === 'USD' ? 'usd' : quote.toLowerCase();
 
-  const sym0 = safeStr(r?.symbol) ?? safeStr(r?.id);
-  if (!sym0) return null;
+    const url = new URL('https://api.coingecko.com/api/v3/coins/markets');
+    url.searchParams.set('vs_currency', vs);
+    url.searchParams.set('order', 'market_cap_desc');
+    url.searchParams.set('per_page', '50');
+    url.searchParams.set('page', '1');
+    url.searchParams.set('price_change_percentage', '24h');
 
-  const symbol = sanitizeSymbol(sym0);
-  if (!symbol) return null;
+    const res = await fetch(url.toString(), {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+      },
+      next: { revalidate: 60 }, // cache 60s (propre pour Vercel)
+    });
 
-  const name = safeStr(r?.name) ?? symbol;
+    if (!res.ok) return [];
 
-  const price = safeNum(r?.price);
-  const chg_24h_pct = safeNum(r?.chg_24h_pct);
+    const json = await res.json();
 
-  const confidence_score = safeNum(r?.confidence_score);
-  const regime = (safeStr(r?.regime) as Regime | null) ?? null;
+    if (!Array.isArray(json)) return [];
 
-  const api_binance = safeStr(r?.binance_url);
-  const api_aff = safeStr(r?.affiliate_url);
+    return json.map((c: any) => {
+      const price = typeof c.current_price === 'number' ? c.current_price : null;
+      const chg = typeof c.price_change_percentage_24h === 'number'
+        ? c.price_change_percentage_24h
+        : null;
 
-  const urls =
-    api_binance || api_aff
-      ? { binance_url: api_binance ?? null, affiliate_url: api_aff ?? null }
-      : makeBinanceUrls(symbol, quote);
+      // Confidence V1 simple et stable
+      let score = 50;
 
-  const trendRaw = r?.score_trend;
-  const score_trend: ScoreTrend = trendRaw === 'up' || trendRaw === 'down' ? trendRaw : null;
+      if (chg !== null) {
+        score += clamp(chg * 3, -20, 20);
+      }
 
-  return {
-    id: safeStr(r?.id) ?? symbol,
-    symbol,
-    name,
+      if (typeof c.market_cap === 'number') {
+        score += clamp(Math.log10(c.market_cap) - 6, 0, 20);
+      }
 
-    price,
-    chg_24h_pct,
+      score = clamp(Math.round(score), 0, 100);
 
-    confidence_score,
-    regime,
+      let regime: Regime = 'TRANSITION';
+      if (chg !== null) {
+        if (Math.abs(chg) < 1) regime = 'STABLE';
+        else if (Math.abs(chg) > 4) regime = 'VOLATILE';
+      }
 
-    binance_url: urls.binance_url,
-    affiliate_url: urls.affiliate_url,
-
-    market_cap: safeNum(r?.market_cap),
-    volume_24h: safeNum(r?.volume_24h),
-
-    score_delta: safeNum(r?.score_delta),
-    score_trend,
-  };
+      return {
+        id: c.id,
+        symbol: c.symbol?.toUpperCase(),
+        name: c.name,
+        price,
+        chg_24h_pct: chg,
+        confidence_score: score,
+        regime,
+        market_cap: c.market_cap ?? null,
+        volume_24h: c.total_volume ?? null,
+      };
+    });
+  } catch {
+    return [];
+  }
 }
 
 /** Contexte global */
