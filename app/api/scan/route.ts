@@ -313,8 +313,8 @@ export async function GET(req: Request) {
     const q = safeStr(url.searchParams.get('q'))?.toLowerCase() ?? null;
 
     const raw = await getRawUniverse(market, quote);
-    const normalized = raw.map((x) => normalize(x, quote)).filter((x): x is ScanAsset => x !== null);
-
+    const normalized = raw as ScanAsset[];
+  
     // fallback garanti
     const source: 'scan' | 'fallback' = normalized.length > 0 ? 'scan' : 'fallback';
     let data = normalized.length > 0 ? normalized : fallbackUniverse(quote);
