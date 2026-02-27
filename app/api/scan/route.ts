@@ -1,211 +1,295 @@
 // app/api/scan/route.ts
-import { NextResponse } from 'next/server';
+import { NextResponse } from "next/server";
+import type { ScanAsset, ScanResponse, SortMode, Timeframe } from "@/lib/types";
+import { isoNow, safeStr, toNum, clamp, titleFromId, upperSymbol } from "@/lib/utils";
+import { buildAffiliateUrl, buildBinanceUrl } from "@/lib/binance";
+import { computeRankScore, computeStabilityIndex, regimeFromChg24 } from "@/lib/stability";
+import { sortAssets } from "@/lib/sort";
 
-export const runtime = 'nodejs';
-export const dynamic = 'force-dynamic';
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
-type Regime = 'STABLE' | 'TRANSITION' | 'VOLATILE' | string;
+const DEFAULT_LIMIT = 200;
+const MAX_LIMIT = 250;
+const DEFAULT_SORT: SortMode = "rank_desc";
+const DEFAULT_TF: Timeframe = "24H";
 
-type ScanAsset = {
-  id: string;
-  symbol: string;
-  name: string;
-
-  price: number | null;
-  chg_24h_pct: number | null;
-
-  confidence_score: number | null;
-  regime: Regime | null;
-
-  binance_url: string | null;
-  affiliate_url: string | null;
-
-  score_delta: number | null;
-  score_trend: 'up' | 'down' | null;
+type CGMarketItem = {
+  id?: string;
+  symbol?: string;
+  name?: string;
+  current_price?: number;
+  price_change_percentage_24h?: number | null;
+  market_cap?: number | null;
+  total_volume?: number | null;
 };
 
-type ScanResponse = {
-  ok: boolean;
-  ts: string;
-  source: 'scan' | 'fallback';
-  market: string;
-  quote: string;
-  count: number;
-  data: ScanAsset[];
-  error?: string;
-};
+const COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/markets";
 
-const NOW = () => new Date().toISOString();
+// Simple in-memory cache (best-effort)
+type CacheEntry = { ts: number; payload: ScanResponse };
+const mem = new Map<string, CacheEntry>();
 
-const safeNum = (v: unknown): number | null =>
-  typeof v === 'number' && Number.isFinite(v) ? v : null;
-
-const safeStr = (v: unknown): string =>
-  typeof v === 'string' ? v.trim() : '';
-
-const clamp = (n: number, min: number, max: number) =>
-  Math.max(min, Math.min(max, n));
-
-function toBinancePair(symbol: string, quote: string) {
-  return `${symbol.toUpperCase()}${quote.toUpperCase()}`;
+function cacheKey(opts: { limit: number; sort: SortMode; tf: Timeframe }) {
+  return `scan:v1:eur:${opts.tf}:${opts.limit}:${opts.sort}`;
+}
+function getCache(key: string, ttlMs: number) {
+  const e = mem.get(key);
+  if (!e) return null;
+  if (Date.now() - e.ts > ttlMs) {
+    mem.delete(key);
+    return null;
+  }
+  return e.payload;
+}
+function setCache(key: string, payload: ScanResponse) {
+  mem.set(key, { ts: Date.now(), payload });
 }
 
-function makeBinanceUrls(symbol: string, quote: string) {
-  const pair = toBinancePair(symbol, quote === 'USD' ? 'USDT' : quote);
-  return {
-    binance_url: `https://www.binance.com/en/trade/${pair}`,
-    affiliate_url: `https://www.binance.com/en/trade/${pair}?ref=YOUR_REF`,
-  };
+function parseSort(v: string | null): SortMode {
+  const s = (v || "").trim();
+  const allowed: SortMode[] = ["rank_desc", "rank_asc", "price_desc", "price_asc"];
+  return (allowed.includes(s as SortMode) ? (s as SortMode) : DEFAULT_SORT);
 }
 
-/**
- * 🔒 Fallback stable pour éviter UI vide
- */
-function fallbackUniverse(quote: string): ScanAsset[] {
+function parseTf(v: string | null): Timeframe {
+  const s = (v || "").trim().toUpperCase();
+  const allowed: Timeframe[] = ["24H", "7D", "30D"];
+  return (allowed.includes(s as Timeframe) ? (s as Timeframe) : DEFAULT_TF);
+}
+
+async function fetchCoinGecko(limit: number): Promise<CGMarketItem[]> {
+  const params = new URLSearchParams({
+    vs_currency: "eur",
+    order: "market_cap_desc",
+    per_page: String(limit),
+    page: "1",
+    sparkline: "false",
+    price_change_percentage: "24h",
+  });
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8500);
+
+  try {
+    const res = await fetch(`${COINGECKO_URL}?${params.toString()}`, {
+      method: "GET",
+      headers: { accept: "application/json" },
+      signal: controller.signal,
+      cache: "no-store",
+    });
+
+    if (!res.ok) throw new Error(`CoinGecko HTTP ${res.status}`);
+    const json = (await res.json()) as unknown;
+    if (!Array.isArray(json)) throw new Error("CoinGecko: response not array");
+    return json as CGMarketItem[];
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function fallbackUniverse(tf: Timeframe): ScanAsset[] {
+  // Minimal stable fallback (keeps UI alive)
   const base = [
-    { symbol: 'BTC', name: 'Bitcoin', price: 64456, chg: 0.03, score: 98 },
-    { symbol: 'ETH', name: 'Ethereum', price: 1853, chg: 0.13, score: 92 },
-    { symbol: 'SOL', name: 'Solana', price: 149.07, chg: 3.42, score: 88 },
+    { id: "bitcoin", symbol: "BTC", name: "Bitcoin", price: 60000, chg24: 0.1, mc: 0, vol: 0 },
+    { id: "ethereum", symbol: "ETH", name: "Ethereum", price: 2000, chg24: 0.2, mc: 0, vol: 0 },
+    { id: "tether", symbol: "USDT", name: "Tether", price: 1, chg24: 0.01, mc: 0, vol: 0 },
+    { id: "solana", symbol: "SOL", name: "Solana", price: 150, chg24: 3.2, mc: 0, vol: 0 },
+    { id: "ripple", symbol: "XRP", name: "XRP", price: 0.6, chg24: -0.4, mc: 0, vol: 0 },
+    { id: "binancecoin", symbol: "BNB", name: "BNB", price: 500, chg24: 0.3, mc: 0, vol: 0 },
   ];
 
   return base.map((x) => {
-    const { binance_url, affiliate_url } = makeBinanceUrls(
-      x.symbol,
-      quote
-    );
+    const regime = regimeFromChg24(x.chg24);
+    const stability = computeStabilityIndex({ timeframe: tf, chg24Pct: x.chg24, marketCap: x.mc, volume24h: x.vol });
+    const rank = computeRankScore({ stabilityIndex: stability, regime, timeframe: tf });
 
-    const delta = x.score > 90 ? 1 : -1;
+    const binance_url = buildBinanceUrl(x.symbol);
+    const affiliate_url = buildAffiliateUrl(binance_url);
 
     return {
-      id: x.symbol,
+      id: x.id,
       symbol: x.symbol,
       name: x.name,
-
-      price: x.price,
-      chg_24h_pct: x.chg,
-
-      confidence_score: clamp(x.score, 0, 100),
-
-      regime:
-        x.score >= 85
-          ? 'STABLE'
-          : x.score >= 60
-          ? 'TRANSITION'
-          : 'VOLATILE',
-
+      price_eur: x.price,
+      chg_24h_pct: x.chg24,
+      timeframe: tf,
+      stability_index: stability,
+      rank_score: rank,
       binance_url,
       affiliate_url,
-
-      score_delta: delta,
-      score_trend: delta > 0 ? 'up' : 'down',
+      market_cap: x.mc,
+      volume_24h: x.vol,
+      rank_delta: null,
+      rank_trend: null,
     };
   });
 }
 
-/**
- * ⚙️ Pipeline futur (CoinGecko / KV)
- * Pour l’instant retourne vide -> fallback
- */
-async function getRawUniverse(): Promise<any[]> {
-  return [];
-}
+function normalizeItem(x: CGMarketItem, tf: Timeframe): ScanAsset | null {
+  const id = safeStr(x.id) ?? null;
+  const symbolRaw = safeStr(x.symbol) ?? null;
+  if (!id || !symbolRaw) return null;
 
-function normalizeAsset(raw: any, quote: string): ScanAsset | null {
-  const symbol = safeStr(raw?.symbol || raw?.id);
-  if (!symbol) return null;
+  const symbol = upperSymbol(symbolRaw);
+  const name = safeStr(x.name) ?? titleFromId(id);
 
-  const name = safeStr(raw?.name || symbol);
+  const price = toNum(x.current_price) ?? 0;
+  const chg24 = toNum(x.price_change_percentage_24h) ?? 0;
 
-  const price = safeNum(raw?.price);
-  const chg = safeNum(raw?.chg_24h_pct);
-  const score = clamp(safeNum(raw?.confidence_score) ?? 0, 0, 100);
+  const mc = toNum(x.market_cap ?? undefined) ?? undefined;
+  const vol = toNum(x.total_volume ?? undefined) ?? undefined;
 
-  const delta = safeNum(raw?.score_delta) ?? 0;
+  const regime = regimeFromChg24(chg24);
+  const stability = computeStabilityIndex({
+    timeframe: tf,
+    chg24Pct: chg24,
+    marketCap: mc,
+    volume24h: vol,
+  });
+  const rank = computeRankScore({ stabilityIndex: stability, regime, timeframe: tf });
 
-  const { binance_url, affiliate_url } =
-    raw?.binance_url || raw?.affiliate_url
-      ? {
-          binance_url: raw?.binance_url ?? null,
-          affiliate_url: raw?.affiliate_url ?? null,
-        }
-      : makeBinanceUrls(symbol, quote);
+  const binance_url = buildBinanceUrl(symbol);
+  const affiliate_url = buildAffiliateUrl(binance_url);
 
   return {
-    id: symbol,
+    id,
     symbol,
     name,
-
-    price,
-    chg_24h_pct: chg,
-
-    confidence_score: score,
-
-    regime:
-      score >= 85
-        ? 'STABLE'
-        : score >= 60
-        ? 'TRANSITION'
-        : 'VOLATILE',
-
+    price_eur: price,
+    chg_24h_pct: chg24,
+    timeframe: tf,
+    stability_index: stability,
+    rank_score: rank,
     binance_url,
     affiliate_url,
-
-    score_delta: delta,
-    score_trend: delta > 0 ? 'up' : delta < 0 ? 'down' : null,
+    market_cap: mc,
+    volume_24h: vol,
+    rank_delta: null,
+    rank_trend: null,
   };
 }
 
 export async function GET(req: Request) {
+  const ts = isoNow();
+  const warnings: string[] = [];
+
   try {
-    const url = new URL(req.url);
+    const { searchParams } = new URL(req.url);
 
-    const quote = (url.searchParams.get('quote') || 'USD').toUpperCase();
-    const market = (url.searchParams.get('market') || 'crypto').toLowerCase();
+    const limitReq = toNum(searchParams.get("limit")) ?? DEFAULT_LIMIT;
+    const limit = clamp(Math.floor(limitReq), 1, MAX_LIMIT);
 
-    const raw = await getRawUniverse();
+    const sort = parseSort(searchParams.get("sort"));
+    const tf = parseTf(searchParams.get("tf"));
 
-    const normalized =
-      raw.length > 0
-        ? raw
-            .map((x) => normalizeAsset(x, quote))
-            .filter(Boolean) as ScanAsset[]
-        : [];
+    // V1 note: CoinGecko markets endpoint only provides 24h change.
+    // We accept 7D/30D for UI continuity but warn that it’s “compat” weights.
+    if (tf !== "24H") {
+      warnings.push("TF=7D/30D est en mode compat V1 (source 24h). Candles multi-TF à implémenter ensuite.");
+    }
 
-    const data =
-      normalized.length > 0
-        ? normalized
-        : fallbackUniverse(quote === 'USD' ? 'USDT' : quote);
+    const noStore = (safeStr(searchParams.get("noStore")) ?? "").toLowerCase() === "1";
+    const ttlMs = 45_000;
+    const key = cacheKey({ limit, sort, tf });
 
-    // tri score desc par défaut
-    data.sort(
-      (a, b) =>
-        (b.confidence_score ?? 0) - (a.confidence_score ?? 0)
-    );
+    if (!noStore) {
+      const hit = getCache(key, ttlMs);
+      if (hit) {
+        return NextResponse.json(
+          { ...hit, ts, source: "cache", meta: { ...(hit.meta ?? {}), cache: "hit" } } satisfies ScanResponse,
+          { status: 200, headers: { "cache-control": "no-store" } }
+        );
+      }
+    }
 
-    const res: ScanResponse = {
+    // Fetch size > limit to make sorting meaningful
+    const fetchSize = clamp(Math.max(limit * 2, 80), 50, 250);
+
+    let raw: CGMarketItem[] = [];
+    let source: ScanResponse["source"] = "coingecko";
+
+    try {
+      raw = await fetchCoinGecko(fetchSize);
+    } catch (e: any) {
+      source = "fallback";
+      warnings.push(`CoinGecko indisponible: ${e?.message ?? "unknown"}`);
+      const data = sortAssets(fallbackUniverse(tf), sort).slice(0, limit);
+
+      const payload: ScanResponse = {
+        ok: true,
+        ts,
+        source,
+        market: "crypto",
+        quote: "eur",
+        timeframe: tf,
+        sort,
+        count: data.length,
+        data,
+        meta: { warnings, cache: noStore ? "no-store" : "miss" },
+      };
+
+      if (!noStore) setCache(key, payload);
+      return NextResponse.json(payload, { status: 200, headers: { "cache-control": "no-store" } });
+    }
+
+    const normalized = raw
+      .map((x) => normalizeItem(x, tf))
+      .filter((x): x is ScanAsset => Boolean(x));
+
+    if (!normalized.length) {
+      const data = sortAssets(fallbackUniverse(tf), sort).slice(0, limit);
+      warnings.push("Aucun actif normalisé depuis la source, fallback utilisé.");
+
+      const payload: ScanResponse = {
+        ok: true,
+        ts,
+        source: "fallback",
+        market: "crypto",
+        quote: "eur",
+        timeframe: tf,
+        sort,
+        count: data.length,
+        data,
+        meta: { warnings, cache: noStore ? "no-store" : "miss" },
+      };
+
+      if (!noStore) setCache(key, payload);
+      return NextResponse.json(payload, { status: 200, headers: { "cache-control": "no-store" } });
+    }
+
+    const sorted = sortAssets(normalized, sort).slice(0, limit);
+
+    const payload: ScanResponse = {
       ok: true,
-      ts: NOW(),
-      source: normalized.length > 0 ? 'scan' : 'fallback',
-      market,
-      quote,
-      count: data.length,
-      data,
+      ts,
+      source,
+      market: "crypto",
+      quote: "eur",
+      timeframe: tf,
+      sort,
+      count: sorted.length,
+      data: sorted,
+      meta: { warnings: warnings.length ? warnings : undefined, cache: noStore ? "no-store" : "miss" },
     };
 
-    return NextResponse.json(res, { status: 200 });
+    if (!noStore) setCache(key, payload);
+
+    return NextResponse.json(payload, { status: 200, headers: { "cache-control": "no-store" } });
   } catch (e: any) {
-    return NextResponse.json(
-      {
-        ok: false,
-        ts: NOW(),
-        source: 'fallback',
-        market: 'crypto',
-        quote: 'USD',
-        count: 0,
-        data: [],
-        error: e?.message ?? 'Unknown error',
-      },
-      { status: 500 }
-    );
+    const payload: ScanResponse = {
+      ok: false,
+      ts,
+      source: "fallback",
+      market: "crypto",
+      quote: "eur",
+      timeframe: "24H",
+      sort: "rank_desc",
+      count: 0,
+      data: [],
+      error: e?.message ?? "unknown_error",
+      meta: { warnings: ["scan_failed"] },
+    };
+    return NextResponse.json(payload, { status: 500, headers: { "cache-control": "no-store" } });
   }
 }
