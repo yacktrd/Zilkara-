@@ -1,9 +1,9 @@
-// app/api/context/route.ts
+// app/api/zones/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import {
   enforceApiPolicy,
-  buildApiKeyErrorResponse,
   applyApiAuthHeaders,
+  buildApiKeyErrorResponse,
 } from "@/lib/xyvala/auth";
 import { trackUsage } from "@/lib/xyvala/usage";
 import {
@@ -11,6 +11,8 @@ import {
   getFromCache,
   setToCache,
   type ScanSnapshot,
+  type ScanAsset,
+  type Quote,
 } from "@/lib/xyvala/snapshot";
 
 export const runtime = "nodejs";
@@ -19,29 +21,46 @@ export const dynamic = "force-dynamic";
 const XYVALA_VERSION = "v1";
 const TTL_MS = 45_000;
 
+type ZoneId = "ACCUMULATION" | "SETUP" | "RISK";
 type Regime = "STABLE" | "TRANSITION" | "VOLATILE" | null;
 
-type SnapshotAssetLike = {
-  regime?: string | null;
+type ZoneSummary = {
+  id: ZoneId;
+  label: string;
+  score: number;
+  count: number;
+  share: number;
+  reason_codes: string[];
 };
 
-type ContextResponse = {
+type BestZone = {
+  id: ZoneId;
+  label: string;
+  score: number;
+  count: number;
+  share: number;
+  reason_codes: string[];
+} | null;
+
+type ZonesResponse = {
   ok: boolean;
   ts: string;
   version: string;
 
-  market_regime: Regime;
-  stable_ratio: number | null;
-  transition_ratio: number | null;
-  volatile_ratio: number | null;
+  market: "crypto";
+  quote: Quote;
+  tf: string;
 
-  message: string | null;
+  count: number;
+  zones: ZoneSummary[];
+  best_zone: BestZone;
+
+  source: "scan_cache" | "zones_cache" | "scan_self_heal" | "scan_recomputed";
   error: string | null;
 
-  source: "scan_cache" | "context_cache" | "scan_self_heal" | "scan_recomputed";
   meta: {
     scan_cache_key: string;
-    context_cache_key: string;
+    zones_cache_key: string;
     cache: "hit" | "miss" | "no-store";
     warnings: string[];
   };
@@ -59,114 +78,184 @@ function safeStr(v: unknown): string | null {
   return typeof v === "string" && v.trim().length ? v.trim() : null;
 }
 
+function normalizeQuote(v: string | null): Quote {
+  const s = (v ?? "").trim().toLowerCase();
+  if (s === "usdt" || s === "eur") return s;
+  return "usd";
+}
+
+function normalizeTf(v: string | null): string {
+  const s = safeStr(v)?.toUpperCase();
+  return s ?? "AUTO";
+}
+
 function normalizeRegime(v: unknown): Regime {
   const s = typeof v === "string" ? v.trim().toUpperCase() : "";
   if (s === "STABLE" || s === "TRANSITION" || s === "VOLATILE") return s;
   return null;
 }
 
-function normalizeQuote(v: string | null): "usd" | "usdt" | "eur" {
-  const s = (v ?? "").trim().toLowerCase();
-  if (s === "usdt" || s === "eur") return s;
-  return "usd";
-}
-
-function buildContextResponse(
-  input: Partial<ContextResponse> & Pick<ContextResponse, "ts">
-): ContextResponse {
+function buildZonesResponse(
+  input: Partial<ZonesResponse> & Pick<ZonesResponse, "ts">
+): ZonesResponse {
   return {
     ok: Boolean(input.ok),
     ts: input.ts,
     version: input.version ?? XYVALA_VERSION,
 
-    market_regime: input.market_regime ?? null,
-    stable_ratio: input.stable_ratio ?? null,
-    transition_ratio: input.transition_ratio ?? null,
-    volatile_ratio: input.volatile_ratio ?? null,
+    market: "crypto",
+    quote: input.quote ?? "usd",
+    tf: input.tf ?? "AUTO",
 
-    message: input.message ?? null,
-    error: input.error ?? null,
+    count: input.count ?? 0,
+    zones: input.zones ?? [],
+    best_zone: input.best_zone ?? null,
 
     source: input.source ?? "scan_cache",
+    error: input.error ?? null,
+
     meta: {
       scan_cache_key: input.meta?.scan_cache_key ?? "",
-      context_cache_key: input.meta?.context_cache_key ?? "",
+      zones_cache_key: input.meta?.zones_cache_key ?? "",
       cache: input.meta?.cache ?? "miss",
       warnings: input.meta?.warnings ?? [],
     },
   };
 }
 
-function hasUsableContext(res: Partial<ContextResponse> | null | undefined) {
+function hasUsableZonesResponse(res: ZonesResponse | null | undefined): boolean {
   if (!res) return false;
-
-  return (
-    res.ok === true &&
-    (
-      res.market_regime !== null ||
-      res.stable_ratio !== null ||
-      res.transition_ratio !== null ||
-      res.volatile_ratio !== null
-    )
-  );
+  if (res.ok !== true) return false;
+  return Array.isArray(res.zones) && res.zones.length > 0;
 }
 
-function extractAssetsFromScanJson(scanJson: any): SnapshotAssetLike[] {
-  if (Array.isArray(scanJson?.data)) return scanJson.data;
-  if (Array.isArray(scanJson?.assets)) return scanJson.assets;
+function extractAssetsFromScanJson(scanJson: any): ScanAsset[] {
+  if (Array.isArray(scanJson?.data)) return scanJson.data as ScanAsset[];
+  if (Array.isArray(scanJson?.assets)) return scanJson.assets as ScanAsset[];
   return [];
 }
 
-function extractContextFromSnapshot(snapshot: ScanSnapshot) {
+function zoneLabel(id: ZoneId): string {
+  if (id === "ACCUMULATION") return "Accumulation";
+  if (id === "SETUP") return "Setup";
+  return "Risk";
+}
+
+function classifyAssetZone(asset: Partial<ScanAsset>): {
+  zone: ZoneId;
+  score: number;
+  reason_codes: string[];
+} {
+  const confidence = safeNum(asset.confidence_score) ?? 0;
+  const regime = normalizeRegime(asset.regime);
+  const chg24 = safeNum(asset.chg_24h_pct);
+
+  const reasons: string[] = [];
+
+  if (regime === "VOLATILE") {
+    reasons.push("volatile_regime");
+    if (confidence < 60) reasons.push("low_confidence");
+    return {
+      zone: "RISK",
+      score: Math.max(0, Math.min(100, 100 - confidence * 0.35)),
+      reason_codes: reasons,
+    };
+  }
+
+  if (confidence >= 80 && (regime === "STABLE" || regime === "TRANSITION")) {
+    reasons.push("high_confidence");
+    reasons.push(regime === "STABLE" ? "stable_regime" : "transition_regime");
+    if (chg24 !== null && chg24 < 0) reasons.push("pullback_24h");
+    return {
+      zone: "ACCUMULATION",
+      score: Math.max(0, Math.min(100, confidence)),
+      reason_codes: reasons,
+    };
+  }
+
+  if (confidence >= 65) {
+    reasons.push("medium_high_confidence");
+    if (regime === "TRANSITION") reasons.push("transition_regime");
+    if (chg24 !== null && chg24 > 0) reasons.push("momentum_24h");
+    return {
+      zone: "SETUP",
+      score: Math.max(0, Math.min(100, confidence)),
+      reason_codes: reasons,
+    };
+  }
+
+  reasons.push("insufficient_confidence");
+  if (regime === "STABLE") reasons.push("stable_but_low_score");
   return {
-    market_regime: normalizeRegime(snapshot.context?.market_regime),
-    stable_ratio: safeNum(snapshot.context?.stable_ratio),
-    transition_ratio: safeNum(snapshot.context?.transition_ratio),
-    volatile_ratio: safeNum(snapshot.context?.volatile_ratio),
+    zone: "RISK",
+    score: Math.max(0, Math.min(100, 100 - confidence * 0.4)),
+    reason_codes: reasons,
   };
 }
 
-function recomputeContextFromAssets(data: SnapshotAssetLike[]) {
-  let stable = 0;
-  let transition = 0;
-  let volatile = 0;
+function computeZonesFromAssets(assets: ScanAsset[]): {
+  zones: ZoneSummary[];
+  best_zone: BestZone;
+  count: number;
+} {
+  const buckets: Record<
+    ZoneId,
+    { scoreSum: number; count: number; reasonCodes: Set<string> }
+  > = {
+    ACCUMULATION: { scoreSum: 0, count: 0, reasonCodes: new Set<string>() },
+    SETUP: { scoreSum: 0, count: 0, reasonCodes: new Set<string>() },
+    RISK: { scoreSum: 0, count: 0, reasonCodes: new Set<string>() },
+  };
 
-  for (const asset of data) {
-    const regime = normalizeRegime(asset?.regime);
+  for (const asset of assets) {
+    const classified = classifyAssetZone(asset);
+    const bucket = buckets[classified.zone];
 
-    if (regime === "STABLE") stable += 1;
-    else if (regime === "TRANSITION") transition += 1;
-    else if (regime === "VOLATILE") volatile += 1;
+    bucket.scoreSum += classified.score;
+    bucket.count += 1;
+
+    for (const code of classified.reason_codes) {
+      bucket.reasonCodes.add(code);
+    }
   }
 
-  const total = stable + transition + volatile;
+  const total = assets.length;
 
-  const stable_ratio = total ? stable / total : null;
-  const transition_ratio = total ? transition / total : null;
-  const volatile_ratio = total ? volatile / total : null;
+  const zones: ZoneSummary[] = (Object.keys(buckets) as ZoneId[])
+    .map((id) => {
+      const bucket = buckets[id];
+      const score =
+        bucket.count > 0 ? Number((bucket.scoreSum / bucket.count).toFixed(2)) : 0;
 
-  let market_regime: Regime = null;
+      return {
+        id,
+        label: zoneLabel(id),
+        score,
+        count: bucket.count,
+        share: total > 0 ? Number((bucket.count / total).toFixed(4)) : 0,
+        reason_codes: Array.from(bucket.reasonCodes).sort(),
+      };
+    })
+    .filter((z) => z.count > 0)
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      if (b.count !== a.count) return b.count - a.count;
+      return a.id.localeCompare(b.id);
+    });
 
-  if (volatile_ratio !== null && volatile_ratio >= 0.45) {
-    market_regime = "VOLATILE";
-  } else if (stable_ratio !== null && stable_ratio >= 0.55) {
-    market_regime = "STABLE";
-  } else if (transition_ratio !== null) {
-    market_regime = "TRANSITION";
-  }
+  const best_zone: BestZone = zones.length > 0 ? zones[0] : null;
 
   return {
-    market_regime,
-    stable_ratio,
-    transition_ratio,
-    volatile_ratio,
+    zones,
+    best_zone,
+    count: total,
   };
 }
 
 async function getOrRebuildScanSnapshot(
   req: NextRequest,
   authKey: string,
-  quote: "usd" | "usdt" | "eur",
+  quote: Quote,
   warnings: string[]
 ): Promise<{
   scan_cache_key: string;
@@ -231,11 +320,6 @@ async function getOrRebuildScanSnapshot(
       };
     }
 
-    const contextFromPayload =
-      scanJson?.context && typeof scanJson.context === "object"
-        ? scanJson.context
-        : recomputeContextFromAssets(assets);
-
     const snapshot: ScanSnapshot = {
       ok: true,
       ts: String(scanJson.ts ?? NOW_ISO()),
@@ -251,8 +335,11 @@ async function getOrRebuildScanSnapshot(
       count: Number.isFinite(scanJson.count)
         ? Number(scanJson.count)
         : assets.length,
-      data: assets as any,
-      context: contextFromPayload,
+      data: assets,
+      context:
+        scanJson?.context && typeof scanJson.context === "object"
+          ? scanJson.context
+          : null,
       meta: scanJson.meta ?? {
         limit: 250,
         sort: "score",
@@ -294,7 +381,7 @@ export async function GET(req: NextRequest) {
 
   await trackUsage({
     apiKey: auth.key,
-    endpoint: "/api/context",
+    endpoint: "/api/zones",
   });
 
   try {
@@ -303,6 +390,7 @@ export async function GET(req: NextRequest) {
       req.nextUrl.searchParams.get("noStore") === "true";
 
     const quote = normalizeQuote(req.nextUrl.searchParams.get("quote"));
+    const tf = normalizeTf(req.nextUrl.searchParams.get("tf"));
 
     const { scan_cache_key, snapshot, source } = await getOrRebuildScanSnapshot(
       req,
@@ -311,18 +399,18 @@ export async function GET(req: NextRequest) {
       warnings
     );
 
-    const context_cache_key = `xyvala:context:${XYVALA_VERSION}:quote=${quote}:scan=${scan_cache_key}`;
+    const zones_cache_key = `xyvala:zones:${XYVALA_VERSION}:quote=${quote}:tf=${tf}:scan=${scan_cache_key}`;
 
     if (!noStore) {
-      const cachedContext = await getFromCache<ContextResponse>(context_cache_key, TTL_MS);
+      const hit = await getFromCache<ZonesResponse>(zones_cache_key, TTL_MS);
 
-      if (hasUsableContext(cachedContext)) {
-        const res = buildContextResponse({
-          ...cachedContext,
+      if (hasUsableZonesResponse(hit)) {
+        const res = buildZonesResponse({
+          ...hit,
           ts,
-          source: "context_cache",
+          source: "zones_cache",
           meta: {
-            ...cachedContext!.meta,
+            ...hit!.meta,
             cache: "hit",
           },
         });
@@ -340,25 +428,25 @@ export async function GET(req: NextRequest) {
         );
       }
 
-      if (cachedContext && !hasUsableContext(cachedContext)) {
-        warnings.push("stale_empty_context_cache_ignored");
+      if (hit && !hasUsableZonesResponse(hit)) {
+        warnings.push("stale_empty_zones_cache_ignored");
       }
     }
 
-    if (!snapshot) {
-      const res = buildContextResponse({
+    if (!snapshot || !Array.isArray(snapshot.data) || snapshot.data.length === 0) {
+      const res = buildZonesResponse({
         ok: false,
         ts,
-        market_regime: null,
-        stable_ratio: null,
-        transition_ratio: null,
-        volatile_ratio: null,
-        message: null,
-        error: "scan_snapshot_missing",
+        quote,
+        tf,
+        count: 0,
+        zones: [],
+        best_zone: null,
         source,
+        error: "scan_snapshot_missing",
         meta: {
           scan_cache_key,
-          context_cache_key,
+          zones_cache_key,
           cache: noStore ? "no-store" : "miss",
           warnings,
         },
@@ -370,56 +458,37 @@ export async function GET(req: NextRequest) {
           headers: {
             "cache-control": "no-store",
             "x-xyvala-version": XYVALA_VERSION,
+            "x-xyvala-cache": noStore ? "no-store" : "miss",
           },
         }),
         auth
       );
     }
 
-    let extracted = extractContextFromSnapshot(snapshot);
+    const computed = computeZonesFromAssets(snapshot.data as ScanAsset[]);
 
-    const needsRecompute =
-      extracted.market_regime === null &&
-      extracted.stable_ratio === null &&
-      extracted.transition_ratio === null &&
-      extracted.volatile_ratio === null;
+    const ok = computed.zones.length > 0 && computed.best_zone !== null;
 
-    if (needsRecompute) {
-      const assets = Array.isArray((snapshot as any)?.data)
-        ? ((snapshot as any).data as SnapshotAssetLike[])
-        : [];
-
-      if (assets.length > 0) {
-        extracted = recomputeContextFromAssets(assets);
-        warnings.push("context_recomputed_from_assets");
-      }
-    }
-
-    const ok = hasUsableContext({
-      ok: true,
-      ...extracted,
-    });
-
-    const res = buildContextResponse({
+    const res = buildZonesResponse({
       ok,
       ts,
-      market_regime: extracted.market_regime,
-      stable_ratio: extracted.stable_ratio,
-      transition_ratio: extracted.transition_ratio,
-      volatile_ratio: extracted.volatile_ratio,
-      message: null,
-      error: ok ? null : "context_unavailable",
-      source: needsRecompute ? "scan_recomputed" : source,
+      quote,
+      tf,
+      count: computed.count,
+      zones: computed.zones,
+      best_zone: computed.best_zone,
+      source: source === "scan_self_heal" ? "scan_recomputed" : source,
+      error: ok ? null : "zones_unavailable",
       meta: {
         scan_cache_key,
-        context_cache_key,
+        zones_cache_key,
         cache: noStore ? "no-store" : "miss",
         warnings,
       },
     });
 
     if (!noStore && res.ok) {
-      await setToCache(context_cache_key, res);
+      await setToCache(zones_cache_key, res);
     }
 
     return applyApiAuthHeaders(
@@ -434,19 +503,19 @@ export async function GET(req: NextRequest) {
       auth
     );
   } catch (e: any) {
-    const res = buildContextResponse({
+    const res = buildZonesResponse({
       ok: false,
       ts,
-      market_regime: null,
-      stable_ratio: null,
-      transition_ratio: null,
-      volatile_ratio: null,
-      message: null,
-      error: e?.message ? String(e.message) : "unknown_error",
+      quote: "usd",
+      tf: "AUTO",
+      count: 0,
+      zones: [],
+      best_zone: null,
       source: "scan_self_heal",
+      error: e?.message ? String(e.message) : "unknown_error",
       meta: {
         scan_cache_key: "",
-        context_cache_key: "",
+        zones_cache_key: "",
         cache: "no-store",
         warnings: ["route_exception"],
       },
@@ -458,6 +527,7 @@ export async function GET(req: NextRequest) {
         headers: {
           "cache-control": "no-store",
           "x-xyvala-version": XYVALA_VERSION,
+          "x-xyvala-cache": "no-store",
         },
       }),
       auth

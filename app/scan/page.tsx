@@ -1,27 +1,37 @@
 // app/scan/page.tsx
-import ScanTable from "./scan-table";
+import { getXyvalaScan, type ScanAsset } from "@/lib/xyvala/scan";
+import { ScanTable } from "@/components/scan-table";
 
-export const revalidate = 0;
+type ScanTableItem = ScanAsset & {
+  affiliate_url: string;
+};
 
-async function getScan() {
-  const res = await fetch(`${process.env.NEXT_PUBLIC_APP_URL}/api/scan`, {
-    cache: "no-store",
-  });
-  if (!res.ok) throw new Error("Failed to load scan");
-  return res.json();
+function normalizeItems(items: ScanAsset[]): ScanTableItem[] {
+  return items.map((item) => ({
+    ...item,
+    affiliate_url: item.affiliate_url ?? item.binance_url,
+  }));
 }
 
 export default async function ScanPage() {
-  const data = await getScan();
+  const result = await getXyvalaScan({
+    quote: "usd",
+    sort: "score_desc",
+    limit: 100,
+  });
+
+  const items = normalizeItems(result.data ?? []);
 
   return (
-    <main style={{ padding: 16, maxWidth: 1100, margin: "0 auto" }}>
-      <h1 style={{ margin: "0 0 12px 0" }}>Scan — Confidence</h1>
-      <p style={{ margin: "0 0 16px 0", opacity: 0.7 }}>
-        Sorted by confidence score (desc). Last 24h context.
-      </p>
+    <main className="mx-auto max-w-7xl px-4 py-8">
+      <div className="mb-6">
+        <h1 className="text-2xl font-semibold tracking-tight">Xyvala Scan</h1>
+        <p className="mt-2 text-sm text-neutral-500">
+          Structured crypto scan ranked by confidence score.
+        </p>
+      </div>
 
-      <ScanTable items={data.items ?? []} />
+      <ScanTable items={items} />
     </main>
   );
 }

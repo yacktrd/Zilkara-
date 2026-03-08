@@ -1,295 +1,912 @@
-// app/api/scan/route.ts
-import { NextResponse } from "next/server";
-import type { ScanAsset, ScanResponse, SortMode, Timeframe } from "@/lib/types";
-import { isoNow, safeStr, toNum, clamp, titleFromId, upperSymbol } from "@/lib/utils";
-import { buildAffiliateUrl, buildBinanceUrl } from "@/lib/binance";
-import { computeRankScore, computeStabilityIndex, regimeFromChg24 } from "@/lib/stability";
-import { sortAssets } from "@/lib/sort";
+import { NextRequest, NextResponse } from "next/server"
+import {
+  validateApiKey,
+  buildApiKeyErrorResponse,
+  applyApiAuthHeaders
+} from "@/lib/xyvala/auth"
 
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
+export const runtime = "nodejs"
+export const dynamic = "force-dynamic"
 
-const DEFAULT_LIMIT = 200;
-const MAX_LIMIT = 250;
-const DEFAULT_SORT: SortMode = "rank_desc";
-const DEFAULT_TF: Timeframe = "24H";
+/* -------------------------------------------------------------------------- */
+/* Config                                                                      */
+/* -------------------------------------------------------------------------- */
 
-type CGMarketItem = {
-  id?: string;
-  symbol?: string;
-  name?: string;
-  current_price?: number;
-  price_change_percentage_24h?: number | null;
-  market_cap?: number | null;
-  total_volume?: number | null;
-};
+const API_VERSION = 1
+const BINANCE_BASE_URL = process.env.BINANCE_BASE_URL ?? "https://api.binance.com"
 
-const COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/markets";
+const DEFAULT_LIMIT = 20
+const MAX_LIMIT = 50
+const CACHE_TTL_MS = 60_000
+const FETCH_TIMEOUT_MS = 8_000
+const KLINES_INTERVAL = "1d"
+const KLINES_LIMIT = 31
+const KLINE_CONCURRENCY = 6
 
-// Simple in-memory cache (best-effort)
-type CacheEntry = { ts: number; payload: ScanResponse };
-const mem = new Map<string, CacheEntry>();
+const RATE_LIMIT_WINDOW_MS = 60_000
+const RATE_LIMIT_MAX_REQUESTS = 60
 
-function cacheKey(opts: { limit: number; sort: SortMode; tf: Timeframe }) {
-  return `scan:v1:eur:${opts.tf}:${opts.limit}:${opts.sort}`;
+const TOP_SYMBOLS_DEFAULT = [
+  "BTCUSDT",
+  "ETHUSDT",
+  "BNBUSDT",
+  "SOLUSDT",
+  "XRPUSDT",
+  "DOGEUSDT",
+  "ADAUSDT",
+  "AVAXUSDT",
+  "LINKUSDT",
+  "TRXUSDT",
+  "DOTUSDT",
+  "MATICUSDT",
+  "LTCUSDT",
+  "BCHUSDT",
+  "ATOMUSDT",
+  "ETCUSDT",
+  "XLMUSDT",
+  "FILUSDT",
+  "APTUSDT",
+  "ARBUSDT",
+  "NEARUSDT",
+  "OPUSDT",
+  "UNIUSDT",
+  "ICPUSDT",
+  "SUIUSDT",
+  "PEPEUSDT",
+  "INJUSDT",
+  "FETUSDT",
+  "RNDRUSDT",
+  "TIAUSDT",
+  "TAOUSDT",
+  "SEIUSDT",
+  "AAVEUSDT",
+  "GRTUSDT",
+  "RUNEUSDT",
+  "ALGOUSDT",
+  "VETUSDT",
+  "HBARUSDT",
+  "MKRUSDT",
+  "EGLDUSDT",
+  "THETAUSDT",
+  "IMXUSDT",
+  "JUPUSDT",
+  "WIFUSDT",
+  "TONUSDT",
+  "BONKUSDT",
+  "KASUSDT",
+  "PYTHUSDT",
+  "ARUSDT",
+  "ENAUSDT"
+] as const
+
+/* -------------------------------------------------------------------------- */
+/* Types                                                                       */
+/* -------------------------------------------------------------------------- */
+
+type Regime = "STABLE" | "TRANSITION" | "VOLATILE"
+type ConfidenceLabel = "HIGH" | "MEDIUM" | "LOW"
+type Rating = "A" | "B" | "C" | "D"
+
+type Binance24hTicker = {
+  symbol: string
+  lastPrice: string
+  priceChangePercent: string
+  quoteVolume: string
+  volume: string
 }
-function getCache(key: string, ttlMs: number) {
-  const e = mem.get(key);
-  if (!e) return null;
-  if (Date.now() - e.ts > ttlMs) {
-    mem.delete(key);
-    return null;
+
+type KlineTuple = [
+  number,
+  string,
+  string,
+  string,
+  string,
+  string,
+  number,
+  string,
+  number,
+  string,
+  string,
+  string
+]
+
+type PrevState = {
+  ts: string
+  stability_score: number
+  regime: Regime
+  confidence_score: number
+}
+
+type ScanAsset = {
+  symbol: string
+  price: number
+  chg_24h_pct: number
+  chg_7d_pct: number
+  chg_30d_pct: number
+  volume_24h: number
+  quote_volume_24h: number
+
+  stability_score: number
+  rating: Rating
+  regime: Regime
+
+  confidence_score: number
+  confidence_label: ConfidenceLabel
+  confidence_reason: string
+
+  prev: PrevState | null
+  delta_score: number | null
+  regime_change: string | null
+
+  rupture_rate: number
+  similarity: number | null
+}
+
+type ScanMeta = {
+  source: "binance"
+  market: "spot"
+  pairs: string
+  score_timeframe: string
+  inputs: string[]
+
+  cache: boolean
+  cache_layer: "memory"
+  cache_ttl_sec: number
+  refresh_interval_sec: number
+  cache_status: "HIT" | "MISS" | "STALE"
+
+  atomic: true
+  last_refresh_ts: string
+  duration_ms: number
+  count: number
+  limit: number
+  filtered: number
+  nulls: number
+
+  api_version: number
+
+  score_method: string
+  score_range: "0-100"
+  normalization_window: string
+  baseline_window: string
+  normalized: true
+
+  confidence_method: string
+  confidence_inputs: string[]
+
+  fallback?: "last_good_snapshot"
+  mode?: "normal" | "degraded"
+}
+
+type ScanSuccessResponse = {
+  ok: true
+  source: "scan"
+  ts: string
+  api_version: number
+  meta: ScanMeta
+  data: ScanAsset[]
+  error: null
+}
+
+type ScanErrorResponse = {
+  ok: false
+  source: "scan"
+  ts: string
+  api_version: number
+  meta: Partial<ScanMeta>
+  data: []
+  error: {
+    code: string
+    message: string
+    retry_after_sec?: number
   }
-  return e.payload;
-}
-function setCache(key: string, payload: ScanResponse) {
-  mem.set(key, { ts: Date.now(), payload });
 }
 
-function parseSort(v: string | null): SortMode {
-  const s = (v || "").trim();
-  const allowed: SortMode[] = ["rank_desc", "rank_asc", "price_desc", "price_asc"];
-  return (allowed.includes(s as SortMode) ? (s as SortMode) : DEFAULT_SORT);
+type CacheSnapshot = {
+  payload: ScanSuccessResponse
+  expiresAt: number
+  lastGoodPayload: ScanSuccessResponse | null
+  prevBySymbol: Record<string, PrevState>
 }
 
-function parseTf(v: string | null): Timeframe {
-  const s = (v || "").trim().toUpperCase();
-  const allowed: Timeframe[] = ["24H", "7D", "30D"];
-  return (allowed.includes(s as Timeframe) ? (s as Timeframe) : DEFAULT_TF);
+type RateBucket = {
+  count: number
+  resetAt: number
 }
 
-async function fetchCoinGecko(limit: number): Promise<CGMarketItem[]> {
-  const params = new URLSearchParams({
-    vs_currency: "eur",
-    order: "market_cap_desc",
-    per_page: String(limit),
-    page: "1",
-    sparkline: "false",
-    price_change_percentage: "24h",
-  });
+type GlobalStore = {
+  scanCache?: CacheSnapshot
+  rateBuckets?: Map<string, RateBucket>
+}
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 8500);
+/* -------------------------------------------------------------------------- */
+/* Global store                                                                */
+/* -------------------------------------------------------------------------- */
 
-  try {
-    const res = await fetch(`${COINGECKO_URL}?${params.toString()}`, {
-      method: "GET",
-      headers: { accept: "application/json" },
-      signal: controller.signal,
-      cache: "no-store",
-    });
+const globalStore = globalThis as typeof globalThis & {
+  __xyvalaGlobal?: GlobalStore
+}
 
-    if (!res.ok) throw new Error(`CoinGecko HTTP ${res.status}`);
-    const json = (await res.json()) as unknown;
-    if (!Array.isArray(json)) throw new Error("CoinGecko: response not array");
-    return json as CGMarketItem[];
-  } finally {
-    clearTimeout(timeout);
+if (!globalStore.__xyvalaGlobal) {
+  globalStore.__xyvalaGlobal = {
+    rateBuckets: new Map<string, RateBucket>()
   }
 }
 
-function fallbackUniverse(tf: Timeframe): ScanAsset[] {
-  // Minimal stable fallback (keeps UI alive)
-  const base = [
-    { id: "bitcoin", symbol: "BTC", name: "Bitcoin", price: 60000, chg24: 0.1, mc: 0, vol: 0 },
-    { id: "ethereum", symbol: "ETH", name: "Ethereum", price: 2000, chg24: 0.2, mc: 0, vol: 0 },
-    { id: "tether", symbol: "USDT", name: "Tether", price: 1, chg24: 0.01, mc: 0, vol: 0 },
-    { id: "solana", symbol: "SOL", name: "Solana", price: 150, chg24: 3.2, mc: 0, vol: 0 },
-    { id: "ripple", symbol: "XRP", name: "XRP", price: 0.6, chg24: -0.4, mc: 0, vol: 0 },
-    { id: "binancecoin", symbol: "BNB", name: "BNB", price: 500, chg24: 0.3, mc: 0, vol: 0 },
-  ];
+function getCache(): CacheSnapshot | undefined {
+  return globalStore.__xyvalaGlobal?.scanCache
+}
 
-  return base.map((x) => {
-    const regime = regimeFromChg24(x.chg24);
-    const stability = computeStabilityIndex({ timeframe: tf, chg24Pct: x.chg24, marketCap: x.mc, volume24h: x.vol });
-    const rank = computeRankScore({ stabilityIndex: stability, regime, timeframe: tf });
+function setCache(snapshot: CacheSnapshot) {
+  if (!globalStore.__xyvalaGlobal) {
+    globalStore.__xyvalaGlobal = { rateBuckets: new Map<string, RateBucket>() }
+  }
+  globalStore.__xyvalaGlobal.scanCache = snapshot
+}
 
-    const binance_url = buildBinanceUrl(x.symbol);
-    const affiliate_url = buildAffiliateUrl(binance_url);
+function getRateBuckets(): Map<string, RateBucket> {
+  if (!globalStore.__xyvalaGlobal) {
+    globalStore.__xyvalaGlobal = { rateBuckets: new Map<string, RateBucket>() }
+  }
+  if (!globalStore.__xyvalaGlobal.rateBuckets) {
+    globalStore.__xyvalaGlobal.rateBuckets = new Map<string, RateBucket>()
+  }
+  return globalStore.__xyvalaGlobal.rateBuckets
+}
 
+/* -------------------------------------------------------------------------- */
+/* Helpers                                                                     */
+/* -------------------------------------------------------------------------- */
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max)
+}
+
+function round2(value: number): number {
+  return Math.round(value * 100) / 100
+}
+
+function toNumber(value: string | number | null | undefined, fallback = 0): number {
+  if (typeof value === "number" && Number.isFinite(value)) return value
+  if (typeof value === "string") {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return fallback
+}
+
+function normalizeSymbol(input: string): string | null {
+  const raw = input.trim().toUpperCase().replace(/[^A-Z0-9]/g, "")
+  if (!raw) return null
+  if (!/^[A-Z0-9]+$/.test(raw)) return null
+  if (raw.endsWith("USDT")) return raw
+  return `${raw}USDT`
+}
+
+function parseSymbolsParam(req: NextRequest): string[] {
+  const raw = req.nextUrl.searchParams.get("symbols")
+  const limitParam = toNumber(req.nextUrl.searchParams.get("limit"), DEFAULT_LIMIT)
+  const limit = clamp(Math.floor(limitParam), 1, MAX_LIMIT)
+
+  if (!raw) {
+    return [...TOP_SYMBOLS_DEFAULT.slice(0, limit)]
+  }
+
+  const normalized = raw
+    .split(",")
+    .map((s) => normalizeSymbol(s))
+    .filter((s): s is string => Boolean(s))
+
+  const unique = [...new Set(normalized)]
+  return unique.slice(0, limit)
+}
+
+function getClientIp(req: NextRequest): string {
+  const xfwd = req.headers.get("x-forwarded-for")
+  if (xfwd) return xfwd.split(",")[0]?.trim() || "unknown"
+  return req.headers.get("x-real-ip") || "unknown"
+}
+
+function applyRateLimit(req: NextRequest): { ok: true } | { ok: false; retryAfterSec: number } {
+  const ip = getClientIp(req)
+  const buckets = getRateBuckets()
+  const now = Date.now()
+
+  const current = buckets.get(ip)
+  if (!current || current.resetAt <= now) {
+    buckets.set(ip, {
+      count: 1,
+      resetAt: now + RATE_LIMIT_WINDOW_MS
+    })
+    return { ok: true }
+  }
+
+  if (current.count >= RATE_LIMIT_MAX_REQUESTS) {
     return {
-      id: x.id,
-      symbol: x.symbol,
-      name: x.name,
-      price_eur: x.price,
-      chg_24h_pct: x.chg24,
-      timeframe: tf,
-      stability_index: stability,
-      rank_score: rank,
-      binance_url,
-      affiliate_url,
-      market_cap: x.mc,
-      volume_24h: x.vol,
-      rank_delta: null,
-      rank_trend: null,
-    };
-  });
+      ok: false,
+      retryAfterSec: Math.max(1, Math.ceil((current.resetAt - now) / 1000))
+    }
+  }
+
+  current.count += 1
+  buckets.set(ip, current)
+  return { ok: true }
 }
 
-function normalizeItem(x: CGMarketItem, tf: Timeframe): ScanAsset | null {
-  const id = safeStr(x.id) ?? null;
-  const symbolRaw = safeStr(x.symbol) ?? null;
-  if (!id || !symbolRaw) return null;
-
-  const symbol = upperSymbol(symbolRaw);
-  const name = safeStr(x.name) ?? titleFromId(id);
-
-  const price = toNum(x.current_price) ?? 0;
-  const chg24 = toNum(x.price_change_percentage_24h) ?? 0;
-
-  const mc = toNum(x.market_cap ?? undefined) ?? undefined;
-  const vol = toNum(x.total_volume ?? undefined) ?? undefined;
-
-  const regime = regimeFromChg24(chg24);
-  const stability = computeStabilityIndex({
-    timeframe: tf,
-    chg24Pct: chg24,
-    marketCap: mc,
-    volume24h: vol,
-  });
-  const rank = computeRankScore({ stabilityIndex: stability, regime, timeframe: tf });
-
-  const binance_url = buildBinanceUrl(symbol);
-  const affiliate_url = buildAffiliateUrl(binance_url);
-
-  return {
-    id,
-    symbol,
-    name,
-    price_eur: price,
-    chg_24h_pct: chg24,
-    timeframe: tf,
-    stability_index: stability,
-    rank_score: rank,
-    binance_url,
-    affiliate_url,
-    market_cap: mc,
-    volume_24h: vol,
-    rank_delta: null,
-    rank_trend: null,
-  };
-}
-
-export async function GET(req: Request) {
-  const ts = isoNow();
-  const warnings: string[] = [];
+async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS)
 
   try {
-    const { searchParams } = new URL(req.url);
+    const res = await fetch(url, {
+      ...init,
+      signal: controller.signal,
+      headers: {
+        "content-type": "application/json",
+        ...(init?.headers ?? {})
+      },
+      cache: "no-store"
+    })
 
-    const limitReq = toNum(searchParams.get("limit")) ?? DEFAULT_LIMIT;
-    const limit = clamp(Math.floor(limitReq), 1, MAX_LIMIT);
-
-    const sort = parseSort(searchParams.get("sort"));
-    const tf = parseTf(searchParams.get("tf"));
-
-    // V1 note: CoinGecko markets endpoint only provides 24h change.
-    // We accept 7D/30D for UI continuity but warn that it’s “compat” weights.
-    if (tf !== "24H") {
-      warnings.push("TF=7D/30D est en mode compat V1 (source 24h). Candles multi-TF à implémenter ensuite.");
+    if (!res.ok) {
+      const text = await res.text().catch(() => "")
+      throw new Error(`Upstream ${res.status} ${res.statusText}${text ? ` — ${text.slice(0, 180)}` : ""}`)
     }
 
-    const noStore = (safeStr(searchParams.get("noStore")) ?? "").toLowerCase() === "1";
-    const ttlMs = 45_000;
-    const key = cacheKey({ limit, sort, tf });
+    return (await res.json()) as T
+  } finally {
+    clearTimeout(timeout)
+  }
+}
 
-    if (!noStore) {
-      const hit = getCache(key, ttlMs);
-      if (hit) {
-        return NextResponse.json(
-          { ...hit, ts, source: "cache", meta: { ...(hit.meta ?? {}), cache: "hit" } } satisfies ScanResponse,
-          { status: 200, headers: { "cache-control": "no-store" } }
-        );
+async function mapLimit<T, R>(
+  items: T[],
+  limit: number,
+  mapper: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length)
+  let cursor = 0
+
+  async function worker() {
+    while (true) {
+      const index = cursor++
+      if (index >= items.length) return
+      results[index] = await mapper(items[index], index)
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker())
+  await Promise.all(workers)
+  return results
+}
+
+function getRegime(stabilityScore: number): Regime {
+  if (stabilityScore >= 80) return "STABLE"
+  if (stabilityScore >= 60) return "TRANSITION"
+  return "VOLATILE"
+}
+
+function getRating(stabilityScore: number): Rating {
+  if (stabilityScore >= 85) return "A"
+  if (stabilityScore >= 70) return "B"
+  if (stabilityScore >= 55) return "C"
+  return "D"
+}
+
+function getConfidenceLabel(confidenceScore: number): ConfidenceLabel {
+  if (confidenceScore >= 80) return "HIGH"
+  if (confidenceScore >= 60) return "MEDIUM"
+  return "LOW"
+}
+
+function getConfidenceReason(params: {
+  regime: Regime
+  shockPenalty: number
+  transitionPenalty: number
+  ruptureRate: number
+  chg24: number
+  chg7: number
+}): string {
+  const { regime, shockPenalty, transitionPenalty, ruptureRate, chg24, chg7 } = params
+
+  if (regime === "VOLATILE") {
+    if (shockPenalty > 0) return "Contexte instable : variation brutale récente."
+    return "Contexte instable : structure bruitée."
+  }
+
+  if (regime === "TRANSITION") {
+    if (transitionPenalty > 0) return "Transition détectée : prudence."
+    return "Contexte intermédiaire : qualité moyenne."
+  }
+
+  if (ruptureRate <= 20 && Math.abs(chg24) <= 4 && Math.abs(chg7) <= 10) {
+    return "Contexte stable."
+  }
+
+  return "Contexte propre mais à surveiller."
+}
+
+function computeStabilityScore(params: {
+  chg24: number
+  chg7: number
+  chg30: number
+  signMismatchCount: number
+  ruptureRate: number
+}): number {
+  const { chg24, chg7, chg30, signMismatchCount, ruptureRate } = params
+
+  const norm24 = clamp(Math.abs(chg24) / 10, 0, 1)
+  const norm7 = clamp(Math.abs(chg7) / 20, 0, 1)
+  const norm30 = clamp(Math.abs(chg30) / 40, 0, 1)
+
+  const mismatchPenalty = signMismatchCount * 7.5
+  const rupturePenalty = Math.min(ruptureRate * 0.8, 24)
+
+  const raw =
+    100 -
+    norm24 * 18 -
+    norm7 * 22 -
+    norm30 * 18 -
+    mismatchPenalty -
+    rupturePenalty
+
+  return round2(clamp(raw, 0, 100))
+}
+
+function computeRuptureRate(params: {
+  chg24: number
+  chg7: number
+  chg30: number
+  signMismatchCount: number
+}): number {
+  const { chg24, chg7, chg30, signMismatchCount } = params
+
+  const base =
+    clamp(Math.abs(chg24) / 8, 0, 1) * 18 +
+    clamp(Math.abs(chg7) / 20, 0, 1) * 22 +
+    clamp(Math.abs(chg30) / 40, 0, 1) * 12 +
+    signMismatchCount * 8
+
+  return round2(clamp(base, 0, 100))
+}
+
+function computeShockPenalty(chg24: number, chg7: number): number {
+  if (Math.abs(chg24) >= 8 || Math.abs(chg7) >= 18) return 12
+  if (Math.abs(chg24) >= 5 || Math.abs(chg7) >= 12) return 6
+  return 0
+}
+
+function computeTransitionPenalty(regime: Regime): number {
+  if (regime === "TRANSITION") return 10
+  if (regime === "VOLATILE") return 25
+  return 0
+}
+
+function signOf(value: number): number {
+  if (value > 0) return 1
+  if (value < 0) return -1
+  return 0
+}
+
+function countSignMismatches(values: number[]): number {
+  const signs = values.map(signOf)
+  let mismatches = 0
+  for (let i = 1; i < signs.length; i += 1) {
+    if (signs[i] !== 0 && signs[i - 1] !== 0 && signs[i] !== signs[i - 1]) {
+      mismatches += 1
+    }
+  }
+  return mismatches
+}
+
+function computeLiquidityBonus(quoteVolume24h: number, maxQuoteVolume24h: number): number {
+  if (!Number.isFinite(quoteVolume24h) || quoteVolume24h <= 0 || maxQuoteVolume24h <= 0) {
+    return 0
+  }
+
+  const ratio = clamp(quoteVolume24h / maxQuoteVolume24h, 0, 1)
+  return round2(clamp(Math.sqrt(ratio) * 5, 0, 5))
+}
+
+function computePercentChange(current: number, past: number): number {
+  if (!Number.isFinite(current) || !Number.isFinite(past) || past === 0) return 0
+  return round2(((current - past) / past) * 100)
+}
+
+function makeResponse(
+  auth: ReturnType<typeof validateApiKey>,
+  payload: ScanSuccessResponse | ScanErrorResponse,
+  status: number,
+  extraHeaders?: Record<string, string>
+) {
+  const response = NextResponse.json(payload, { status })
+
+  if (extraHeaders) {
+    Object.entries(extraHeaders).forEach(([key, value]) => {
+      response.headers.set(key, value)
+    })
+  }
+
+  return applyApiAuthHeaders(response, auth as never)
+}
+
+function getPrevBySymbolFromCache(): Record<string, PrevState> {
+  return getCache()?.prevBySymbol ?? {}
+}
+
+function buildMeta(params: {
+  count: number
+  limit: number
+  durationMs: number
+  cacheStatus: "HIT" | "MISS" | "STALE"
+  lastRefreshTs: string
+  filtered: number
+  nulls: number
+  mode?: "normal" | "degraded"
+  fallback?: "last_good_snapshot"
+}): ScanMeta {
+  return {
+    source: "binance",
+    market: "spot",
+    pairs: "*_USDT",
+    score_timeframe: KLINES_INTERVAL,
+    inputs: ["price", "chg_24h_pct", "chg_7d_pct", "chg_30d_pct", "quote_volume_24h"],
+
+    cache: true,
+    cache_layer: "memory",
+    cache_ttl_sec: Math.floor(CACHE_TTL_MS / 1000),
+    refresh_interval_sec: Math.floor(CACHE_TTL_MS / 1000),
+    cache_status: params.cacheStatus,
+
+    atomic: true,
+    last_refresh_ts: params.lastRefreshTs,
+    duration_ms: params.durationMs,
+    count: params.count,
+    limit: params.limit,
+    filtered: params.filtered,
+    nulls: params.nulls,
+
+    api_version: API_VERSION,
+
+    score_method: "stability (volatility+dispersion+liquidity; normalized)",
+    score_range: "0-100",
+    normalization_window: "30d rolling",
+    baseline_window: "365d",
+    normalized: true,
+
+    confidence_method: "v1",
+    confidence_inputs: [
+      "stability_score",
+      "liquidity_bonus",
+      "shock_penalty",
+      "transition_penalty"
+    ],
+
+    ...(params.fallback ? { fallback: params.fallback } : {}),
+    mode: params.mode ?? "normal"
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Binance access                                                              */
+/* -------------------------------------------------------------------------- */
+
+async function fetch24hTickers(symbols: string[]): Promise<Binance24hTicker[]> {
+  const symbolsJson = JSON.stringify(symbols)
+  const url = `${BINANCE_BASE_URL}/api/v3/ticker/24hr?symbols=${encodeURIComponent(symbolsJson)}`
+  return fetchJson<Binance24hTicker[]>(url)
+}
+
+async function fetchKlines(symbol: string): Promise<KlineTuple[]> {
+  const url = `${BINANCE_BASE_URL}/api/v3/klines?symbol=${symbol}&interval=${KLINES_INTERVAL}&limit=${KLINES_LIMIT}`
+  return fetchJson<KlineTuple[]>(url)
+}
+
+/* -------------------------------------------------------------------------- */
+/* Builder                                                                     */
+/* -------------------------------------------------------------------------- */
+
+async function buildScanPayload(symbols: string[]): Promise<ScanSuccessResponse> {
+  const startedAt = Date.now()
+
+  const tickers = await fetch24hTickers(symbols)
+  const tickerMap = new Map(tickers.map((t) => [t.symbol, t]))
+
+  const rawKlines = await mapLimit(symbols, KLINE_CONCURRENCY, async (symbol) => {
+    const klines = await fetchKlines(symbol)
+    return { symbol, klines }
+  })
+
+  const klineMap = new Map(rawKlines.map((item) => [item.symbol, item.klines]))
+
+  const maxQuoteVolume24h = Math.max(
+    0,
+    ...tickers.map((t) => toNumber(t.quoteVolume, 0))
+  )
+
+  const prevBySymbol = getPrevBySymbolFromCache()
+
+  let filtered = 0
+  let nulls = 0
+
+  const assets: ScanAsset[] = []
+
+  for (const symbol of symbols) {
+    const ticker = tickerMap.get(symbol)
+    const klines = klineMap.get(symbol)
+
+    if (!ticker || !klines || klines.length < 8) {
+      filtered += 1
+      continue
+    }
+
+    const currentPrice = toNumber(ticker.lastPrice, NaN)
+    const chg24 = round2(toNumber(ticker.priceChangePercent, 0))
+    const quoteVolume24h = toNumber(ticker.quoteVolume, 0)
+    const volume24h = toNumber(ticker.volume, 0)
+
+    const closes = klines.map((k) => toNumber(k[4], NaN)).filter(Number.isFinite)
+    if (closes.length < 8 || !Number.isFinite(currentPrice)) {
+      filtered += 1
+      nulls += 1
+      continue
+    }
+
+    const idx7 = Math.max(0, closes.length - 8)
+    const idx30 = Math.max(0, closes.length - 31)
+
+    const chg7 = computePercentChange(closes[closes.length - 1], closes[idx7])
+    const chg30 = computePercentChange(closes[closes.length - 1], closes[idx30])
+
+    const signMismatchCount = countSignMismatches([chg24, chg7, chg30])
+    const ruptureRate = computeRuptureRate({
+      chg24,
+      chg7,
+      chg30,
+      signMismatchCount
+    })
+
+    const stabilityScore = computeStabilityScore({
+      chg24,
+      chg7,
+      chg30,
+      signMismatchCount,
+      ruptureRate
+    })
+
+    const regime = getRegime(stabilityScore)
+    const rating = getRating(stabilityScore)
+
+    const liquidityBonus = computeLiquidityBonus(quoteVolume24h, maxQuoteVolume24h)
+    const shockPenalty = computeShockPenalty(chg24, chg7)
+    const transitionPenalty = computeTransitionPenalty(regime)
+
+    const confidenceScore = round2(
+      clamp(
+        stabilityScore +
+          liquidityBonus -
+          shockPenalty -
+          transitionPenalty,
+        0,
+        100
+      )
+    )
+
+    const confidenceLabel = getConfidenceLabel(confidenceScore)
+    const confidenceReason = getConfidenceReason({
+      regime,
+      shockPenalty,
+      transitionPenalty,
+      ruptureRate,
+      chg24,
+      chg7
+    })
+
+    const prev = prevBySymbol[symbol] ?? null
+    const deltaScore = prev ? round2(confidenceScore - prev.confidence_score) : null
+    const regimeChange = prev && prev.regime !== regime ? `${prev.regime}->${regime}` : null
+
+    assets.push({
+      symbol,
+      price: round2(currentPrice),
+      chg_24h_pct: chg24,
+      chg_7d_pct: chg7,
+      chg_30d_pct: chg30,
+      volume_24h: round2(volume24h),
+      quote_volume_24h: round2(quoteVolume24h),
+
+      stability_score: stabilityScore,
+      rating,
+      regime,
+
+      confidence_score: confidenceScore,
+      confidence_label: confidenceLabel,
+      confidence_reason: confidenceReason,
+
+      prev,
+      delta_score: deltaScore,
+      regime_change: regimeChange,
+
+      rupture_rate: ruptureRate,
+      similarity: null
+    })
+  }
+
+  assets.sort((a, b) => {
+    if (b.confidence_score !== a.confidence_score) {
+      return b.confidence_score - a.confidence_score
+    }
+    if (b.stability_score !== a.stability_score) {
+      return b.stability_score - a.stability_score
+    }
+    return a.symbol.localeCompare(b.symbol)
+  })
+
+  const finishedAt = Date.now()
+  const ts = new Date().toISOString()
+
+  return {
+    ok: true,
+    source: "scan",
+    ts,
+    api_version: API_VERSION,
+    meta: buildMeta({
+      count: assets.length,
+      limit: symbols.length,
+      durationMs: finishedAt - startedAt,
+      cacheStatus: "MISS",
+      lastRefreshTs: ts,
+      filtered,
+      nulls,
+      mode: "normal"
+    }),
+    data: assets,
+    error: null
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Route                                                                       */
+/* -------------------------------------------------------------------------- */
+
+export async function GET(req: NextRequest) {
+  /* ---------------- API AUTH ---------------- */
+
+  const auth = validateApiKey(req)
+
+  if (!auth.ok) {
+    return buildApiKeyErrorResponse(auth.error, auth.status)
+  }
+
+  /* ---------------- RATE LIMIT ---------------- */
+
+  const rate = applyRateLimit(req)
+  if (!rate.ok) {
+    const payload: ScanErrorResponse = {
+      ok: false,
+      source: "scan",
+      ts: new Date().toISOString(),
+      api_version: API_VERSION,
+      meta: {
+        source: "binance",
+        cache: true,
+        cache_layer: "memory",
+        cache_ttl_sec: Math.floor(CACHE_TTL_MS / 1000),
+        api_version: API_VERSION,
+        mode: "degraded"
+      },
+      data: [],
+      error: {
+        code: "RATE_LIMIT",
+        message: "Too many requests",
+        retry_after_sec: rate.retryAfterSec
       }
     }
 
-    // Fetch size > limit to make sorting meaningful
-    const fetchSize = clamp(Math.max(limit * 2, 80), 50, 250);
+    return makeResponse(auth, payload, 429, {
+      "retry-after": String(rate.retryAfterSec)
+    })
+  }
 
-    let raw: CGMarketItem[] = [];
-    let source: ScanResponse["source"] = "coingecko";
+  /* ---------------- CACHE HIT ---------------- */
 
-    try {
-      raw = await fetchCoinGecko(fetchSize);
-    } catch (e: any) {
-      source = "fallback";
-      warnings.push(`CoinGecko indisponible: ${e?.message ?? "unknown"}`);
-      const data = sortAssets(fallbackUniverse(tf), sort).slice(0, limit);
+  const symbols = parseSymbolsParam(req)
+  const now = Date.now()
+  const forceRefresh = req.nextUrl.searchParams.get("refresh") === "1"
 
-      const payload: ScanResponse = {
-        ok: true,
-        ts,
-        source,
-        market: "crypto",
-        quote: "eur",
-        timeframe: tf,
-        sort,
-        count: data.length,
-        data,
-        meta: { warnings, cache: noStore ? "no-store" : "miss" },
-      };
-
-      if (!noStore) setCache(key, payload);
-      return NextResponse.json(payload, { status: 200, headers: { "cache-control": "no-store" } });
+  const cache = getCache()
+  if (!forceRefresh && cache && cache.expiresAt > now) {
+    const cachedPayload: ScanSuccessResponse = {
+      ...cache.payload,
+      meta: {
+        ...cache.payload.meta,
+        cache_status: "HIT",
+        duration_ms: 0
+      }
     }
 
-    const normalized = raw
-      .map((x) => normalizeItem(x, tf))
-      .filter((x): x is ScanAsset => Boolean(x));
+    return makeResponse(auth, cachedPayload, 200, {
+      "x-cache": "HIT",
+      "x-api-version": String(API_VERSION)
+    })
+  }
 
-    if (!normalized.length) {
-      const data = sortAssets(fallbackUniverse(tf), sort).slice(0, limit);
-      warnings.push("Aucun actif normalisé depuis la source, fallback utilisé.");
+  /* ---------------- BUILD SNAPSHOT ---------------- */
 
-      const payload: ScanResponse = {
-        ok: true,
-        ts,
-        source: "fallback",
-        market: "crypto",
-        quote: "eur",
-        timeframe: tf,
-        sort,
-        count: data.length,
-        data,
-        meta: { warnings, cache: noStore ? "no-store" : "miss" },
-      };
+  try {
+    const payload = await buildScanPayload(symbols)
 
-      if (!noStore) setCache(key, payload);
-      return NextResponse.json(payload, { status: 200, headers: { "cache-control": "no-store" } });
+    const nextPrevBySymbol: Record<string, PrevState> = {}
+    for (const item of payload.data) {
+      nextPrevBySymbol[item.symbol] = {
+        ts: payload.ts,
+        stability_score: item.stability_score,
+        regime: item.regime,
+        confidence_score: item.confidence_score
+      }
     }
 
-    const sorted = sortAssets(normalized, sort).slice(0, limit);
+    const toCache: CacheSnapshot = {
+      payload,
+      expiresAt: Date.now() + CACHE_TTL_MS,
+      lastGoodPayload: payload,
+      prevBySymbol: nextPrevBySymbol
+    }
 
-    const payload: ScanResponse = {
-      ok: true,
-      ts,
-      source,
-      market: "crypto",
-      quote: "eur",
-      timeframe: tf,
-      sort,
-      count: sorted.length,
-      data: sorted,
-      meta: { warnings: warnings.length ? warnings : undefined, cache: noStore ? "no-store" : "miss" },
-    };
+    setCache(toCache)
 
-    if (!noStore) setCache(key, payload);
+    return makeResponse(auth, payload, 200, {
+      "x-cache": "MISS",
+      "x-api-version": String(API_VERSION)
+    })
+  } catch (error) {
+    const fallback = getCache()?.lastGoodPayload
 
-    return NextResponse.json(payload, { status: 200, headers: { "cache-control": "no-store" } });
-  } catch (e: any) {
-    const payload: ScanResponse = {
+    if (fallback) {
+      const degradedPayload: ScanSuccessResponse = {
+        ...fallback,
+        ts: new Date().toISOString(),
+        meta: {
+          ...fallback.meta,
+          cache_status: "STALE",
+          fallback: "last_good_snapshot",
+          mode: "degraded"
+        }
+      }
+
+      return makeResponse(auth, degradedPayload, 200, {
+        "x-cache": "STALE",
+        "x-fallback": "last_good_snapshot",
+        "x-api-version": String(API_VERSION)
+      })
+    }
+
+    const message =
+      error instanceof Error ? error.message : "Unexpected scan error"
+
+    const payload: ScanErrorResponse = {
       ok: false,
-      ts,
-      source: "fallback",
-      market: "crypto",
-      quote: "eur",
-      timeframe: "24H",
-      sort: "rank_desc",
-      count: 0,
+      source: "scan",
+      ts: new Date().toISOString(),
+      api_version: API_VERSION,
+      meta: {
+        source: "binance",
+        cache: true,
+        cache_layer: "memory",
+        cache_ttl_sec: Math.floor(CACHE_TTL_MS / 1000),
+        api_version: API_VERSION,
+        mode: "degraded"
+      },
       data: [],
-      error: e?.message ?? "unknown_error",
-      meta: { warnings: ["scan_failed"] },
-    };
-    return NextResponse.json(payload, { status: 500, headers: { "cache-control": "no-store" } });
+      error: {
+        code: "UPSTREAM_ERROR",
+        message
+      }
+    }
+
+    return makeResponse(auth, payload, 502, {
+      "x-cache": "MISS",
+      "x-api-version": String(API_VERSION)
+    })
   }
 }
