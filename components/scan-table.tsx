@@ -1,71 +1,75 @@
-import type { ScanAsset } from "@/lib/xyvala/scan"
+type ScanAsset = {
+  id: string
+  symbol: string
+  name: string
+  price: number
+  h24: number
+  chg_24h_pct: number
+  market_cap?: number
+  volume_24h?: number
+  confidence_score: number
+  regime: "STABLE" | "TRANSITION" | "VOLATILE"
+  binance_url: string
+  affiliate_url?: string
+}
 
-type ScanTableItem = ScanAsset & {
-  affiliate_url: string
+function formatPrice(n: number) {
+  if (!Number.isFinite(n)) return "-"
+  if (n >= 1000) return n.toLocaleString("fr-FR", { maximumFractionDigits: 2 })
+  if (n >= 1) return n.toLocaleString("fr-FR", { maximumFractionDigits: 4 })
+  return n.toLocaleString("fr-FR", { maximumFractionDigits: 8 })
+}
+
+function formatPct(n: number) {
+  if (!Number.isFinite(n)) return "-"
+  const sign = n > 0 ? "+" : ""
+  return `${sign}${n.toFixed(2)}%`
 }
 
 type Props = {
-  items: ScanTableItem[]
+  items: ScanAsset[]
 }
 
-function price(v: number) {
-  if (!Number.isFinite(v)) return "-"
-  if (v > 1000) return v.toLocaleString()
-  if (v > 1) return v.toFixed(2)
-  return v.toFixed(6)
-}
-
-function pct(v: number) {
-  if (!Number.isFinite(v)) return "-"
-  const sign = v >= 0 ? "+" : ""
-  return `${sign}${v.toFixed(2)}%`
-}
-
-export function ScanTable({ items }: Props) {
+export default function ScanTable({ items }: Props) {
   if (!items.length) {
-    return (
-      <div className="p-6 text-sm text-neutral-500 border rounded-lg">
-        Aucun actif disponible
-      </div>
-    )
+    return <p>Aucun résultat.</p>
   }
 
   return (
-    <div className="overflow-x-auto border rounded-xl">
-      <table className="w-full text-sm">
-        <thead className="bg-neutral-100">
-          <tr>
-            <th className="px-4 py-3 text-left">Asset</th>
-            <th className="px-4 py-3 text-left">Price</th>
-            <th className="px-4 py-3 text-left">24h</th>
-            <th className="px-4 py-3 text-left">Score</th>
-            <th className="px-4 py-3 text-left">Regime</th>
-            <th className="px-4 py-3 text-left">Link</th>
+    <div style={{ overflowX: "auto" }}>
+      <table
+        style={{
+          width: "100%",
+          borderCollapse: "collapse",
+          fontSize: 14,
+        }}
+      >
+        <thead>
+          <tr style={{ textAlign: "left", borderBottom: "1px solid #333" }}>
+            <th style={{ padding: "10px 8px" }}>Asset</th>
+            <th style={{ padding: "10px 8px" }}>Price</th>
+            <th style={{ padding: "10px 8px" }}>24h</th>
+            <th style={{ padding: "10px 8px" }}>Score</th>
+            <th style={{ padding: "10px 8px" }}>Regime</th>
+            <th style={{ padding: "10px 8px" }}>Link</th>
           </tr>
         </thead>
-
         <tbody>
-          {items.map((a) => (
-            <tr key={a.id} className="border-t">
-              <td className="px-4 py-3">
-                <div className="font-medium">{a.symbol}</div>
-                <div className="text-xs text-neutral-500">{a.name}</div>
+          {items.map((item) => (
+            <tr key={`${item.id}-${item.symbol}`} style={{ borderBottom: "1px solid #222" }}>
+              <td style={{ padding: "10px 8px" }}>
+                <div style={{ fontWeight: 600 }}>{item.symbol}</div>
+                <div style={{ opacity: 0.75 }}>{item.name}</div>
               </td>
-
-              <td className="px-4 py-3">{price(a.price)}</td>
-
-              <td className="px-4 py-3">{pct(a.chg_24h_pct)}</td>
-
-              <td className="px-4 py-3">{a.confidence_score}</td>
-
-              <td className="px-4 py-3">{a.regime}</td>
-
-              <td className="px-4 py-3">
+              <td style={{ padding: "10px 8px" }}>{formatPrice(item.price)}</td>
+              <td style={{ padding: "10px 8px" }}>{formatPct(item.chg_24h_pct)}</td>
+              <td style={{ padding: "10px 8px" }}>{item.confidence_score}</td>
+              <td style={{ padding: "10px 8px" }}>{item.regime}</td>
+              <td style={{ padding: "10px 8px" }}>
                 <a
-                  href={a.affiliate_url}
+                  href={item.affiliate_url || item.binance_url}
                   target="_blank"
                   rel="noreferrer"
-                  className="underline"
                 >
                   Trade
                 </a>
