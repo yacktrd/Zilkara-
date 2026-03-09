@@ -31,6 +31,10 @@ type ContextLikeResponse = {
   volatile_ratio?: number | null;
   message?: string | null;
   error?: string | null;
+  meta?: {
+    cache?: "hit" | "miss" | "no-store";
+    warnings?: string[];
+  };
 };
 
 type StateResponse = {
@@ -55,11 +59,14 @@ type StateResponse = {
   meta: {
     cache: "hit" | "miss" | "no-store";
     source: "context_cache" | "context_fetch" | "fallback";
+    quote: Quote;
     warnings: string[];
   };
 };
 
-/* --------------------------------- Utils --------------------------------- */
+/* -------------------------------------------------------------------------- */
+/*                                    Utils                                   */
+/* -------------------------------------------------------------------------- */
 
 const NOW_ISO = () => new Date().toISOString();
 
@@ -67,8 +74,12 @@ function safeNum(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
+function safeStr(v: unknown): string {
+  return typeof v === "string" ? v.trim() : "";
+}
+
 function normalizeRegime(v: unknown): MarketRegime {
-  const s = typeof v === "string" ? v.trim().toUpperCase() : "";
+  const s = safeStr(v).toUpperCase();
   if (s === "STABLE" || s === "TRANSITION" || s === "VOLATILE") return s;
   return null;
 }
@@ -79,9 +90,18 @@ function normalizeQuote(v: string | null): Quote {
   return "usd";
 }
 
+function parseNoStore(req: NextRequest): boolean {
+  const value = req.nextUrl.searchParams.get("noStore");
+  return value === "1" || value === "true";
+}
+
+function uniqueWarnings(...groups: Array<string[] | undefined | null>): string[] {
+  const merged = groups.flatMap((group) => (Array.isArray(group) ? group : []));
+  return [...new Set(merged.filter((item) => typeof item === "string" && item.trim().length > 0))];
+}
+
 function hasUsableContext(ctx: ContextLikeResponse | null | undefined): boolean {
-  if (!ctx) return false;
-  if (ctx.ok !== true) return false;
+  if (!ctx || ctx.ok !== true) return false;
 
   return (
     normalizeRegime(ctx.market_regime) !== null ||
@@ -136,7 +156,10 @@ function inferExecutionBias(input: {
 }
 
 function buildStateResponse(
-  input: Partial<StateResponse> & Pick<StateResponse, "ts">
+  input: Partial<StateResponse> &
+    Pick<StateResponse, "ts"> & {
+      quote?: Quote;
+    }
 ): StateResponse {
   return {
     ok: Boolean(input.ok),
@@ -159,6 +182,7 @@ function buildStateResponse(
     meta: {
       cache: input.meta?.cache ?? "miss",
       source: input.meta?.source ?? "fallback",
+      quote: input.meta?.quote ?? input.quote ?? "usd",
       warnings: input.meta?.warnings ?? [],
     },
   };
@@ -168,11 +192,13 @@ function stateCacheKey(quote: Quote) {
   return `xyvala:state:${XYVALA_VERSION}:quote=${quote}`;
 }
 
-/* -------------------------------- Handler -------------------------------- */
+/* -------------------------------------------------------------------------- */
+/*                                  Handler                                   */
+/* -------------------------------------------------------------------------- */
 
 export async function GET(req: NextRequest) {
   const ts = NOW_ISO();
-  const warnings: string[] = [];
+  const routeWarnings: string[] = [];
 
   const auth = enforceApiPolicy(req);
 
@@ -180,30 +206,34 @@ export async function GET(req: NextRequest) {
     return buildApiKeyErrorResponse(auth.error, auth.status);
   }
 
-  await trackUsage({
-    apiKey: auth.key,
-    endpoint: "/api/state",
-  });
+  try {
+    await trackUsage({
+      apiKey: auth.key,
+      endpoint: "/api/state",
+    });
+  } catch {
+    routeWarnings.push("usage_tracking_failed");
+  }
 
   try {
-    const noStore =
-      req.nextUrl.searchParams.get("noStore") === "1" ||
-      req.nextUrl.searchParams.get("noStore") === "true";
-
+    const noStore = parseNoStore(req);
     const quote = normalizeQuote(req.nextUrl.searchParams.get("quote"));
     const cacheKey = stateCacheKey(quote);
 
     if (!noStore) {
       const hit = await getFromCache<StateResponse>(cacheKey, STATE_TTL_MS);
 
-      if (hit && hit.ok) {
+      if (hit && hit.ok === true) {
         const res = buildStateResponse({
           ...hit,
           ts,
+          quote,
           meta: {
             ...hit.meta,
             cache: "hit",
             source: "context_cache",
+            quote,
+            warnings: uniqueWarnings(hit.meta?.warnings, routeWarnings),
           },
         });
 
@@ -220,14 +250,15 @@ export async function GET(req: NextRequest) {
         );
       }
 
-      if (hit && !hit.ok) {
-        warnings.push("stale_state_cache_ignored");
+      if (hit && hit.ok !== true) {
+        routeWarnings.push("stale_state_cache_ignored");
       }
     }
 
     const origin = new URL(req.url).origin;
     const contextUrl = new URL("/api/context", origin);
     contextUrl.searchParams.set("quote", quote);
+
     if (noStore) {
       contextUrl.searchParams.set("noStore", "1");
     }
@@ -244,11 +275,13 @@ export async function GET(req: NextRequest) {
       const res = buildStateResponse({
         ok: false,
         ts,
+        quote,
         error: `context_http_${contextRes.status}`,
         meta: {
           cache: noStore ? "no-store" : "miss",
           source: "fallback",
-          warnings: ["context_request_failed"],
+          quote,
+          warnings: uniqueWarnings(routeWarnings, ["context_request_failed"]),
         },
       });
 
@@ -271,11 +304,17 @@ export async function GET(req: NextRequest) {
       const res = buildStateResponse({
         ok: false,
         ts,
+        quote,
         error: contextJson.error ?? "context_unavailable",
         meta: {
           cache: noStore ? "no-store" : "miss",
           source: "fallback",
-          warnings: ["context_empty_or_invalid"],
+          quote,
+          warnings: uniqueWarnings(
+            routeWarnings,
+            contextJson.meta?.warnings,
+            ["context_empty_or_invalid"]
+          ),
         },
       });
 
@@ -324,6 +363,7 @@ export async function GET(req: NextRequest) {
     const res = buildStateResponse({
       ok: true,
       ts,
+      quote,
       state: {
         market_regime,
         volatility_state,
@@ -338,7 +378,8 @@ export async function GET(req: NextRequest) {
       meta: {
         cache: noStore ? "no-store" : "miss",
         source: "context_fetch",
-        warnings,
+        quote,
+        warnings: uniqueWarnings(routeWarnings, contextJson.meta?.warnings),
       },
     });
 
@@ -357,15 +398,24 @@ export async function GET(req: NextRequest) {
       }),
       auth
     );
-  } catch (e: any) {
+  } catch (error: unknown) {
+    const message =
+      error instanceof Error && error.message
+        ? error.message
+        : "unknown_error";
+
+    const quote = normalizeQuote(req.nextUrl.searchParams.get("quote"));
+
     const res = buildStateResponse({
       ok: false,
       ts,
-      error: e?.message ? String(e.message) : "unknown_error",
+      quote,
+      error: message,
       meta: {
         cache: "no-store",
         source: "fallback",
-        warnings: ["route_exception"],
+        quote,
+        warnings: uniqueWarnings(routeWarnings, ["route_exception"]),
       },
     });
 
