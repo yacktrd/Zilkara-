@@ -1,240 +1,194 @@
 // lib/xyvala/usage.ts
 
-/**
- * XYVALA — Usage Tracking (V1 robuste)
- *
- * Objectif :
- * - mesurer l'usage par clé API
- * - mesurer l'usage par endpoint
- * - préparer quotas / facturation / analytics
- *
- * ADN :
- * - simple
- * - robuste
- * - compatible avec l'architecture actuelle
- * - prêt à migrer vers KV / DB plus tard
- */
+import { NextResponse } from "next/server";
+import type { ApiKeyType } from "@/lib/xyvala/auth";
 
-export type UsageEndpoint =
-  | "/api/scan"
-  | "/api/zones"
-  | "/api/decision"
-  | "/api/history"
-  | "/api/history/update"
-  | "/api/stats"
-  | "/api/assets"
-  | string;
+export type ApiPlan =
+  | "internal"
+  | "demo"
+  | "trader"
+  | "pro"
+  | "enterprise";
 
-export type UsageRecord = {
-  apiKey: string;
-  endpoint: UsageEndpoint;
-
-  totalCount: number;
-
-  minuteBucket: string;
-  minuteCount: number;
-
-  dayBucket: string;
-  dayCount: number;
-
-  updatedAt: number;
+export type TrackUsageInput = {
+  key?: string;
+  apiKey?: string;
+  keyType?: ApiKeyType | string;
+  endpoint?: string;
+  planOverride?: ApiPlan;
 };
 
-export type UsageSnapshot = {
-  apiKey: string;
-  endpoint: UsageEndpoint;
-  totalCount: number;
-  minuteCount: number;
-  dayCount: number;
-  updatedAt: number;
+export type UsageState = {
+  plan: ApiPlan;
+  quotaLimit: number;
+  quotaRemaining: number;
+  quotaReset: number;
+  usageCount: number;
+  endpoint: string | null;
+  quotaExceeded: boolean;
 };
 
-const usageMap = new Map<string, UsageRecord>();
-const MAX_USAGE_RECORDS = 20_000;
+type DailyUsageRecord = {
+  count: number;
+  bucket: string;
+  resetAt: number;
+};
 
-/* -------------------------------- Utilities ------------------------------- */
+const PLAN_LIMITS: Readonly<Record<ApiPlan, number>> = Object.freeze({
+  internal: 1_000_000_000,
+  demo: 100,
+  trader: 5_000,
+  pro: 50_000,
+  enterprise: 1_000_000_000,
+});
 
-function nowMs() {
-  return Date.now();
+const usageStore = new Map<string, DailyUsageRecord>();
+
+function safeStr(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
 }
 
-function minuteBucketUTC(d = new Date()) {
-  const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const day = String(d.getUTCDate()).padStart(2, "0");
-  const h = String(d.getUTCHours()).padStart(2, "0");
-  const min = String(d.getUTCMinutes()).padStart(2, "0");
-  return `${y}${m}${day}${h}${min}`;
+function getResolvedKey(input: TrackUsageInput): string {
+  return safeStr(input.key) || safeStr(input.apiKey);
 }
 
-function dayBucketUTC(d = new Date()) {
-  const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const day = String(d.getUTCDate()).padStart(2, "0");
-  return `${y}${m}${day}`;
+function getTodayBucketUtc(date = new Date()): string {
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(date.getUTCDate()).padStart(2, "0");
+
+  return `${year}-${month}-${day}`;
 }
 
-function makeUsageKey(apiKey: string, endpoint: UsageEndpoint) {
-  return `${apiKey}::${endpoint}`;
+function getNextUtcMidnightTimestamp(date = new Date()): number {
+  return Date.UTC(
+    date.getUTCFullYear(),
+    date.getUTCMonth(),
+    date.getUTCDate() + 1,
+    0,
+    0,
+    0,
+    0
+  );
 }
 
-function maybeGcUsage() {
-  if (usageMap.size <= MAX_USAGE_RECORDS) return;
+function inferKeyTypeFromEnv(key: string): ApiKeyType | null {
+  if (!key) return null;
 
-  const entries = Array.from(usageMap.entries()).sort(
-    (a, b) => a[1].updatedAt - b[1].updatedAt
+  const internal = safeStr(process.env.XYVALA_INTERNAL_KEY);
+  if (internal && key === internal) return "internal";
+
+  const demo = safeStr(process.env.XYVALA_PUBLIC_DEMO_KEY);
+  if (demo && key === demo) return "public_demo";
+
+  const legacy = safeStr(process.env.XYVALA_API_KEY);
+  if (legacy && key === legacy) return "legacy";
+
+  return null;
+}
+
+function resolvePlanFromKeyType(keyType: string | null): ApiPlan {
+  if (keyType === "internal") return "internal";
+  if (keyType === "public_demo") return "demo";
+  if (keyType === "legacy") return "trader";
+
+  return "trader";
+}
+
+function resolvePlan(input: TrackUsageInput, resolvedKey: string): ApiPlan {
+  if (input.planOverride) {
+    return input.planOverride;
+  }
+
+  const explicitKeyType = safeStr(input.keyType);
+  if (explicitKeyType) {
+    return resolvePlanFromKeyType(explicitKeyType);
+  }
+
+  const inferred = inferKeyTypeFromEnv(resolvedKey);
+  return resolvePlanFromKeyType(inferred);
+}
+
+function buildUsageStoreKey(key: string, bucket: string): string {
+  return `${bucket}:${key}`;
+}
+
+function cleanupUsageStore(currentBucket: string) {
+  if (usageStore.size < 500) return;
+
+  for (const [storeKey, record] of usageStore.entries()) {
+    if (record.bucket !== currentBucket) {
+      usageStore.delete(storeKey);
+    }
+  }
+}
+
+export function trackUsage(input: TrackUsageInput): UsageState {
+  const now = new Date();
+  const bucket = getTodayBucketUtc(now);
+  const quotaReset = getNextUtcMidnightTimestamp(now);
+
+  cleanupUsageStore(bucket);
+
+  const resolvedKey = getResolvedKey(input);
+  const endpoint = safeStr(input.endpoint) || null;
+  const plan = resolvePlan(input, resolvedKey);
+  const quotaLimit = PLAN_LIMITS[plan];
+
+  if (!resolvedKey) {
+    return {
+      plan,
+      quotaLimit,
+      quotaRemaining: quotaLimit,
+      quotaReset,
+      usageCount: 0,
+      endpoint,
+      quotaExceeded: false,
+    };
+  }
+
+  const usageKey = buildUsageStoreKey(resolvedKey, bucket);
+  const current = usageStore.get(usageKey);
+
+  const nextCount = (current?.count ?? 0) + 1;
+
+  usageStore.set(usageKey, {
+    count: nextCount,
+    bucket,
+    resetAt: quotaReset,
+  });
+
+  const quotaRemaining = Math.max(quotaLimit - nextCount, 0);
+  const quotaExceeded = nextCount > quotaLimit;
+
+  return {
+    plan,
+    quotaLimit,
+    quotaRemaining,
+    quotaReset,
+    usageCount: nextCount,
+    endpoint,
+    quotaExceeded,
+  };
+}
+
+export function applyQuotaHeaders(
+  response: NextResponse,
+  usage: UsageState
+) {
+  response.headers.set("x-xyvala-plan", usage.plan);
+  response.headers.set("x-xyvala-quota-limit", String(usage.quotaLimit));
+  response.headers.set("x-xyvala-quota-remaining", String(usage.quotaRemaining));
+  response.headers.set("x-xyvala-quota-reset", String(usage.quotaReset));
+  response.headers.set("x-xyvala-usage-count", String(usage.usageCount));
+  response.headers.set(
+    "x-xyvala-quota-exceeded",
+    usage.quotaExceeded ? "true" : "false"
   );
 
-  const toDelete = Math.max(1, usageMap.size - MAX_USAGE_RECORDS);
-
-  for (let i = 0; i < toDelete; i++) {
-    usageMap.delete(entries[i][0]);
-  }
-}
-
-/* ------------------------------ Core Tracking ----------------------------- */
-
-export async function trackUsage(input: {
-  apiKey: string;
-  endpoint: UsageEndpoint;
-}): Promise<UsageSnapshot> {
-  const { apiKey, endpoint } = input;
-
-  const currentMinute = minuteBucketUTC();
-  const currentDay = dayBucketUTC();
-  const mapKey = makeUsageKey(apiKey, endpoint);
-
-  const existing = usageMap.get(mapKey);
-
-  let record: UsageRecord;
-
-  if (!existing) {
-    record = {
-      apiKey,
-      endpoint,
-      totalCount: 0,
-      minuteBucket: currentMinute,
-      minuteCount: 0,
-      dayBucket: currentDay,
-      dayCount: 0,
-      updatedAt: nowMs(),
-    };
-  } else {
-    record = { ...existing };
-
-    if (record.minuteBucket !== currentMinute) {
-      record.minuteBucket = currentMinute;
-      record.minuteCount = 0;
-    }
-
-    if (record.dayBucket !== currentDay) {
-      record.dayBucket = currentDay;
-      record.dayCount = 0;
-    }
+  if (usage.endpoint) {
+    response.headers.set("x-xyvala-endpoint", usage.endpoint);
   }
 
-  record.totalCount += 1;
-  record.minuteCount += 1;
-  record.dayCount += 1;
-  record.updatedAt = nowMs();
-
-  usageMap.set(mapKey, record);
-  maybeGcUsage();
-
-  return {
-    apiKey: record.apiKey,
-    endpoint: record.endpoint,
-    totalCount: record.totalCount,
-    minuteCount: record.minuteCount,
-    dayCount: record.dayCount,
-    updatedAt: record.updatedAt,
-  };
-}
-
-/* ------------------------------ Read Helpers ------------------------------ */
-
-export async function getUsage(input: {
-  apiKey: string;
-  endpoint: UsageEndpoint;
-}): Promise<UsageSnapshot | null> {
-  const mapKey = makeUsageKey(input.apiKey, input.endpoint);
-  const record = usageMap.get(mapKey);
-
-  if (!record) return null;
-
-  return {
-    apiKey: record.apiKey,
-    endpoint: record.endpoint,
-    totalCount: record.totalCount,
-    minuteCount: record.minuteCount,
-    dayCount: record.dayCount,
-    updatedAt: record.updatedAt,
-  };
-}
-
-export async function listUsageByKey(input: {
-  apiKey: string;
-}): Promise<UsageSnapshot[]> {
-  const out: UsageSnapshot[] = [];
-
-  for (const record of usageMap.values()) {
-    if (record.apiKey !== input.apiKey) continue;
-
-    out.push({
-      apiKey: record.apiKey,
-      endpoint: record.endpoint,
-      totalCount: record.totalCount,
-      minuteCount: record.minuteCount,
-      dayCount: record.dayCount,
-      updatedAt: record.updatedAt,
-    });
-  }
-
-  return out.sort((a, b) => b.updatedAt - a.updatedAt);
-}
-
-export async function listUsageByEndpoint(input: {
-  endpoint: UsageEndpoint;
-}): Promise<UsageSnapshot[]> {
-  const out: UsageSnapshot[] = [];
-
-  for (const record of usageMap.values()) {
-    if (record.endpoint !== input.endpoint) continue;
-
-    out.push({
-      apiKey: record.apiKey,
-      endpoint: record.endpoint,
-      totalCount: record.totalCount,
-      minuteCount: record.minuteCount,
-      dayCount: record.dayCount,
-      updatedAt: record.updatedAt,
-    });
-  }
-
-  return out.sort((a, b) => b.updatedAt - a.updatedAt);
-}
-
-export async function getUsageTotals() {
-  let records = 0;
-  let totalCalls = 0;
-
-  for (const record of usageMap.values()) {
-    records += 1;
-    totalCalls += record.totalCount;
-  }
-
-  return {
-    records,
-    totalCalls,
-  };
-}
-
-export async function __usageStats() {
-  const totals = await getUsageTotals();
-
-  return {
-    entries: usageMap.size,
-    records: totals.records,
-    totalCalls: totals.totalCalls,
-  };
+  return response;
 }

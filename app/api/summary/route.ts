@@ -13,11 +13,12 @@ import { getXyvalaScan } from "@/lib/xyvala/scan"
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
-const XYVALA_VERSION = "v1"
+const XYVALA_VERSION = "v2"
 const SUMMARY_ROUTE = "/api/summary"
 
 const SUMMARY_CACHE_TTL_MS = 15_000
 const SUMMARY_CACHE_TTL_SECONDS = Math.ceil(SUMMARY_CACHE_TTL_MS / 1000)
+const SUMMARY_STALE_IF_ERROR_MS = 60_000
 
 const SUBREQUEST_TIMEOUT_MS = 3_500
 
@@ -29,19 +30,7 @@ type JsonRecord = Record<string, unknown>
 type NullableRecord = JsonRecord | null
 type UnknownArray = unknown[]
 
-type ScanResultLike = {
-  source?: string
-  quote?: string
-  data?: unknown[]
-} | null
-
-type SummaryWarningCode =
-  | "scan_failed"
-  | "state_failed"
-  | "opportunities_failed"
-  | "kv_read_failed"
-  | "kv_write_failed"
-  | "summary_failed"
+type SummaryWarningCode = string
 
 type SummaryResponse = {
   ok: boolean
@@ -58,7 +47,7 @@ type SummaryResponse = {
   degraded?: boolean
   warnings?: SummaryWarningCode[]
   cache?: {
-    status: "hit" | "miss"
+    status: "hit" | "miss" | "stale"
     layer: "kv" | "memory" | "none"
     ttl_ms: number
   }
@@ -67,9 +56,42 @@ type SummaryResponse = {
 type CachedEntry<T> = {
   value: T
   expiresAt: number
+  staleUntil: number
 }
 
 type MemoryCacheStore = Map<string, CachedEntry<SummaryResponse>>
+
+type HttpJsonResult = {
+  ok: boolean
+  status: number | null
+  json: unknown
+  warning: string | null
+}
+
+type StateFetchResult = {
+  state: NullableRecord
+  warning: string | null
+}
+
+type OpportunitiesFetchResult = {
+  opportunities: UnknownArray
+  warning: string | null
+}
+
+type ScanFetchResult = {
+  scan: {
+    source?: string
+    quote?: string
+    data?: unknown[]
+    error?: string | null
+  } | null
+  warning: string | null
+}
+
+type CacheReadResult = {
+  value: SummaryResponse | null
+  warning: string | null
+}
 
 declare global {
   // eslint-disable-next-line no-var
@@ -82,33 +104,50 @@ function getMemoryCache(): MemoryCacheStore {
   if (!globalThis.__xyvalaSummaryCache__) {
     globalThis.__xyvalaSummaryCache__ = new Map<string, CachedEntry<SummaryResponse>>()
   }
+
   return globalThis.__xyvalaSummaryCache__
 }
 
-function getMemoryCachedSummary(key: string): SummaryResponse | null {
+function setMemoryCachedSummary(key: string, value: SummaryResponse, ttlMs: number) {
+  const cache = getMemoryCache()
+
+  cache.set(key, {
+    value,
+    expiresAt: Date.now() + ttlMs,
+    staleUntil: Date.now() + ttlMs + SUMMARY_STALE_IF_ERROR_MS
+  })
+}
+
+function getMemoryCachedSummary(
+  key: string,
+  options?: { allowStale?: boolean }
+): SummaryResponse | null {
+  const allowStale = options?.allowStale === true
   const cache = getMemoryCache()
   const hit = cache.get(key)
 
   if (!hit) return null
 
-  if (Date.now() >= hit.expiresAt) {
-    cache.delete(key)
-    return null
+  const now = Date.now()
+
+  if (now <= hit.expiresAt) {
+    return hit.value
   }
 
-  return hit.value
-}
+  if (allowStale && now <= hit.staleUntil) {
+    return hit.value
+  }
 
-function setMemoryCachedSummary(key: string, value: SummaryResponse, ttlMs: number) {
-  const cache = getMemoryCache()
-  cache.set(key, {
-    value,
-    expiresAt: Date.now() + ttlMs
-  })
+  cache.delete(key)
+  return null
 }
 
 function isRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0
 }
 
 function normalizeState(value: unknown): NullableRecord {
@@ -119,17 +158,34 @@ function normalizeOpportunities(value: unknown): UnknownArray {
   return Array.isArray(value) ? value : []
 }
 
+function normalizeWarnings(...groups: Array<Array<string | null | undefined> | null | undefined>) {
+  return [...new Set(groups.flatMap((group) => (Array.isArray(group) ? group : [])).filter(isNonEmptyString))]
+}
+
 function getCacheKey() {
   return `xyvala:summary:${XYVALA_VERSION}:${SCAN_QUOTE}:${SCAN_SORT}:${SCAN_LIMIT}`
 }
 
 function getRedisClient(): Redis | null {
-  const url = process.env.UPSTASH_REDIS_REST_URL
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN
+  const url =
+    process.env.UPSTASH_REDIS_REST_URL?.trim() ||
+    process.env.KV_REST_API_URL?.trim()
+
+  const token =
+    process.env.UPSTASH_REDIS_REST_TOKEN?.trim() ||
+    process.env.KV_REST_API_TOKEN?.trim()
 
   if (!url || !token) return null
 
   return new Redis({ url, token })
+}
+
+function resolveServiceApiKey(fallbackKey: string): string {
+  return (
+    process.env.XYVALA_INTERNAL_KEY?.trim() ||
+    process.env.XYVALA_API_KEY?.trim() ||
+    fallbackKey
+  )
 }
 
 async function withTimeout<T>(
@@ -153,7 +209,7 @@ async function fetchJson(
   url: string,
   apiKey: string,
   timeoutMs: number
-): Promise<unknown> {
+): Promise<HttpJsonResult> {
   return withTimeout(
     async (signal) => {
       const res = await fetch(url, {
@@ -165,27 +221,113 @@ async function fetchJson(
         signal
       })
 
-      if (!res.ok) return null
-      return res.json()
+      let json: unknown = null
+
+      try {
+        json = await res.json()
+      } catch {
+        json = null
+      }
+
+      if (!res.ok) {
+        return {
+          ok: false,
+          status: res.status,
+          json,
+          warning: `http_${res.status}`
+        }
+      }
+
+      return {
+        ok: true,
+        status: res.status,
+        json,
+        warning: null
+      }
     },
     timeoutMs,
-    null
+    {
+      ok: false,
+      status: null,
+      json: null,
+      warning: "timeout_or_fetch_failed"
+    }
   )
 }
 
-async function fetchState(origin: string, apiKey: string): Promise<NullableRecord> {
-  const json = await fetchJson(`${origin}/api/state`, apiKey, SUBREQUEST_TIMEOUT_MS)
-  if (!isRecord(json)) return null
-  return normalizeState(json.state)
+async function fetchState(origin: string, apiKey: string): Promise<StateFetchResult> {
+  const result = await fetchJson(
+    `${origin}/api/state?quote=${SCAN_QUOTE}`,
+    apiKey,
+    SUBREQUEST_TIMEOUT_MS
+  )
+
+  if (!result.ok) {
+    return {
+      state: null,
+      warning: `state_${result.warning ?? "failed"}`
+    }
+  }
+
+  if (!isRecord(result.json)) {
+    return {
+      state: null,
+      warning: "state_invalid_payload"
+    }
+  }
+
+  if (result.json.ok !== true) {
+    return {
+      state: null,
+      warning: isNonEmptyString(result.json.error)
+        ? `state_${result.json.error}`
+        : "state_unavailable"
+    }
+  }
+
+  return {
+    state: normalizeState(result.json.state),
+    warning: null
+  }
 }
 
-async function fetchOpportunities(origin: string, apiKey: string): Promise<UnknownArray> {
-  const json = await fetchJson(`${origin}/api/opportunities`, apiKey, SUBREQUEST_TIMEOUT_MS)
-  if (!isRecord(json)) return []
-  return normalizeOpportunities(json.data)
+async function fetchOpportunities(origin: string, apiKey: string): Promise<OpportunitiesFetchResult> {
+  const result = await fetchJson(
+    `${origin}/api/opportunities?quote=${SCAN_QUOTE}`,
+    apiKey,
+    SUBREQUEST_TIMEOUT_MS
+  )
+
+  if (!result.ok) {
+    return {
+      opportunities: [],
+      warning: `opportunities_${result.warning ?? "failed"}`
+    }
+  }
+
+  if (!isRecord(result.json)) {
+    return {
+      opportunities: [],
+      warning: "opportunities_invalid_payload"
+    }
+  }
+
+  if (result.json.ok === false) {
+    return {
+      opportunities: [],
+      warning: isNonEmptyString(result.json.error)
+        ? `opportunities_${result.json.error}`
+        : "opportunities_unavailable"
+    }
+  }
+
+  return {
+    opportunities: normalizeOpportunities(result.json.data),
+    warning: null
+  }
 }
 
-async function fetchScan(): Promise<ScanResultLike> {
+async function fetchScan(): Promise<ScanFetchResult> {
   return withTimeout(
     async () => {
       const scan = await getXyvalaScan({
@@ -194,27 +336,57 @@ async function fetchScan(): Promise<ScanResultLike> {
         limit: SCAN_LIMIT
       })
 
-      return scan ?? null
+      const warning =
+        isNonEmptyString(scan?.error) ? `scan_${scan.error}` : null
+
+      return {
+        scan: scan ?? null,
+        warning
+      }
     },
     SUBREQUEST_TIMEOUT_MS,
-    null
+    {
+      scan: null,
+      warning: "scan_timeout_or_failed"
+    }
   )
 }
 
-async function readKvCache(key: string): Promise<SummaryResponse | null> {
+async function readKvCache(key: string): Promise<CacheReadResult> {
   const redis = getRedisClient()
-  if (!redis) return null
+
+  if (!redis) {
+    return {
+      value: null,
+      warning: null
+    }
+  }
 
   try {
     const cached = await redis.get<SummaryResponse>(key)
-    return cached ?? null
+
+    if (!cached || !isRecord(cached)) {
+      return {
+        value: null,
+        warning: null
+      }
+    }
+
+    return {
+      value: cached as SummaryResponse,
+      warning: null
+    }
   } catch {
-    return null
+    return {
+      value: null,
+      warning: "kv_read_failed"
+    }
   }
 }
 
 async function writeKvCache(key: string, value: SummaryResponse): Promise<boolean> {
   const redis = getRedisClient()
+
   if (!redis) return false
 
   try {
@@ -226,7 +398,7 @@ async function writeKvCache(key: string, value: SummaryResponse): Promise<boolea
 }
 
 function buildResponseHeaders(params: {
-  cacheStatus: "hit" | "miss"
+  cacheStatus: "hit" | "miss" | "stale"
   cacheLayer: "kv" | "memory" | "none"
 }) {
   return {
@@ -239,38 +411,47 @@ function buildResponseHeaders(params: {
 
 function buildSummaryFromParts(params: {
   ts: string
-  scan: ScanResultLike
+  scan: ScanFetchResult["scan"]
   state: NullableRecord
   opportunities: UnknownArray
   warnings: SummaryWarningCode[]
-  cacheStatus: "hit" | "miss"
+  cacheStatus: "hit" | "miss" | "stale"
   cacheLayer: "kv" | "memory" | "none"
+  error?: string | null
 }): SummaryResponse {
-  const { ts, scan, state, opportunities, warnings, cacheStatus, cacheLayer } = params
-
-  const assets = Array.isArray(scan?.data) ? scan.data.length : 0
-  const allFailed = assets === 0 && state === null && opportunities.length === 0
-  const degraded = warnings.length > 0 && !allFailed
+  const assets = Array.isArray(params.scan?.data) ? params.scan.data.length : 0
+  const warnings = normalizeWarnings(params.warnings)
+  const hasAnyData = assets > 0 || params.state !== null || params.opportunities.length > 0
 
   return {
-    ok: !allFailed,
-    ts,
+    ok: hasAnyData,
+    ts: params.ts,
     version: XYVALA_VERSION,
-    state,
-    opportunities,
+    state: params.state,
+    opportunities: params.opportunities,
     scan_meta: {
-      source: scan?.source,
-      quote: scan?.quote,
+      source: params.scan?.source,
+      quote: params.scan?.quote,
       assets
     },
-    error: allFailed ? "summary_failed" : null,
-    degraded: degraded || undefined,
+    error: params.error ?? (hasAnyData ? null : "summary_failed"),
+    degraded: warnings.length > 0 && hasAnyData ? true : undefined,
     warnings: warnings.length > 0 ? warnings : undefined,
     cache: {
-      status: cacheStatus,
-      layer: cacheLayer,
+      status: params.cacheStatus,
+      layer: params.cacheLayer,
       ttl_ms: SUMMARY_CACHE_TTL_MS
     }
+  }
+}
+
+function withCacheMetadata(
+  response: SummaryResponse,
+  cache: SummaryResponse["cache"]
+): SummaryResponse {
+  return {
+    ...response,
+    cache
   }
 }
 
@@ -292,20 +473,17 @@ export async function GET(req: NextRequest) {
 
   const cacheKey = getCacheKey()
 
-  const kvCached = await readKvCache(cacheKey)
-  if (kvCached) {
+  const kvCache = await readKvCache(cacheKey)
+  if (kvCache.value) {
     return applyApiAuthHeaders(
       NextResponse.json(
+        withCacheMetadata(kvCache.value, {
+          status: "hit",
+          layer: "kv",
+          ttl_ms: SUMMARY_CACHE_TTL_MS
+        }),
         {
-          ...kvCached,
-          cache: {
-            status: "hit",
-            layer: "kv",
-            ttl_ms: SUMMARY_CACHE_TTL_MS
-          }
-        },
-        {
-          status: kvCached.ok ? 200 : 503,
+          status: kvCache.value.ok ? 200 : 503,
           headers: buildResponseHeaders({
             cacheStatus: "hit",
             cacheLayer: "kv"
@@ -316,93 +494,103 @@ export async function GET(req: NextRequest) {
     )
   }
 
-  const memoryCached = getMemoryCachedSummary(cacheKey)
-  if (memoryCached) {
+  const memoryFresh = getMemoryCachedSummary(cacheKey)
+  if (memoryFresh) {
+    const memoryResponse = withCacheMetadata(memoryFresh, {
+      status: "hit",
+      layer: "memory",
+      ttl_ms: SUMMARY_CACHE_TTL_MS
+    })
+
+    if (kvCache.warning) {
+      memoryResponse.warnings = normalizeWarnings(memoryResponse.warnings, [kvCache.warning])
+      memoryResponse.degraded = true
+    }
+
     return applyApiAuthHeaders(
-      NextResponse.json(
-        {
-          ...memoryCached,
-          cache: {
-            status: "hit",
-            layer: "memory",
-            ttl_ms: SUMMARY_CACHE_TTL_MS
-          }
-        },
-        {
-          status: memoryCached.ok ? 200 : 503,
-          headers: buildResponseHeaders({
-            cacheStatus: "hit",
-            cacheLayer: "memory"
-          })
-        }
-      ),
+      NextResponse.json(memoryResponse, {
+        status: memoryResponse.ok ? 200 : 503,
+        headers: buildResponseHeaders({
+          cacheStatus: "hit",
+          cacheLayer: "memory"
+        })
+      }),
       auth
     )
   }
 
   const ts = NOW_ISO()
+  const serviceKey = resolveServiceApiKey(auth.key)
 
   try {
     const origin = new URL(req.url).origin
 
-    const [scanResult, stateResult, opportunitiesResult] = await Promise.allSettled([
+    const [scanResult, stateResult, opportunitiesResult] = await Promise.all([
       fetchScan(),
-      fetchState(origin, auth.key),
-      fetchOpportunities(origin, auth.key)
+      fetchState(origin, serviceKey),
+      fetchOpportunities(origin, serviceKey)
     ])
 
-    const warnings: SummaryWarningCode[] = []
-
-    const scan =
-      scanResult.status === "fulfilled" ? scanResult.value : null
-    if (scanResult.status !== "fulfilled" || !scan) {
-      warnings.push("scan_failed")
-    }
-
-    const state =
-      stateResult.status === "fulfilled" ? stateResult.value : null
-    if (stateResult.status !== "fulfilled") {
-      warnings.push("state_failed")
-    }
-
-    const opportunities =
-      opportunitiesResult.status === "fulfilled" ? opportunitiesResult.value : []
-    if (opportunitiesResult.status !== "fulfilled") {
-      warnings.push("opportunities_failed")
-    }
+    const warnings = normalizeWarnings(
+      [kvCache.warning],
+      [scanResult.warning],
+      [stateResult.warning],
+      [opportunitiesResult.warning]
+    )
 
     let response = buildSummaryFromParts({
       ts,
-      scan,
-      state,
-      opportunities,
+      scan: scanResult.scan,
+      state: stateResult.state,
+      opportunities: opportunitiesResult.opportunities,
       warnings,
       cacheStatus: "miss",
       cacheLayer: "none"
     })
 
-    const kvWriteOk = await writeKvCache(cacheKey, response)
-    if (kvWriteOk) {
-      response = {
-        ...response,
-        cache: {
-          status: "miss",
-          layer: "kv",
-          ttl_ms: SUMMARY_CACHE_TTL_MS
-        }
-      }
-    } else {
-      setMemoryCachedSummary(cacheKey, response, SUMMARY_CACHE_TTL_MS)
+    if (!response.ok) {
+      const staleMemory = getMemoryCachedSummary(cacheKey, { allowStale: true })
 
-      response = {
-        ...response,
-        warnings: [...(response.warnings ?? []), "kv_write_failed"],
-        cache: {
-          status: "miss",
+      if (staleMemory) {
+        const staleResponse = withCacheMetadata(staleMemory, {
+          status: "stale",
           layer: "memory",
           ttl_ms: SUMMARY_CACHE_TTL_MS
-        }
+        })
+
+        staleResponse.warnings = normalizeWarnings(
+          staleResponse.warnings,
+          response.warnings,
+          ["served_stale_summary"]
+        )
+        staleResponse.degraded = true
+
+        return applyApiAuthHeaders(
+          NextResponse.json(staleResponse, {
+            status: 200,
+            headers: buildResponseHeaders({
+              cacheStatus: "stale",
+              cacheLayer: "memory"
+            })
+          }),
+          auth
+        )
       }
+    }
+
+    const kvWriteOk = await writeKvCache(cacheKey, response)
+
+    setMemoryCachedSummary(cacheKey, response, SUMMARY_CACHE_TTL_MS)
+
+    response = withCacheMetadata(response, {
+      status: "miss",
+      layer: kvWriteOk ? "kv" : "memory",
+      ttl_ms: SUMMARY_CACHE_TTL_MS
+    })
+
+    if (!kvWriteOk) {
+      response.warnings = normalizeWarnings(response.warnings, ["kv_write_failed"])
+      response.degraded = true
     }
 
     return applyApiAuthHeaders(
@@ -416,6 +604,33 @@ export async function GET(req: NextRequest) {
       auth
     )
   } catch (error: unknown) {
+    const staleMemory = getMemoryCachedSummary(cacheKey, { allowStale: true })
+
+    if (staleMemory) {
+      const staleResponse = withCacheMetadata(staleMemory, {
+        status: "stale",
+        layer: "memory",
+        ttl_ms: SUMMARY_CACHE_TTL_MS
+      })
+
+      staleResponse.warnings = normalizeWarnings(
+        staleResponse.warnings,
+        ["summary_failed", "served_stale_summary"]
+      )
+      staleResponse.degraded = true
+
+      return applyApiAuthHeaders(
+        NextResponse.json(staleResponse, {
+          status: 200,
+          headers: buildResponseHeaders({
+            cacheStatus: "stale",
+            cacheLayer: "memory"
+          })
+        }),
+        auth
+      )
+    }
+
     const response: SummaryResponse = {
       ok: false,
       ts,

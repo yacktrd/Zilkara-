@@ -1,4 +1,5 @@
 // components/scan-table.tsx
+
 type Regime = "STABLE" | "TRANSITION" | "VOLATILE";
 
 export type ScanAsset = {
@@ -20,14 +21,19 @@ type Props = {
   items: ScanAsset[];
 };
 
-function safeNumber(value: unknown, fallback = 0): number {
+function safeNumber(value: unknown, fallback = NaN): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
+function safeArray<T>(value: T[] | null | undefined): T[] {
+  return Array.isArray(value) ? value : [];
+}
+
 function formatPrice(value: number): string {
-  const n = safeNumber(value, NaN);
+  const n = safeNumber(value);
 
   if (!Number.isFinite(n)) return "-";
+
   if (Math.abs(n) >= 1000) {
     return n.toLocaleString("fr-FR", {
       minimumFractionDigits: 0,
@@ -49,7 +55,8 @@ function formatPrice(value: number): string {
 }
 
 function formatPct(value: number): string {
-  const n = safeNumber(value, NaN);
+  const n = safeNumber(value);
+
   if (!Number.isFinite(n)) return "-";
 
   const sign = n > 0 ? "+" : "";
@@ -57,397 +64,270 @@ function formatPct(value: number): string {
 }
 
 function formatCompactNumber(value?: number): string {
-  if (typeof value !== "number" || !Number.isFinite(value)) return "-";
+  const n = safeNumber(value);
+
+  if (!Number.isFinite(n)) return "-";
 
   return new Intl.NumberFormat("fr-FR", {
     notation: "compact",
     maximumFractionDigits: 2,
-  }).format(value);
+  }).format(n);
+}
+
+function getConfidenceLabel(score: number): string {
+  const n = safeNumber(score, 0);
+
+  if (n >= 85) return "High";
+  if (n >= 70) return "Strong";
+  if (n >= 55) return "Moderate";
+  return "Low";
 }
 
 function getTradeUrl(item: ScanAsset): string {
-  const affiliate = item.affiliate_url?.trim();
-  const binance = item.binance_url?.trim();
+  const affiliate = typeof item.affiliate_url === "string" ? item.affiliate_url.trim() : "";
+  const fallback = typeof item.binance_url === "string" ? item.binance_url.trim() : "";
 
-  if (affiliate) return affiliate;
-  if (binance) return binance;
-  return "https://www.binance.com/en/markets";
+  return affiliate || fallback || "https://www.binance.com/en/markets";
 }
 
-function getRegimeBadgeStyle(regime: Regime): React.CSSProperties {
-  switch (regime) {
-    case "STABLE":
-      return {
-        border: "1px solid rgba(34,197,94,0.25)",
-        background: "rgba(34,197,94,0.10)",
-        color: "#86efac",
-      };
-
-    case "TRANSITION":
-      return {
-        border: "1px solid rgba(250,204,21,0.25)",
-        background: "rgba(250,204,21,0.10)",
-        color: "#fde68a",
-      };
-
-    case "VOLATILE":
-      return {
-        border: "1px solid rgba(248,113,113,0.25)",
-        background: "rgba(248,113,113,0.10)",
-        color: "#fca5a5",
-      };
-
-    default:
-      return {
-        border: "1px solid rgba(115,115,115,0.25)",
-        background: "rgba(115,115,115,0.10)",
-        color: "#d4d4d4",
-      };
+function getRegimeClasses(regime: Regime): string {
+  if (regime === "STABLE") {
+    return "border-emerald-500/20 bg-emerald-500/10 text-emerald-300";
   }
+
+  if (regime === "TRANSITION") {
+    return "border-amber-500/20 bg-amber-500/10 text-amber-300";
+  }
+
+  return "border-red-500/20 bg-red-500/10 text-red-300";
 }
 
-function getPctColor(value: number): string {
-  if (!Number.isFinite(value)) return "#a3a3a3";
-  if (value > 0) return "#86efac";
-  if (value < 0) return "#fca5a5";
-  return "#d4d4d4";
+function getPctClasses(value: number): string {
+  const n = safeNumber(value);
+
+  if (!Number.isFinite(n)) return "text-neutral-400";
+  if (n > 0) return "text-emerald-300";
+  if (n < 0) return "text-red-300";
+  return "text-neutral-200";
 }
 
-function getScoreColor(score: number): string {
-  if (!Number.isFinite(score)) return "#a3a3a3";
-  if (score >= 80) return "#86efac";
-  if (score >= 60) return "#fde68a";
-  if (score >= 40) return "#fdba74";
-  return "#fca5a5";
+function getScoreClasses(score: number): string {
+  const n = safeNumber(score, 0);
+
+  if (n >= 85) return "text-emerald-300";
+  if (n >= 70) return "text-amber-300";
+  if (n >= 55) return "text-orange-300";
+  return "text-neutral-200";
 }
 
 function EmptyState() {
   return (
-    <div
-      style={{
-        border: "1px solid #262626",
-        background: "rgba(23,23,23,0.65)",
-        borderRadius: 16,
-        padding: 20,
-      }}
-    >
-      <div style={{ fontSize: 15, fontWeight: 600, color: "#f5f5f5" }}>
-        Aucun résultat
-      </div>
-      <div style={{ marginTop: 6, fontSize: 14, color: "#a3a3a3" }}>
-        Le scan a répondu, mais aucun actif exploitable n’a été retourné.
-      </div>
+    <div className="rounded-2xl border border-neutral-800 bg-neutral-950/70 p-5">
+      <p className="text-sm font-medium text-neutral-100">Aucun résultat</p>
+      <p className="mt-1 text-sm text-neutral-500">
+        Le moteur n’a retourné aucun actif exploitable pour cette vue.
+      </p>
     </div>
   );
 }
 
 function MobileCard({ item }: { item: ScanAsset }) {
-  const pct = safeNumber(item.chg_24h_pct, NaN);
-  const score = safeNumber(item.confidence_score, NaN);
+  const tradeUrl = getTradeUrl(item);
+  const pct = safeNumber(item.chg_24h_pct);
+  const score = safeNumber(item.confidence_score, 0);
+  const confidence = getConfidenceLabel(score);
 
   return (
-    <div
-      style={{
-        border: "1px solid #262626",
-        background: "rgba(23,23,23,0.65)",
-        borderRadius: 16,
-        padding: 14,
-      }}
+    <a
+      href={tradeUrl}
+      target="_blank"
+      rel="noreferrer"
+      className="block rounded-2xl border border-neutral-800 bg-neutral-950/70 p-4 transition hover:border-neutral-700 hover:bg-neutral-950"
     >
-      <div
-        style={{
-          display: "flex",
-          alignItems: "flex-start",
-          justifyContent: "space-between",
-          gap: 12,
-        }}
-      >
-        <div>
-          <div style={{ fontWeight: 700, fontSize: 15, color: "#fafafa" }}>
-            {item.symbol}
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="truncate text-base font-semibold tracking-tight text-neutral-50">
+              {item.symbol}
+            </span>
+            <span
+              className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${getRegimeClasses(
+                item.regime
+              )}`}
+            >
+              {item.regime}
+            </span>
           </div>
-          <div style={{ marginTop: 2, fontSize: 13, color: "#a3a3a3" }}>
-            {item.name}
-          </div>
+
+          <div className="mt-1 truncate text-xs text-neutral-500">{item.name}</div>
         </div>
 
-        <span
-          style={{
-            ...getRegimeBadgeStyle(item.regime),
-            borderRadius: 999,
-            padding: "4px 10px",
-            fontSize: 11,
-            fontWeight: 700,
-            whiteSpace: "nowrap",
-          }}
-        >
-          {item.regime}
-        </span>
+        <div className="text-right">
+          <div className={`text-lg font-semibold leading-none ${getScoreClasses(score)}`}>
+            {Number.isFinite(score) ? score : "-"}
+          </div>
+          <div className="mt-1 text-[10px] uppercase tracking-wide text-neutral-500">
+            {confidence}
+          </div>
+        </div>
       </div>
 
-      <div
-        style={{
-          marginTop: 14,
-          display: "grid",
-          gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
-          gap: 10,
-        }}
-      >
+      <div className="mt-4 grid grid-cols-3 gap-3">
         <div>
-          <div style={{ fontSize: 12, color: "#737373" }}>Prix</div>
-          <div style={{ marginTop: 3, fontSize: 14, color: "#f5f5f5" }}>
+          <div className="text-[11px] uppercase tracking-wide text-neutral-500">Prix</div>
+          <div className="mt-1 text-sm font-medium text-neutral-100">
             {formatPrice(item.price)}
           </div>
         </div>
 
         <div>
-          <div style={{ fontSize: 12, color: "#737373" }}>24h</div>
-          <div
-            style={{
-              marginTop: 3,
-              fontSize: 14,
-              color: getPctColor(pct),
-              fontWeight: 600,
-            }}
-          >
+          <div className="text-[11px] uppercase tracking-wide text-neutral-500">24h</div>
+          <div className={`mt-1 text-sm font-medium ${getPctClasses(pct)}`}>
             {formatPct(pct)}
           </div>
         </div>
 
         <div>
-          <div style={{ fontSize: 12, color: "#737373" }}>Score</div>
-          <div
-            style={{
-              marginTop: 3,
-              fontSize: 14,
-              color: getScoreColor(score),
-              fontWeight: 700,
-            }}
-          >
-            {Number.isFinite(score) ? score : "-"}
-          </div>
-        </div>
-
-        <div>
-          <div style={{ fontSize: 12, color: "#737373" }}>Volume 24h</div>
-          <div style={{ marginTop: 3, fontSize: 14, color: "#d4d4d4" }}>
-            {formatCompactNumber(item.volume_24h)}
-          </div>
-        </div>
-
-        <div>
-          <div style={{ fontSize: 12, color: "#737373" }}>Market cap</div>
-          <div style={{ marginTop: 3, fontSize: 14, color: "#d4d4d4" }}>
-            {formatCompactNumber(item.market_cap)}
-          </div>
+          <div className="text-[11px] uppercase tracking-wide text-neutral-500">Signal</div>
+          <div className="mt-1 text-sm font-medium text-neutral-200">{confidence}</div>
         </div>
       </div>
 
-      <div style={{ marginTop: 14 }}>
-        <a
-          href={getTradeUrl(item)}
-          target="_blank"
-          rel="noreferrer"
-          style={{
-            display: "inline-flex",
-            alignItems: "center",
-            justifyContent: "center",
-            minHeight: 38,
-            padding: "0 14px",
-            borderRadius: 10,
-            border: "1px solid #404040",
-            color: "#fafafa",
-            textDecoration: "none",
-            fontSize: 13,
-            fontWeight: 600,
-          }}
-        >
-          Trade
-        </a>
+      <div className="mt-4 flex items-center justify-between border-t border-neutral-800 pt-3 text-[11px] text-neutral-500">
+        <span>Mcap {formatCompactNumber(item.market_cap)}</span>
+        <span>Vol {formatCompactNumber(item.volume_24h)}</span>
       </div>
+    </a>
+  );
+}
+
+function DesktopTable({ items }: { items: ScanAsset[] }) {
+  return (
+    <div className="hidden overflow-x-auto rounded-2xl border border-neutral-800 bg-neutral-950/70 md:block">
+      <table className="min-w-full border-collapse text-sm">
+        <thead>
+          <tr className="border-b border-neutral-800 text-left">
+            <th className="px-4 py-3 text-xs font-medium uppercase tracking-wide text-neutral-500">
+              Asset
+            </th>
+            <th className="px-4 py-3 text-xs font-medium uppercase tracking-wide text-neutral-500">
+              Score
+            </th>
+            <th className="px-4 py-3 text-xs font-medium uppercase tracking-wide text-neutral-500">
+              Regime
+            </th>
+            <th className="px-4 py-3 text-xs font-medium uppercase tracking-wide text-neutral-500">
+              Price
+            </th>
+            <th className="px-4 py-3 text-xs font-medium uppercase tracking-wide text-neutral-500">
+              24h
+            </th>
+            <th className="px-4 py-3 text-xs font-medium uppercase tracking-wide text-neutral-500">
+              Market Cap
+            </th>
+            <th className="px-4 py-3 text-xs font-medium uppercase tracking-wide text-neutral-500">
+              Volume
+            </th>
+            <th className="px-4 py-3 text-xs font-medium uppercase tracking-wide text-neutral-500">
+              Open
+            </th>
+          </tr>
+        </thead>
+
+        <tbody>
+          {items.map((item) => {
+            const pct = safeNumber(item.chg_24h_pct);
+            const score = safeNumber(item.confidence_score, 0);
+
+            return (
+              <tr
+                key={`${item.id}-${item.symbol}`}
+                className="border-b border-neutral-900/80 transition hover:bg-white/[0.02]"
+              >
+                <td className="px-4 py-3">
+                  <div className="flex min-w-0 flex-col">
+                    <span className="font-semibold tracking-tight text-neutral-50">
+                      {item.symbol}
+                    </span>
+                    <span className="truncate text-xs text-neutral-500">{item.name}</span>
+                  </div>
+                </td>
+
+                <td className="px-4 py-3">
+                  <div className="flex flex-col">
+                    <span className={`font-semibold ${getScoreClasses(score)}`}>
+                      {Number.isFinite(score) ? score : "-"}
+                    </span>
+                    <span className="text-[11px] text-neutral-500">
+                      {getConfidenceLabel(score)}
+                    </span>
+                  </div>
+                </td>
+
+                <td className="px-4 py-3">
+                  <span
+                    className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${getRegimeClasses(
+                      item.regime
+                    )}`}
+                  >
+                    {item.regime}
+                  </span>
+                </td>
+
+                <td className="px-4 py-3 font-medium text-neutral-100">
+                  {formatPrice(item.price)}
+                </td>
+
+                <td className={`px-4 py-3 font-medium ${getPctClasses(pct)}`}>
+                  {formatPct(pct)}
+                </td>
+
+                <td className="px-4 py-3 text-neutral-400">
+                  {formatCompactNumber(item.market_cap)}
+                </td>
+
+                <td className="px-4 py-3 text-neutral-400">
+                  {formatCompactNumber(item.volume_24h)}
+                </td>
+
+                <td className="px-4 py-3">
+                  <a
+                    href={getTradeUrl(item)}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-xs font-medium text-neutral-300 transition hover:text-neutral-50"
+                    aria-label={`Open ${item.symbol}`}
+                  >
+                    Open
+                  </a>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
     </div>
   );
 }
 
 export function ScanTable({ items }: Props) {
-  if (!Array.isArray(items) || items.length === 0) {
+  const normalizedItems = safeArray(items);
+
+  if (normalizedItems.length === 0) {
     return <EmptyState />;
   }
 
   return (
-    <>
-      <div className="md:hidden" style={{ display: "grid", gap: 12 }}>
-        {items.map((item) => (
+    <section aria-label="Assets">
+      <div className="grid gap-3 md:hidden">
+        {normalizedItems.map((item) => (
           <MobileCard key={`${item.id}-${item.symbol}`} item={item} />
         ))}
       </div>
 
-      <div
-        className="hidden md:block"
-        style={{
-          display: "none",
-        }}
-      >
-        <div
-          style={{
-            overflowX: "auto",
-            border: "1px solid #262626",
-            borderRadius: 18,
-            background: "rgba(23,23,23,0.72)",
-          }}
-        >
-          <table
-            style={{
-              width: "100%",
-              borderCollapse: "collapse",
-              fontSize: 14,
-              minWidth: 980,
-            }}
-          >
-            <thead>
-              <tr
-                style={{
-                  textAlign: "left",
-                  borderBottom: "1px solid #262626",
-                  background: "rgba(10,10,10,0.55)",
-                }}
-              >
-                <th style={{ padding: "14px 14px", color: "#a3a3a3", fontWeight: 600 }}>
-                  Asset
-                </th>
-                <th style={{ padding: "14px 14px", color: "#a3a3a3", fontWeight: 600 }}>
-                  Price
-                </th>
-                <th style={{ padding: "14px 14px", color: "#a3a3a3", fontWeight: 600 }}>
-                  24h
-                </th>
-                <th style={{ padding: "14px 14px", color: "#a3a3a3", fontWeight: 600 }}>
-                  Score
-                </th>
-                <th style={{ padding: "14px 14px", color: "#a3a3a3", fontWeight: 600 }}>
-                  Regime
-                </th>
-                <th style={{ padding: "14px 14px", color: "#a3a3a3", fontWeight: 600 }}>
-                  Market Cap
-                </th>
-                <th style={{ padding: "14px 14px", color: "#a3a3a3", fontWeight: 600 }}>
-                  Volume 24h
-                </th>
-                <th style={{ padding: "14px 14px", color: "#a3a3a3", fontWeight: 600 }}>
-                  Link
-                </th>
-              </tr>
-            </thead>
-
-            <tbody>
-              {items.map((item) => {
-                const pct = safeNumber(item.chg_24h_pct, NaN);
-                const score = safeNumber(item.confidence_score, NaN);
-
-                return (
-                  <tr
-                    key={`${item.id}-${item.symbol}`}
-                    style={{
-                      borderBottom: "1px solid #1f1f1f",
-                    }}
-                  >
-                    <td style={{ padding: "14px 14px" }}>
-                      <div style={{ fontWeight: 700, color: "#fafafa" }}>
-                        {item.symbol}
-                      </div>
-                      <div style={{ marginTop: 3, color: "#8a8a8a", fontSize: 13 }}>
-                        {item.name}
-                      </div>
-                    </td>
-
-                    <td style={{ padding: "14px 14px", color: "#e5e5e5" }}>
-                      {formatPrice(item.price)}
-                    </td>
-
-                    <td
-                      style={{
-                        padding: "14px 14px",
-                        color: getPctColor(pct),
-                        fontWeight: 600,
-                      }}
-                    >
-                      {formatPct(pct)}
-                    </td>
-
-                    <td
-                      style={{
-                        padding: "14px 14px",
-                        color: getScoreColor(score),
-                        fontWeight: 700,
-                      }}
-                    >
-                      {Number.isFinite(score) ? score : "-"}
-                    </td>
-
-                    <td style={{ padding: "14px 14px" }}>
-                      <span
-                        style={{
-                          ...getRegimeBadgeStyle(item.regime),
-                          borderRadius: 999,
-                          padding: "4px 10px",
-                          fontSize: 11,
-                          fontWeight: 700,
-                          whiteSpace: "nowrap",
-                        }}
-                      >
-                        {item.regime}
-                      </span>
-                    </td>
-
-                    <td style={{ padding: "14px 14px", color: "#d4d4d4" }}>
-                      {formatCompactNumber(item.market_cap)}
-                    </td>
-
-                    <td style={{ padding: "14px 14px", color: "#d4d4d4" }}>
-                      {formatCompactNumber(item.volume_24h)}
-                    </td>
-
-                    <td style={{ padding: "14px 14px" }}>
-                      <a
-                        href={getTradeUrl(item)}
-                        target="_blank"
-                        rel="noreferrer"
-                        style={{
-                          display: "inline-flex",
-                          alignItems: "center",
-                          justifyContent: "center",
-                          minHeight: 34,
-                          padding: "0 12px",
-                          borderRadius: 10,
-                          border: "1px solid #404040",
-                          color: "#fafafa",
-                          textDecoration: "none",
-                          fontSize: 13,
-                          fontWeight: 600,
-                        }}
-                      >
-                        Trade
-                      </a>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      <style>{`
-        @media (min-width: 768px) {
-          .md\\:hidden {
-            display: none !important;
-          }
-
-          .md\\:block {
-            display: block !important;
-          }
-        }
-      `}</style>
-    </>
+      <DesktopTable items={normalizedItems} />
+    </section>
   );
 }
+
+export default ScanTable;
