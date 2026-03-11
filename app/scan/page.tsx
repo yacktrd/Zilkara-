@@ -40,6 +40,9 @@ type MarketStateApiResponse = {
   ok?: boolean;
   state?: MarketState | null;
   error?: string | null;
+  meta?: {
+    warnings?: string[];
+  };
 };
 
 type MarketStateResult = {
@@ -64,7 +67,13 @@ function uniqueWarnings(
     Array.isArray(group) ? group : []
   );
 
-  return [...new Set(merged.filter((item) => typeof item === "string" && item.trim().length > 0))];
+  return [
+    ...new Set(
+      merged.filter(
+        (item) => typeof item === "string" && item.trim().length > 0
+      )
+    ),
+  ];
 }
 
 function normalizeItems(items: ScanAsset[] | null | undefined): ScanTableItem[] {
@@ -82,19 +91,25 @@ function normalizeUiWarning(warning: string): string | null {
   if (
     w === "missing_api_key" ||
     w === "invalid_api_key" ||
-    w === "internal_key_missing"
+    w === "internal_key_missing" ||
+    w === "internal_base_url_unavailable"
   ) {
-    return "market_state_unavailable";
-  }
-
-  if (w.startsWith("market_state_http_")) {
     return "market_state_unavailable";
   }
 
   if (
-    w === "market_state_fetch_timeout_or_failed" ||
-    w === "market_state_request_failed"
+    w === "request_timeout" ||
+    w === "request_failed" ||
+    w === "json_parse_failed"
   ) {
+    return "market_state_unavailable";
+  }
+
+  if (w.startsWith("http_")) {
+    return "market_state_unavailable";
+  }
+
+  if (w.startsWith("fetch_failed:")) {
     return "market_state_unavailable";
   }
 
@@ -130,7 +145,9 @@ async function getMarketState(): Promise<MarketStateResult> {
   if (!result.ok) {
     return {
       state: null,
-      warning: normalizeUiWarning(result.error ?? result.warnings[0] ?? "market_state_unavailable"),
+      warning: normalizeUiWarning(
+        result.error ?? result.warnings[0] ?? "market_state_unavailable"
+      ),
     };
   }
 
@@ -139,7 +156,9 @@ async function getMarketState(): Promise<MarketStateResult> {
   if (!payload || payload.ok !== true) {
     return {
       state: null,
-      warning: normalizeUiWarning(payload?.error ?? "market_state_unavailable"),
+      warning: normalizeUiWarning(
+        payload?.error ?? "market_state_unavailable"
+      ),
     };
   }
 

@@ -1,136 +1,43 @@
 // app/api/admin/enable-key/route.ts
-import { NextRequest, NextResponse } from "next/server";
-import { enableRegistryKey } from "@/lib/xyvala/registry";
-import { invalidateAuthKey } from "@/lib/xyvala/auth";
 
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
+import { NextRequest, NextResponse } from "next/server"
+import { enableRegistryKey } from "@/lib/xyvala/registry"
 
-const XYVALA_VERSION = "v1";
-
-type EnableKeyResponse = {
-  ok: boolean;
-  ts: string;
-  version: string;
-
-  key: string | null;
-  updated: boolean;
-
-  error: string | null;
-
-  meta: {
-    warnings: string[];
-  };
-};
-
-const NOW_ISO = () => new Date().toISOString();
-
-function safeStr(v: unknown): string | null {
-  return typeof v === "string" && v.trim().length ? v.trim() : null;
-}
-
-function buildResponse(
-  input: Partial<EnableKeyResponse> & Pick<EnableKeyResponse, "ts">
-): EnableKeyResponse {
-  return {
-    ok: Boolean(input.ok),
-    ts: input.ts,
-    version: input.version ?? XYVALA_VERSION,
-
-    key: input.key ?? null,
-    updated: input.updated ?? false,
-
-    error: input.error ?? null,
-
-    meta: {
-      warnings: input.meta?.warnings ?? [],
-    },
-  };
-}
+export const runtime = "nodejs"
+export const dynamic = "force-dynamic"
 
 export async function POST(req: NextRequest) {
-  const ts = NOW_ISO();
-
   try {
-    const body = await req.json();
-    const key = safeStr(body?.key);
+    const body = await req.json()
+
+    const key =
+      typeof body?.key === "string"
+        ? body.key.trim()
+        : ""
 
     if (!key) {
-      const res = buildResponse({
-        ok: false,
-        ts,
-        key: null,
-        updated: false,
-        error: "missing_key",
-      });
-
-      return NextResponse.json(res, {
-        status: 400,
-        headers: {
-          "cache-control": "no-store",
-          "x-xyvala-version": XYVALA_VERSION,
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "missing_key"
         },
-      });
+        { status: 400 }
+      )
     }
 
-    const result = enableRegistryKey(key);
+    await enableRegistryKey(key)
 
-    if (!result.ok) {
-      const res = buildResponse({
-        ok: false,
-        ts,
-        key,
-        updated: false,
-        error: "key_not_found",
-      });
-
-      return NextResponse.json(res, {
-        status: 404,
-        headers: {
-          "cache-control": "no-store",
-          "x-xyvala-version": XYVALA_VERSION,
-        },
-      });
-    }
-
-    invalidateAuthKey(key);
-
-    const res = buildResponse({
+    return NextResponse.json({
       ok: true,
-      ts,
-      key,
-      updated: result.updated,
-      error: null,
-      meta: {
-        warnings: [],
-      },
-    });
-
-    return NextResponse.json(res, {
-      status: 200,
-      headers: {
-        "cache-control": "no-store",
-        "x-xyvala-version": XYVALA_VERSION,
-      },
-    });
+      key
+    })
   } catch (e: any) {
-    const res = buildResponse({
-      ok: false,
-      ts,
-      key: null,
-      updated: false,
-      error: e?.message ? String(e.message) : "unknown_error",
-      meta: {
-        warnings: ["route_exception"],
+    return NextResponse.json(
+      {
+        ok: false,
+        error: e?.message ?? "enable_key_failed"
       },
-    });
-
-    return NextResponse.json(res, {
-      status: 500,
-      headers: {
-        "cache-control": "no-store",
-        "x-xyvala-version": XYVALA_VERSION,
-      },
-    });
+      { status: 500 }
+    )
   }
 }

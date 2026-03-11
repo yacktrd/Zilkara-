@@ -24,9 +24,17 @@ function safeStr(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function uniqueWarnings(...groups: Array<string[] | undefined | null>): string[] {
+function uniqueWarnings(
+  ...groups: Array<string[] | undefined | null>
+): string[] {
   const merged = groups.flatMap((group) => (Array.isArray(group) ? group : []));
-  return [...new Set(merged.filter((item) => typeof item === "string" && item.trim().length > 0))];
+  return [
+    ...new Set(
+      merged.filter(
+        (item) => typeof item === "string" && item.trim().length > 0
+      )
+    ),
+  ];
 }
 
 function normalizePath(path: string): string | null {
@@ -48,7 +56,9 @@ function resolveBaseUrl(): string | null {
   if (host) {
     const protocol =
       forwardedProto ||
-      (host.includes("localhost") || host.startsWith("127.0.0.1") ? "http" : "https");
+      (host.includes("localhost") || host.startsWith("127.0.0.1")
+        ? "http"
+        : "https");
 
     return `${protocol}://${host}`;
   }
@@ -70,6 +80,7 @@ function getInternalKey(override?: string): {
   source: "env" | "override" | "missing";
 } {
   const overrideKey = safeStr(override);
+
   if (overrideKey) {
     return {
       key: overrideKey,
@@ -78,6 +89,7 @@ function getInternalKey(override?: string): {
   }
 
   const envKey = safeStr(process.env.XYVALA_INTERNAL_KEY);
+
   if (envKey) {
     return {
       key: envKey,
@@ -119,6 +131,7 @@ export async function xyvalaServerFetch<T extends JsonRecord = JsonRecord>(
   const warnings: string[] = [];
 
   const normalizedPath = normalizePath(path);
+
   if (!normalizedPath) {
     return {
       ok: false,
@@ -135,6 +148,7 @@ export async function xyvalaServerFetch<T extends JsonRecord = JsonRecord>(
   }
 
   const baseUrl = resolveBaseUrl();
+
   if (!baseUrl) {
     return {
       ok: false,
@@ -151,6 +165,7 @@ export async function xyvalaServerFetch<T extends JsonRecord = JsonRecord>(
   }
 
   const internalKeyInfo = getInternalKey(input?.internalKeyOverride);
+
   if (!internalKeyInfo.key) {
     return {
       ok: false,
@@ -232,14 +247,11 @@ export async function xyvalaServerFetch<T extends JsonRecord = JsonRecord>(
         error instanceof Error && error.message
           ? `fetch_failed:${error.message}`
           : "fetch_failed",
-      warnings: uniqueWarnings(
-        warnings,
-        [
-          error instanceof Error && error.name === "AbortError"
-            ? "request_timeout"
-            : "request_failed",
-        ]
-      ),
+      warnings: uniqueWarnings(warnings, [
+        error instanceof Error && error.name === "AbortError"
+          ? "request_timeout"
+          : "request_failed",
+      ]),
       meta: {
         url: url.toString(),
         usedInternalKey: true,
