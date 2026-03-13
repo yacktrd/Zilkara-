@@ -1,6 +1,5 @@
 // lib/xyvala/usage.ts
 
-import { createHash } from "node:crypto";
 import { NextResponse } from "next/server";
 import type { ApiKeyType } from "@/lib/xyvala/auth";
 
@@ -11,416 +10,399 @@ export type ApiPlan =
   | "pro"
   | "enterprise";
 
-export type UsageEndpoint = string;
-
 export type TrackUsageInput = {
   key?: string;
   apiKey?: string;
   keyType?: ApiKeyType | string;
   endpoint?: string;
-  planOverride?: ApiPlan;
+  planOverride?: ApiPlan | string;
+};
+
+export type UsageSnapshot = {
+  key: string;
+  endpoint: string;
+  plan: ApiPlan;
+  keyType: string;
+  usageCount: number;
+  usageMinute: number;
+  usageDay: number;
+  quotaMinute: number;
+  quotaDay: number;
+  remainingMinute: number;
+  remainingDay: number;
+  quotaExceeded: boolean;
+  resetMinute: number;
+  resetDay: number;
+  ts: string;
 };
 
 export type UsageState = {
   plan: ApiPlan;
-  quotaLimit: number;
-  quotaRemaining: number;
-  quotaReset: number;
+  key: string;
+  keyType: string;
+  endpoint: string;
   usageCount: number;
-  endpoint: string | null;
+  usageMinute: number;
+  usageDay: number;
+  quotaMinute: number;
+  quotaDay: number;
+  remainingMinute: number;
+  remainingDay: number;
   quotaExceeded: boolean;
+  resetMinute: number;
+  resetDay: number;
+  snapshot: UsageSnapshot;
 };
 
-export type UsageSnapshot = {
-  bucket: string;
-  apiKey: string;
-  apiKeyMasked: string;
-  apiKeyHash: string;
-  endpoint: string | null;
-  keyType: string | null;
+type UsageBucket = {
+  count: number;
+  resetAt: number;
+};
+
+type UsageStoreEntry = {
+  totalCount: number;
+  minute: UsageBucket;
+  day: UsageBucket;
+  updatedAt: number;
   plan: ApiPlan;
-  count: number;
-  resetAt: number;
-  lastSeenAt: number;
+  keyType: string;
 };
 
-type DailyQuotaRecord = {
-  count: number;
-  bucket: string;
-  resetAt: number;
-  lastSeenAt: number;
+type UsageViewByKey = {
   key: string;
-  keyType: string | null;
   plan: ApiPlan;
+  keyType: string;
+  totalCount: number;
+  minuteCount: number;
+  dayCount: number;
+  updatedAt: number;
 };
 
-type UsageMatrixRecord = {
-  bucket: string;
-  key: string;
-  endpoint: string | null;
-  keyType: string | null;
-  plan: ApiPlan;
-  count: number;
-  resetAt: number;
-  lastSeenAt: number;
+type UsageViewByEndpoint = {
+  endpoint: string;
+  totalCount: number;
+  minuteCount: number;
+  dayCount: number;
+  keys: number;
 };
 
 type UsageTotals = {
-  records: number;
-  totalCalls: number;
+  totalKeys: number;
+  totalEndpoints: number;
+  totalUsageCount: number;
+  totalMinuteCount: number;
+  totalDayCount: number;
+  quotaExceededKeys: number;
 };
 
-const PLAN_LIMITS: Readonly<Record<ApiPlan, number>> = Object.freeze({
-  internal: 1_000_000_000,
-  demo: 100,
-  trader: 5_000,
-  pro: 50_000,
-  enterprise: 1_000_000_000,
-});
+const PLAN_LIMITS: Record<ApiPlan, { minute: number; day: number }> = {
+  internal: { minute: 1_000_000_000, day: 1_000_000_000 },
+  demo: { minute: 20, day: 100 },
+  trader: { minute: 300, day: 5_000 },
+  pro: { minute: 2_000, day: 50_000 },
+  enterprise: { minute: 1_000_000_000, day: 1_000_000_000 },
+};
 
-const DEFAULT_PLAN: ApiPlan = "trader";
-const CLEANUP_THRESHOLD = 2_000;
+const DEFAULT_ENDPOINT = "unknown";
 
-const quotaStore = new Map<string, DailyQuotaRecord>();
-const usageMatrixStore = new Map<string, UsageMatrixRecord>();
+const keyStore = new Map<string, UsageStoreEntry>();
+const endpointStore = new Map<string, UsageStoreEntry>();
 
-function safeStr(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "";
+function nowTs(): string {
+  return new Date().toISOString();
 }
 
 function nowMs(): number {
   return Date.now();
 }
 
-function getResolvedKey(input: TrackUsageInput): string {
+function safeStr(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeEndpoint(value: unknown): string {
+  return safeStr(value) || DEFAULT_ENDPOINT;
+}
+
+function normalizeKey(input: TrackUsageInput): string {
   return safeStr(input.key) || safeStr(input.apiKey);
 }
 
-function normalizeEndpoint(value: unknown): string | null {
-  const raw = safeStr(value);
-  if (!raw) return null;
-  return raw.startsWith("/") ? raw : `/${raw}`;
-}
-
-function getTodayBucketUtc(date = new Date()): string {
-  const year = date.getUTCFullYear();
-  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
-  const day = String(date.getUTCDate()).padStart(2, "0");
-
-  return `${year}-${month}-${day}`;
-}
-
-function getNextUtcMidnightTimestamp(date = new Date()): number {
-  return Date.UTC(
-    date.getUTCFullYear(),
-    date.getUTCMonth(),
-    date.getUTCDate() + 1,
-    0,
-    0,
-    0,
-    0
-  );
-}
-
-function inferKeyTypeFromEnv(key: string): ApiKeyType | null {
-  if (!key) return null;
-
-  const internal = safeStr(process.env.XYVALA_INTERNAL_KEY);
-  if (internal && key === internal) return "internal";
-
-  const demo = safeStr(process.env.XYVALA_PUBLIC_DEMO_KEY);
-  if (demo && key === demo) return "public_demo";
-
-  const legacy = safeStr(process.env.XYVALA_API_KEY);
-  if (legacy && key === legacy) return "legacy";
-
-  return null;
-}
-
-function resolvePlanFromKeyType(keyType: string | null): ApiPlan {
+function resolvePlanFromKeyType(keyType: string): ApiPlan {
   if (keyType === "internal") return "internal";
   if (keyType === "public_demo") return "demo";
-  if (keyType === "legacy") return "trader";
-
-  return DEFAULT_PLAN;
+  return "trader";
 }
 
-function resolvePlan(input: TrackUsageInput, resolvedKey: string): ApiPlan {
-  if (input.planOverride && PLAN_LIMITS[input.planOverride]) {
-    return input.planOverride;
+function normalizePlan(
+  planOverride: unknown,
+  keyType: string
+): ApiPlan {
+  const override = safeStr(planOverride).toLowerCase();
+
+  if (
+    override === "internal" ||
+    override === "demo" ||
+    override === "trader" ||
+    override === "pro" ||
+    override === "enterprise"
+  ) {
+    return override;
   }
 
-  const explicitKeyType = safeStr(input.keyType);
-  if (explicitKeyType) {
-    return resolvePlanFromKeyType(explicitKeyType);
-  }
-
-  const inferred = inferKeyTypeFromEnv(resolvedKey);
-  return resolvePlanFromKeyType(inferred);
+  return resolvePlanFromKeyType(keyType);
 }
 
-function resolveKeyType(input: TrackUsageInput, resolvedKey: string): string | null {
-  const explicitKeyType = safeStr(input.keyType);
-  if (explicitKeyType) return explicitKeyType;
-
-  return inferKeyTypeFromEnv(resolvedKey);
+function getMinuteReset(fromMs = nowMs()): number {
+  const d = new Date(fromMs);
+  d.setSeconds(0, 0);
+  d.setMinutes(d.getMinutes() + 1);
+  return d.getTime();
 }
 
-function buildQuotaStoreKey(key: string, bucket: string): string {
-  return `${bucket}:${key}`;
+function getDayReset(fromMs = nowMs()): number {
+  const d = new Date(fromMs);
+  d.setHours(24, 0, 0, 0);
+  return d.getTime();
 }
 
-function buildMatrixStoreKey(
-  key: string,
-  endpoint: string | null,
-  bucket: string
-): string {
-  return `${bucket}:${key}:${endpoint ?? "*"}`;
-}
+function ensureBucket(bucket: UsageBucket, kind: "minute" | "day", currentMs: number): UsageBucket {
+  const targetReset = kind === "minute" ? getMinuteReset(currentMs) : getDayReset(currentMs);
 
-function hashKey(key: string): string {
-  return createHash("sha256").update(key).digest("hex").slice(0, 16);
-}
-
-function maskKey(key: string): string {
-  if (!key) return "";
-  if (key.length <= 8) return "****";
-
-  const start = key.slice(0, 4);
-  const end = key.slice(-4);
-  return `${start}****${end}`;
-}
-
-function cleanupStoreBucket<T extends { bucket: string }>(
-  store: Map<string, T>,
-  currentBucket: string
-) {
-  if (store.size < CLEANUP_THRESHOLD) return;
-
-  for (const [storeKey, record] of store.entries()) {
-    if (record.bucket !== currentBucket) {
-      store.delete(storeKey);
-    }
-  }
-}
-
-function cleanupStores(currentBucket: string) {
-  cleanupStoreBucket(quotaStore, currentBucket);
-  cleanupStoreBucket(usageMatrixStore, currentBucket);
-}
-
-function toSnapshot(record: UsageMatrixRecord): UsageSnapshot {
-  return {
-    bucket: record.bucket,
-    apiKey: record.key,
-    apiKeyMasked: maskKey(record.key),
-    apiKeyHash: hashKey(record.key),
-    endpoint: record.endpoint,
-    keyType: record.keyType,
-    plan: record.plan,
-    count: record.count,
-    resetAt: record.resetAt,
-    lastSeenAt: record.lastSeenAt,
-  };
-}
-
-function sortSnapshotsDesc(a: UsageSnapshot, b: UsageSnapshot): number {
-  if (b.count !== a.count) return b.count - a.count;
-  return b.lastSeenAt - a.lastSeenAt;
-}
-
-function aggregateTotalsFromMatrix(records: Iterable<UsageMatrixRecord>): UsageTotals {
-  let totalCalls = 0;
-  let recordsCount = 0;
-
-  for (const record of records) {
-    recordsCount += 1;
-    totalCalls += record.count;
-  }
-
-  return {
-    records: recordsCount,
-    totalCalls,
-  };
-}
-
-function getCurrentBucket(): string {
-  return getTodayBucketUtc(new Date());
-}
-
-function getCurrentResetAt(): number {
-  return getNextUtcMidnightTimestamp(new Date());
-}
-
-/* -------------------------------------------------------------------------- */
-/*                               Public Tracking                              */
-/* -------------------------------------------------------------------------- */
-
-export function trackUsage(input: TrackUsageInput): UsageState {
-  const date = new Date();
-  const bucket = getTodayBucketUtc(date);
-  const quotaReset = getNextUtcMidnightTimestamp(date);
-  const lastSeenAt = nowMs();
-
-  cleanupStores(bucket);
-
-  const resolvedKey = getResolvedKey(input);
-  const endpoint = normalizeEndpoint(input.endpoint);
-  const keyType = resolveKeyType(input, resolvedKey);
-  const plan = resolvePlan(input, resolvedKey);
-  const quotaLimit = PLAN_LIMITS[plan];
-
-  if (!resolvedKey) {
+  if (currentMs >= bucket.resetAt) {
     return {
-      plan,
-      quotaLimit,
-      quotaRemaining: quotaLimit,
-      quotaReset,
-      usageCount: 0,
-      endpoint,
-      quotaExceeded: false,
+      count: 0,
+      resetAt: targetReset,
     };
   }
 
-  const quotaKey = buildQuotaStoreKey(resolvedKey, bucket);
-  const currentQuota = quotaStore.get(quotaKey);
-  const nextQuotaCount = (currentQuota?.count ?? 0) + 1;
+  return bucket;
+}
 
-  quotaStore.set(quotaKey, {
-    count: nextQuotaCount,
-    bucket,
-    resetAt: quotaReset,
-    lastSeenAt,
-    key: resolvedKey,
-    keyType,
-    plan,
-  });
-
-  const matrixKey = buildMatrixStoreKey(resolvedKey, endpoint, bucket);
-  const currentMatrix = usageMatrixStore.get(matrixKey);
-  const nextMatrixCount = (currentMatrix?.count ?? 0) + 1;
-
-  usageMatrixStore.set(matrixKey, {
-    bucket,
-    key: resolvedKey,
-    endpoint,
-    keyType,
-    plan,
-    count: nextMatrixCount,
-    resetAt: quotaReset,
-    lastSeenAt,
-  });
-
-  const quotaRemaining = Math.max(quotaLimit - nextQuotaCount, 0);
-  const quotaExceeded = nextQuotaCount > quotaLimit;
-
+function createStoreEntry(plan: ApiPlan, keyType: string, currentMs: number): UsageStoreEntry {
   return {
+    totalCount: 0,
+    minute: {
+      count: 0,
+      resetAt: getMinuteReset(currentMs),
+    },
+    day: {
+      count: 0,
+      resetAt: getDayReset(currentMs),
+    },
+    updatedAt: currentMs,
     plan,
-    quotaLimit,
-    quotaRemaining,
-    quotaReset,
-    usageCount: nextQuotaCount,
-    endpoint,
-    quotaExceeded,
+    keyType,
   };
 }
 
-export function applyQuotaHeaders(response: NextResponse, usage: UsageState) {
-  response.headers.set("x-xyvala-plan", usage.plan);
-  response.headers.set("x-xyvala-quota-limit", String(usage.quotaLimit));
-  response.headers.set("x-xyvala-quota-remaining", String(usage.quotaRemaining));
-  response.headers.set("x-xyvala-quota-reset", String(usage.quotaReset));
-  response.headers.set("x-xyvala-usage-count", String(usage.usageCount));
-  response.headers.set(
-    "x-xyvala-quota-exceeded",
-    usage.quotaExceeded ? "true" : "false"
+function trackStoreEntry(
+  store: Map<string, UsageStoreEntry>,
+  storeKey: string,
+  plan: ApiPlan,
+  keyType: string,
+  currentMs: number
+): UsageStoreEntry {
+  const existing = store.get(storeKey) ?? createStoreEntry(plan, keyType, currentMs);
+
+  const minute = ensureBucket(existing.minute, "minute", currentMs);
+  const day = ensureBucket(existing.day, "day", currentMs);
+
+  const updated: UsageStoreEntry = {
+    totalCount: existing.totalCount + 1,
+    minute: {
+      count: minute.count + 1,
+      resetAt: minute.resetAt,
+    },
+    day: {
+      count: day.count + 1,
+      resetAt: day.resetAt,
+    },
+    updatedAt: currentMs,
+    plan,
+    keyType,
+  };
+
+  store.set(storeKey, updated);
+  return updated;
+}
+
+function buildSnapshot(input: {
+  key: string;
+  endpoint: string;
+  plan: ApiPlan;
+  keyType: string;
+  entry: UsageStoreEntry;
+}): UsageSnapshot {
+  const limits = PLAN_LIMITS[input.plan];
+
+  const usageMinute = input.entry.minute.count;
+  const usageDay = input.entry.day.count;
+
+  const remainingMinute = Math.max(limits.minute - usageMinute, 0);
+  const remainingDay = Math.max(limits.day - usageDay, 0);
+
+  const quotaExceeded = usageMinute > limits.minute || usageDay > limits.day;
+
+  return {
+    key: input.key,
+    endpoint: input.endpoint,
+    plan: input.plan,
+    keyType: input.keyType,
+    usageCount: input.entry.totalCount,
+    usageMinute,
+    usageDay,
+    quotaMinute: limits.minute,
+    quotaDay: limits.day,
+    remainingMinute,
+    remainingDay,
+    quotaExceeded,
+    resetMinute: input.entry.minute.resetAt,
+    resetDay: input.entry.day.resetAt,
+    ts: nowTs(),
+  };
+}
+
+export function trackUsage(input: TrackUsageInput): UsageState {
+  const key = normalizeKey(input);
+  const keyType = safeStr(input.keyType) || "legacy";
+  const endpoint = normalizeEndpoint(input.endpoint);
+  const plan = normalizePlan(input.planOverride, keyType);
+
+  if (!key) {
+    throw new Error("usage_key_missing");
+  }
+
+  const currentMs = nowMs();
+
+  const keyEntry = trackStoreEntry(
+    keyStore,
+    key,
+    plan,
+    keyType,
+    currentMs
   );
 
-  if (usage.endpoint) {
-    response.headers.set("x-xyvala-endpoint", usage.endpoint);
-  }
+  trackStoreEntry(
+    endpointStore,
+    endpoint,
+    plan,
+    keyType,
+    currentMs
+  );
 
-  return response;
+  const snapshot = buildSnapshot({
+    key,
+    endpoint,
+    plan,
+    keyType,
+    entry: keyEntry,
+  });
+
+  return {
+    plan,
+    key,
+    keyType,
+    endpoint,
+    usageCount: snapshot.usageCount,
+    usageMinute: snapshot.usageMinute,
+    usageDay: snapshot.usageDay,
+    quotaMinute: snapshot.quotaMinute,
+    quotaDay: snapshot.quotaDay,
+    remainingMinute: snapshot.remainingMinute,
+    remainingDay: snapshot.remainingDay,
+    quotaExceeded: snapshot.quotaExceeded,
+    resetMinute: snapshot.resetMinute,
+    resetDay: snapshot.resetDay,
+    snapshot,
+  };
 }
 
-/* -------------------------------------------------------------------------- */
-/*                              Admin / Analytics                             */
-/* -------------------------------------------------------------------------- */
-
-export async function listUsageByKey(input: {
-  apiKey: string;
-}): Promise<UsageSnapshot[]> {
-  const apiKey = safeStr(input.apiKey);
-  if (!apiKey) return [];
-
-  const bucket = getCurrentBucket();
-  const rows: UsageSnapshot[] = [];
-
-  for (const record of usageMatrixStore.values()) {
-    if (record.bucket !== bucket) continue;
-    if (record.key !== apiKey) continue;
-    rows.push(toSnapshot(record));
-  }
-
-  rows.sort(sortSnapshotsDesc);
-  return rows;
+export function listUsageByKey(): UsageViewByKey[] {
+  return Array.from(keyStore.entries())
+    .map(([key, entry]) => ({
+      key,
+      plan: entry.plan,
+      keyType: entry.keyType,
+      totalCount: entry.totalCount,
+      minuteCount: entry.minute.count,
+      dayCount: entry.day.count,
+      updatedAt: entry.updatedAt,
+    }))
+    .sort((a, b) => b.totalCount - a.totalCount || b.updatedAt - a.updatedAt);
 }
 
-export async function listUsageByEndpoint(input: {
-  endpoint: UsageEndpoint;
-}): Promise<UsageSnapshot[]> {
-  const endpoint = normalizeEndpoint(input.endpoint);
-  if (!endpoint) return [];
+export function listUsageByEndpoint(): UsageViewByEndpoint[] {
+  const rows = Array.from(endpointStore.entries()).map(([endpoint, entry]) => ({
+    endpoint,
+    totalCount: entry.totalCount,
+    minuteCount: entry.minute.count,
+    dayCount: entry.day.count,
+    keys: 0,
+  }));
 
-  const bucket = getCurrentBucket();
-  const rows: UsageSnapshot[] = [];
+  const keysByEndpoint = new Map<string, Set<string>>();
 
-  for (const record of usageMatrixStore.values()) {
-    if (record.bucket !== bucket) continue;
-    if (record.endpoint !== endpoint) continue;
-    rows.push(toSnapshot(record));
+  for (const [key] of keyStore.entries()) {
+    void key;
   }
 
-  rows.sort(sortSnapshotsDesc);
-  return rows;
+  return rows
+    .map((row) => ({
+      ...row,
+      keys: keysByEndpoint.get(row.endpoint)?.size ?? 0,
+    }))
+    .sort((a, b) => b.totalCount - a.totalCount || a.endpoint.localeCompare(b.endpoint));
 }
 
-export async function getUsageTotals(): Promise<UsageTotals> {
-  const bucket = getCurrentBucket();
+export function getUsageTotals(): UsageTotals {
+  let totalUsageCount = 0;
+  let totalMinuteCount = 0;
+  let totalDayCount = 0;
+  let quotaExceededKeys = 0;
 
-  const currentBucketRecords: UsageMatrixRecord[] = [];
-  for (const record of usageMatrixStore.values()) {
-    if (record.bucket === bucket) {
-      currentBucketRecords.push(record);
+  for (const [, entry] of keyStore.entries()) {
+    totalUsageCount += entry.totalCount;
+    totalMinuteCount += entry.minute.count;
+    totalDayCount += entry.day.count;
+
+    const limits = PLAN_LIMITS[entry.plan];
+    if (entry.minute.count > limits.minute || entry.day.count > limits.day) {
+      quotaExceededKeys += 1;
     }
   }
 
-  return aggregateTotalsFromMatrix(currentBucketRecords);
-}
-
-/* -------------------------------------------------------------------------- */
-/*                           Optional Internal Helpers                        */
-/* -------------------------------------------------------------------------- */
-
-export function getPlanQuotaLimit(plan: ApiPlan): number {
-  return PLAN_LIMITS[plan];
-}
-
-export function getSupportedPlans(): ApiPlan[] {
-  return Object.keys(PLAN_LIMITS) as ApiPlan[];
-}
-
-export function getUsageDebugState() {
-  const bucket = getCurrentBucket();
-  const totals = aggregateTotalsFromMatrix(
-    Array.from(usageMatrixStore.values()).filter((row) => row.bucket === bucket)
-  );
-
   return {
-    bucket,
-    resetAt: getCurrentResetAt(),
-    quotaStoreSize: quotaStore.size,
-    usageMatrixStoreSize: usageMatrixStore.size,
-    totals,
+    totalKeys: keyStore.size,
+    totalEndpoints: endpointStore.size,
+    totalUsageCount,
+    totalMinuteCount,
+    totalDayCount,
+    quotaExceededKeys,
   };
+}
+
+export function applyQuotaHeaders(
+  res: NextResponse,
+  usage: UsageState
+): NextResponse {
+  res.headers.set("x-xyvala-plan", usage.plan);
+  res.headers.set("x-xyvala-endpoint", usage.endpoint);
+
+  res.headers.set("x-xyvala-usage-count", String(usage.usageCount));
+
+  res.headers.set("x-xyvala-usage-minute", String(usage.usageMinute));
+  res.headers.set("x-xyvala-usage-day", String(usage.usageDay));
+
+  res.headers.set("x-xyvala-quota-minute", String(usage.quotaMinute));
+  res.headers.set("x-xyvala-quota-day", String(usage.quotaDay));
+
+  res.headers.set("x-xyvala-remaining-minute", String(usage.remainingMinute));
+  res.headers.set("x-xyvala-remaining-day", String(usage.remainingDay));
+
+  res.headers.set("x-xyvala-quota-exceeded", usage.quotaExceeded ? "true" : "false");
+  res.headers.set("x-xyvala-reset-minute", String(usage.resetMinute));
+  res.headers.set("x-xyvala-reset-day", String(usage.resetDay));
+
+  return res;
 }

@@ -1,11 +1,16 @@
 // app/api/context/route.ts
+
 import { NextRequest, NextResponse } from "next/server";
 import {
   enforceApiPolicy,
   buildApiKeyErrorResponse,
   applyApiAuthHeaders,
 } from "@/lib/xyvala/auth";
-import { trackUsage } from "@/lib/xyvala/usage";
+import {
+  trackUsage,
+  applyQuotaHeaders,
+} from "@/lib/xyvala/usage";
+import { xyvalaServerFetch } from "@/lib/xyvala/server-client";
 import {
   scanKey,
   getFromCache,
@@ -15,15 +20,13 @@ import {
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const revalidate = 0;
 
 const XYVALA_VERSION = "v1";
 const TTL_MS = 45_000;
+const CANONICAL_LIMIT = 250;
 
 type Regime = "STABLE" | "TRANSITION" | "VOLATILE" | null;
-
-type SnapshotAssetLike = {
-  regime?: string | null;
-};
 
 type ContextResponse = {
   ok: boolean;
@@ -38,7 +41,7 @@ type ContextResponse = {
   message: string | null;
   error: string | null;
 
-  source: "scan_cache" | "context_cache" | "scan_self_heal" | "scan_recomputed";
+  source: "scan_cache" | "context_cache" | "scan_self_heal";
   meta: {
     scan_cache_key: string;
     context_cache_key: string;
@@ -47,28 +50,56 @@ type ContextResponse = {
   };
 };
 
-/* --------------------------------- Utils --------------------------------- */
+type ScanRouteResponse = {
+  ok?: boolean;
+  ts?: string;
+  version?: string;
+  source?: string;
+  market?: string;
+  quote?: string;
+  count?: number;
+  data?: unknown[];
+  context?: {
+    market_regime?: unknown;
+    stable_ratio?: unknown;
+    transition_ratio?: unknown;
+    volatile_ratio?: unknown;
+  };
+  meta?: {
+    limit?: unknown;
+    sort?: unknown;
+    order?: unknown;
+    q?: unknown;
+    warnings?: unknown;
+  };
+  error?: string | null;
+};
 
-const NOW_ISO = () => new Date().toISOString();
+type AuthResult = ReturnType<typeof enforceApiPolicy>;
+type AuthSuccess = Extract<AuthResult, { ok: true }>;
+type UsageResult = ReturnType<typeof trackUsage> | null;
 
-function safeNum(v: unknown): number | null {
-  return typeof v === "number" && Number.isFinite(v) ? v : null;
+const nowIso = () => new Date().toISOString();
+
+function safeStr(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
 }
 
-function safeStr(v: unknown): string | null {
-  return typeof v === "string" && v.trim().length ? v.trim() : null;
+function safeNum(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-function normalizeRegime(v: unknown): Regime {
-  const s = typeof v === "string" ? v.trim().toUpperCase() : "";
-  if (s === "STABLE" || s === "TRANSITION" || s === "VOLATILE") return s;
+function uniqueWarnings(...groups: Array<string[] | undefined | null>): string[] {
+  const merged = groups.flatMap((group) => (Array.isArray(group) ? group : []));
+  return [...new Set(merged.filter((item) => typeof item === "string" && item.trim().length > 0))];
+}
+
+function normalizeRegime(value: unknown): Regime {
+  const s = safeStr(value).toUpperCase();
+  if (s === "STABLE") return "STABLE";
+  if (s === "TRANSITION") return "TRANSITION";
+  if (s === "VOLATILE") return "VOLATILE";
   return null;
-}
-
-function normalizeQuote(v: string | null): "usd" | "usdt" | "eur" {
-  const s = (v ?? "").trim().toLowerCase();
-  if (s === "usdt" || s === "eur") return s;
-  return "usd";
 }
 
 function buildContextResponse(
@@ -97,26 +128,6 @@ function buildContextResponse(
   };
 }
 
-function hasUsableContext(res: Partial<ContextResponse> | null | undefined) {
-  if (!res) return false;
-
-  return (
-    res.ok === true &&
-    (
-      res.market_regime !== null ||
-      res.stable_ratio !== null ||
-      res.transition_ratio !== null ||
-      res.volatile_ratio !== null
-    )
-  );
-}
-
-function extractAssetsFromScanJson(scanJson: any): SnapshotAssetLike[] {
-  if (Array.isArray(scanJson?.data)) return scanJson.data;
-  if (Array.isArray(scanJson?.assets)) return scanJson.assets;
-  return [];
-}
-
 function extractContextFromSnapshot(snapshot: ScanSnapshot) {
   return {
     market_regime: normalizeRegime(snapshot.context?.market_regime),
@@ -126,47 +137,49 @@ function extractContextFromSnapshot(snapshot: ScanSnapshot) {
   };
 }
 
-function recomputeContextFromAssets(data: SnapshotAssetLike[]) {
-  let stable = 0;
-  let transition = 0;
-  let volatile = 0;
-
-  for (const asset of data) {
-    const regime = normalizeRegime(asset?.regime);
-
-    if (regime === "STABLE") stable += 1;
-    else if (regime === "TRANSITION") transition += 1;
-    else if (regime === "VOLATILE") volatile += 1;
-  }
-
-  const total = stable + transition + volatile;
-
-  const stable_ratio = total ? stable / total : null;
-  const transition_ratio = total ? transition / total : null;
-  const volatile_ratio = total ? volatile / total : null;
-
-  let market_regime: Regime = null;
-
-  if (volatile_ratio !== null && volatile_ratio >= 0.45) {
-    market_regime = "VOLATILE";
-  } else if (stable_ratio !== null && stable_ratio >= 0.55) {
-    market_regime = "STABLE";
-  } else if (transition_ratio !== null) {
-    market_regime = "TRANSITION";
-  }
+function normalizeScanSnapshot(input: ScanRouteResponse): ScanSnapshot | null {
+  if (!input?.ok) return null;
+  if (!Array.isArray(input.data)) return null;
+  if (!input.context || typeof input.context !== "object") return null;
 
   return {
-    market_regime,
-    stable_ratio,
-    transition_ratio,
-    volatile_ratio,
+    ok: true,
+    ts: safeStr(input.ts) || nowIso(),
+    version: safeStr(input.version) || XYVALA_VERSION,
+    source:
+      input.source === "cache" || input.source === "fallback"
+        ? input.source
+        : "scan",
+    market: safeStr(input.market) || "crypto",
+    quote: safeStr(input.quote) || "usd",
+    count:
+      typeof input.count === "number" && Number.isFinite(input.count)
+        ? Math.max(0, Math.trunc(input.count))
+        : input.data.length,
+    data: input.data as ScanSnapshot["data"],
+    context: {
+      market_regime: normalizeRegime(input.context.market_regime),
+      stable_ratio: safeNum(input.context.stable_ratio),
+      transition_ratio: safeNum(input.context.transition_ratio),
+      volatile_ratio: safeNum(input.context.volatile_ratio),
+    },
+    meta: {
+      limit:
+        typeof input.meta?.limit === "number" && Number.isFinite(input.meta.limit)
+          ? Math.max(1, Math.trunc(input.meta.limit))
+          : CANONICAL_LIMIT,
+      sort: safeStr(input.meta?.sort) === "price" ? "price" : "score",
+      order: safeStr(input.meta?.order) === "asc" ? "asc" : "desc",
+      q: typeof input.meta?.q === "string" ? input.meta.q : null,
+      warnings: Array.isArray(input.meta?.warnings)
+        ? input.meta.warnings.filter((item): item is string => typeof item === "string")
+        : [],
+    },
   };
 }
 
 async function getOrRebuildScanSnapshot(
-  req: NextRequest,
-  authKey: string,
-  quote: "usd" | "usdt" | "eur",
+  auth: AuthSuccess,
   warnings: string[]
 ): Promise<{
   scan_cache_key: string;
@@ -176,15 +189,14 @@ async function getOrRebuildScanSnapshot(
   const scan_cache_key = scanKey({
     version: XYVALA_VERSION,
     market: "crypto",
-    quote,
+    quote: "usd",
     sort: "score",
     order: "desc",
-    limit: 250,
+    limit: CANONICAL_LIMIT,
     q: null,
   });
 
-  const cached = await getFromCache<ScanSnapshot>(scan_cache_key, TTL_MS);
-
+  const cached = getFromCache<ScanSnapshot>(scan_cache_key, TTL_MS);
   if (cached) {
     return {
       scan_cache_key,
@@ -193,155 +205,132 @@ async function getOrRebuildScanSnapshot(
     };
   }
 
-  try {
-    const origin = new URL(req.url).origin;
-    const url = new URL("/api/scan", origin);
-    url.searchParams.set("quote", quote);
-    url.searchParams.set("sort", "score");
-    url.searchParams.set("order", "desc");
-    url.searchParams.set("limit", "250");
-    url.searchParams.set("noStore", "1");
+  const rebuilt = await xyvalaServerFetch<ScanRouteResponse>("/api/scan", {
+    searchParams: {
+      quote: "usd",
+      sort: "score",
+      order: "desc",
+      limit: CANONICAL_LIMIT,
+      noStore: 1,
+    },
+    timeoutMs: 8_000,
+  });
 
-    const scanRes = await fetch(url.toString(), {
-      method: "GET",
-      headers: {
-        "x-xyvala-key": authKey,
-      },
-      cache: "no-store",
-    });
+  if (!rebuilt.ok || !rebuilt.data) {
+    warnings.push(
+      rebuilt.error
+        ? `scan_self_heal_failed:${rebuilt.error}`
+        : "scan_self_heal_failed"
+    );
 
-    if (!scanRes.ok) {
-      warnings.push(`scan_self_heal_http_${scanRes.status}`);
-      return {
-        scan_cache_key,
-        snapshot: null,
-        source: "scan_self_heal",
-      };
-    }
-
-    const scanJson = await scanRes.json();
-    const assets = extractAssetsFromScanJson(scanJson);
-
-    if (!scanJson?.ok || assets.length === 0) {
-      warnings.push("scan_self_heal_invalid_shape");
-      return {
-        scan_cache_key,
-        snapshot: null,
-        source: "scan_self_heal",
-      };
-    }
-
-    const contextFromPayload =
-      scanJson?.context && typeof scanJson.context === "object"
-        ? scanJson.context
-        : recomputeContextFromAssets(assets);
-
-    const snapshot: ScanSnapshot = {
-      ok: true,
-      ts: String(scanJson.ts ?? NOW_ISO()),
-      version: String(scanJson.version ?? XYVALA_VERSION),
-      source:
-        scanJson.source === "cache" ||
-        scanJson.source === "fallback" ||
-        scanJson.source === "scan"
-          ? scanJson.source
-          : "scan",
-      market: String(scanJson.market ?? "crypto"),
-      quote: String(scanJson.quote ?? quote),
-      count: Number.isFinite(scanJson.count)
-        ? Number(scanJson.count)
-        : assets.length,
-      data: assets as any,
-      context: contextFromPayload,
-      meta: scanJson.meta ?? {
-        limit: 250,
-        sort: "score",
-        order: "desc",
-        q: null,
-        warnings: [],
-      },
-    };
-
-    await setToCache(scan_cache_key, snapshot);
-    warnings.push("scan_self_heal_ok");
-
-    return {
-      scan_cache_key,
-      snapshot,
-      source: "scan_self_heal",
-    };
-  } catch {
-    warnings.push("scan_self_heal_failed");
     return {
       scan_cache_key,
       snapshot: null,
       source: "scan_self_heal",
     };
   }
+
+  const snapshot = normalizeScanSnapshot(rebuilt.data);
+
+  if (!snapshot) {
+    warnings.push("scan_self_heal_invalid_shape");
+
+    return {
+      scan_cache_key,
+      snapshot: null,
+      source: "scan_self_heal",
+    };
+  }
+
+  setToCache(scan_cache_key, snapshot);
+  warnings.push("scan_self_heal_ok");
+
+  return {
+    scan_cache_key,
+    snapshot,
+    source: "scan_self_heal",
+  };
+}
+
+function respond(
+  payload: ContextResponse,
+  status: number,
+  auth: AuthSuccess,
+  usage: UsageResult
+) {
+  let res: NextResponse = NextResponse.json(payload, {
+    status,
+    headers: {
+      "cache-control": "no-store",
+      "x-xyvala-version": XYVALA_VERSION,
+      "x-xyvala-cache": payload.meta.cache,
+    },
+  });
+
+  res = applyApiAuthHeaders(res, auth);
+
+  if (usage) {
+    res = applyQuotaHeaders(res, usage);
+  }
+
+  return res;
 }
 
 /* -------------------------------- Handler -------------------------------- */
 
 export async function GET(req: NextRequest) {
-  const ts = NOW_ISO();
-  const warnings: string[] = [];
-
+  const ts = nowIso();
   const auth = enforceApiPolicy(req);
 
   if (!auth.ok) {
     return buildApiKeyErrorResponse(auth.error, auth.status);
   }
 
-  await trackUsage({
-    apiKey: auth.key,
-    endpoint: "/api/context",
-  });
+  let usage: UsageResult = null;
+  let usageWarnings: string[] = [];
 
   try {
-    const noStore =
-      req.nextUrl.searchParams.get("noStore") === "1" ||
-      req.nextUrl.searchParams.get("noStore") === "true";
+    usage = trackUsage({
+      key: auth.key,
+      keyType: auth.keyType,
+      endpoint: "/api/context",
+      planOverride: auth.plan,
+    });
+  } catch (error) {
+    usageWarnings = uniqueWarnings([
+      error instanceof Error && error.message
+        ? `usage_track_failed:${error.message}`
+        : "usage_track_failed",
+    ]);
+  }
 
-    const quote = normalizeQuote(req.nextUrl.searchParams.get("quote"));
+  try {
+    const warnings: string[] = [...usageWarnings];
 
     const { scan_cache_key, snapshot, source } = await getOrRebuildScanSnapshot(
-      req,
-      auth.key,
-      quote,
+      auth,
       warnings
     );
 
-    const context_cache_key = `xyvala:context:${XYVALA_VERSION}:quote=${quote}:scan=${scan_cache_key}`;
+    const context_cache_key = `xyvala:context:${XYVALA_VERSION}:scan=${scan_cache_key}`;
+    const noStore = req.nextUrl.searchParams.get("noStore") === "1";
 
     if (!noStore) {
-      const cachedContext = await getFromCache<ContextResponse>(context_cache_key, TTL_MS);
+      const cachedContext = getFromCache<ContextResponse>(context_cache_key, TTL_MS);
 
-      if (hasUsableContext(cachedContext)) {
+      if (cachedContext) {
         const res = buildContextResponse({
           ...cachedContext,
           ts,
           source: "context_cache",
           meta: {
-            ...cachedContext!.meta,
+            ...cachedContext.meta,
             cache: "hit",
+            warnings: uniqueWarnings(cachedContext.meta.warnings, warnings),
           },
         });
 
-        return applyApiAuthHeaders(
-          NextResponse.json(res, {
-            status: 200,
-            headers: {
-              "cache-control": "no-store",
-              "x-xyvala-version": XYVALA_VERSION,
-              "x-xyvala-cache": "hit",
-            },
-          }),
-          auth
-        );
-      }
-
-      if (cachedContext && !hasUsableContext(cachedContext)) {
-        warnings.push("stale_empty_context_cache_ignored");
+        return respond(res, 200, auth, usage);
       }
     }
 
@@ -364,52 +353,21 @@ export async function GET(req: NextRequest) {
         },
       });
 
-      return applyApiAuthHeaders(
-        NextResponse.json(res, {
-          status: 503,
-          headers: {
-            "cache-control": "no-store",
-            "x-xyvala-version": XYVALA_VERSION,
-          },
-        }),
-        auth
-      );
+      return respond(res, 503, auth, usage);
     }
 
-    let extracted = extractContextFromSnapshot(snapshot);
-
-    const needsRecompute =
-      extracted.market_regime === null &&
-      extracted.stable_ratio === null &&
-      extracted.transition_ratio === null &&
-      extracted.volatile_ratio === null;
-
-    if (needsRecompute) {
-      const assets = Array.isArray((snapshot as any)?.data)
-        ? ((snapshot as any).data as SnapshotAssetLike[])
-        : [];
-
-      if (assets.length > 0) {
-        extracted = recomputeContextFromAssets(assets);
-        warnings.push("context_recomputed_from_assets");
-      }
-    }
-
-    const ok = hasUsableContext({
-      ok: true,
-      ...extracted,
-    });
+    const extracted = extractContextFromSnapshot(snapshot);
 
     const res = buildContextResponse({
-      ok,
+      ok: true,
       ts,
       market_regime: extracted.market_regime,
       stable_ratio: extracted.stable_ratio,
       transition_ratio: extracted.transition_ratio,
       volatile_ratio: extracted.volatile_ratio,
       message: null,
-      error: ok ? null : "context_unavailable",
-      source: needsRecompute ? "scan_recomputed" : source,
+      error: null,
+      source,
       meta: {
         scan_cache_key,
         context_cache_key,
@@ -418,22 +376,12 @@ export async function GET(req: NextRequest) {
       },
     });
 
-    if (!noStore && res.ok) {
-      await setToCache(context_cache_key, res);
+    if (!noStore) {
+      setToCache(context_cache_key, res);
     }
 
-    return applyApiAuthHeaders(
-      NextResponse.json(res, {
-        status: res.ok ? 200 : 503,
-        headers: {
-          "cache-control": "no-store",
-          "x-xyvala-version": XYVALA_VERSION,
-          "x-xyvala-cache": noStore ? "no-store" : "miss",
-        },
-      }),
-      auth
-    );
-  } catch (e: any) {
+    return respond(res, 200, auth, usage);
+  } catch (error) {
     const res = buildContextResponse({
       ok: false,
       ts,
@@ -442,25 +390,26 @@ export async function GET(req: NextRequest) {
       transition_ratio: null,
       volatile_ratio: null,
       message: null,
-      error: e?.message ? String(e.message) : "unknown_error",
+      error:
+        error instanceof Error && error.message
+          ? String(error.message)
+          : "unknown_error",
       source: "scan_self_heal",
       meta: {
         scan_cache_key: "",
         context_cache_key: "",
-        cache: "no-store",
-        warnings: ["route_exception"],
+        cache: "miss",
+        warnings: uniqueWarnings(
+          usageWarnings,
+          [
+            error instanceof Error && error.message
+              ? `route_exception:${error.message}`
+              : "route_exception",
+          ]
+        ),
       },
     });
 
-    return applyApiAuthHeaders(
-      NextResponse.json(res, {
-        status: 500,
-        headers: {
-          "cache-control": "no-store",
-          "x-xyvala-version": XYVALA_VERSION,
-        },
-      }),
-      auth
-    );
+    return respond(res, 500, auth, usage);
   }
 }

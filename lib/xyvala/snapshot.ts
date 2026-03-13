@@ -1,18 +1,12 @@
 // lib/xyvala/snapshot.ts
-/**
- * XYVALA — Snapshot Cache (V1 propre, robuste, prêt V2 KV)
- *
- * ADN :
- * - Un “capteur” stable (scan) réutilisable par /zones et /decision
- * - Shape immuable (pas de surprises pour l’UI)
- * - Cache best-effort (serverless) + contrat identique si on passe à Vercel KV
- *
- * Corrections / améliorations vs erreurs vues :
- * - Clés stables & canoniques (tri des params) => moins de "cache miss" inutiles
- * - TTL géré au niveau entry (expiresAt) => lecture O(1), logique claire
- * - Auto-clean périodique => limite la croissance mémoire
- * - API async-compatible (get/set peuvent devenir KV sans casser les appels)
- */
+/* XYVALA — Snapshot Cache (V3 stabilisé)
+   Rôle :
+   - source centrale de vérité cache pour scan / zones / decision
+   - shape stable, réutilisable et vérifiable
+   - in-memory best-effort borné
+   - rétrocompatibilité douce avec anciens appels setToCache(..., ttlMs)
+   - prêt pour migration vers Redis / KV sans casser l’API
+*/
 
 export type Market = "crypto" | string;
 export type Quote = "usd" | "usdt" | "eur" | string;
@@ -31,7 +25,6 @@ export type ScanAsset = {
   confidence_score: number | null;
   regime: Regime | null;
 
-  // jamais vides côté API (fallback => markets/binance)
   binance_url: string;
   affiliate_url: string;
 
@@ -43,16 +36,16 @@ export type ScanAsset = {
 };
 
 export type ScanContext = {
-  market_regime: Regime;
-  stable_ratio: number;
-  transition_ratio: number;
-  volatile_ratio: number;
+  market_regime: Regime | null;
+  stable_ratio: number | null;
+  transition_ratio: number | null;
+  volatile_ratio: number | null;
 };
 
 export type ScanSnapshot = {
   ok: true;
-  ts: string; // ISO
-  version: string; // ex: "v1"
+  ts: string;
+  version: string;
   source: "scan" | "fallback" | "cache";
 
   market: Market;
@@ -72,98 +65,162 @@ export type ScanSnapshot = {
   };
 };
 
-/* ------------------------------ Cache engine ------------------------------ */
-
 type Entry<T> = {
+  ts: number;
   value: T;
-  createdAt: number; // epoch ms
-  expiresAt: number; // epoch ms
+  expiresAt: number | null;
 };
+
+const MAX_CACHE_ENTRIES = 500;
 
 const mem = new Map<string, Entry<unknown>>();
 
-// Petite GC périodique (best-effort) pour éviter que la Map grossisse indéfiniment.
-let lastGcAt = 0;
-const GC_INTERVAL_MS = 30_000; // toutes les 30s max
-const MAX_ENTRIES = 1500; // garde-fou (serverless)
-const HARD_EVICT_BATCH = 200;
-
-function now() {
-  return Date.now();
+function safeStr(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
 }
 
-function maybeGc() {
-  const t = now();
-  if (t - lastGcAt < GC_INTERVAL_MS) return;
-  lastGcAt = t;
+function safeFiniteNumberOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
 
-  // 1) purge expirés
-  for (const [k, e] of mem.entries()) {
-    if (e.expiresAt <= t) mem.delete(k);
+function normalizeKeyPart(value: string | number | null | undefined): string {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
   }
 
-  // 2) garde-fou taille : éviction simple (les plus vieux) si on dépasse MAX_ENTRIES
-  if (mem.size <= MAX_ENTRIES) return;
+  if (typeof value === "string") {
+    return value.trim();
+  }
 
-  const arr: Array<[string, Entry<unknown>]> = [];
-  for (const kv of mem.entries()) arr.push(kv);
-
-  arr.sort((a, b) => a[1].createdAt - b[1].createdAt); // plus ancien d’abord
-  const toRemove = Math.min(mem.size - MAX_ENTRIES, HARD_EVICT_BATCH);
-
-  for (let i = 0; i < toRemove; i++) mem.delete(arr[i][0]);
+  return "";
 }
 
-function stableEncode(v: string | number | boolean | null | undefined) {
-  if (v === null || v === undefined) return "";
-  return encodeURIComponent(String(v));
+function normalizeTtlMs(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return null;
+  }
+
+  const ttl = Math.max(0, Math.trunc(value));
+  return ttl > 0 ? ttl : null;
 }
 
-// Canonicalisation : tri des clés => clé stable quel que soit l’ordre d’insertion.
-function key(ns: string, parts: Record<string, string | number | boolean | null | undefined>) {
-  const keys = Object.keys(parts).sort();
-  const flat = keys.map((k) => `${k}=${stableEncode(parts[k])}`).join("&");
+function pruneCacheIfNeeded(): void {
+  if (mem.size < MAX_CACHE_ENTRIES) return;
+
+  const firstKey = mem.keys().next().value;
+  if (typeof firstKey === "string") {
+    mem.delete(firstKey);
+  }
+}
+
+function buildKey(
+  ns: string,
+  parts: Record<string, string | number | null | undefined>
+): string {
+  const flat = Object.entries(parts)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([k, v]) => `${k}=${normalizeKeyPart(v)}`)
+    .join("&");
+
   return `xyvala:${ns}:${flat}`;
 }
 
-/**
- * API compatible V2 KV :
- * - getFromCache / setToCache sont async-friendly (tu peux les await sans changer d’implémentation)
- * - si tu passes à KV, tu gardes les mêmes signatures.
- */
-export async function getFromCache<T>(k: string, ttlMs: number): Promise<T | null> {
-  maybeGc();
+function isExpired(entry: Entry<unknown>, ttlMs: number): boolean {
+  const now = Date.now();
 
-  const e = mem.get(k) as Entry<T> | undefined;
-  if (!e) return null;
+  if (entry.expiresAt !== null && now >= entry.expiresAt) {
+    return true;
+  }
 
-  const t = now();
+  if (ttlMs <= 0) {
+    return true;
+  }
 
-  // TTL "soft" demandé par l'appelant (permet de raccourcir selon endpoint)
-  // + TTL "hard" enregistré à l'écriture (expiresAt).
-  const age = t - e.createdAt;
-  if (age > ttlMs || e.expiresAt <= t) {
+  return now - entry.ts > ttlMs;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isScanAsset(value: unknown): value is ScanAsset {
+  if (!isRecord(value)) return false;
+
+  if (!safeStr(value.id)) return false;
+  if (!safeStr(value.symbol)) return false;
+  if (!safeStr(value.name)) return false;
+  if (!safeStr(value.binance_url)) return false;
+  if (!safeStr(value.affiliate_url)) return false;
+
+  const scoreTrend = value.score_trend;
+  if (scoreTrend !== "up" && scoreTrend !== "down" && scoreTrend !== null) {
+    return false;
+  }
+
+  if (safeFiniteNumberOrNull(value.price) === null && value.price !== null) {
+    return false;
+  }
+
+  if (safeFiniteNumberOrNull(value.chg_24h_pct) === null && value.chg_24h_pct !== null) {
+    return false;
+  }
+
+  if (
+    safeFiniteNumberOrNull(value.confidence_score) === null &&
+    value.confidence_score !== null
+  ) {
+    return false;
+  }
+
+  if (safeFiniteNumberOrNull(value.market_cap) === null && value.market_cap !== null) {
+    return false;
+  }
+
+  if (safeFiniteNumberOrNull(value.volume_24h) === null && value.volume_24h !== null) {
+    return false;
+  }
+
+  if (safeFiniteNumberOrNull(value.score_delta) === null && value.score_delta !== null) {
+    return false;
+  }
+
+  return true;
+}
+
+export function getFromCache<T>(k: string, ttlMs: number): T | null {
+  const entry = mem.get(k);
+  if (!entry) return null;
+
+  const effectiveTtl = Number.isFinite(ttlMs) ? Math.max(0, Math.trunc(ttlMs)) : 0;
+
+  if (isExpired(entry, effectiveTtl)) {
     mem.delete(k);
     return null;
   }
 
-  return e.value;
+  return entry.value as T;
 }
 
-export async function setToCache<T>(k: string, value: T, ttlMs = 45_000): Promise<void> {
-  maybeGc();
+export function setToCache<T>(k: string, value: T, ttlMs?: number): void {
+  pruneCacheIfNeeded();
 
-  const t = now();
+  const normalizedTtl = normalizeTtlMs(ttlMs);
+
   mem.set(k, {
+    ts: Date.now(),
     value,
-    createdAt: t,
-    expiresAt: t + Math.max(1_000, ttlMs), // min 1s pour éviter edge-cases
+    expiresAt: normalizedTtl !== null ? Date.now() + normalizedTtl : null,
   });
 }
 
-/* --------------------------------- Keys ---------------------------------- */
+export function clearSnapshotCache(): void {
+  mem.clear();
+}
 
-/** Snapshot keys (scan canonical) */
+export function getSnapshotCacheSize(): number {
+  return mem.size;
+}
+
 export function scanKey(opts: {
   version: string;
   market: string;
@@ -172,8 +229,8 @@ export function scanKey(opts: {
   order: "asc" | "desc";
   limit: number;
   q: string | null;
-}) {
-  return key("scan", {
+}): string {
+  return buildKey("scan", {
     v: opts.version,
     market: opts.market,
     quote: opts.quote,
@@ -184,14 +241,13 @@ export function scanKey(opts: {
   });
 }
 
-/** Zones keys depend on scanKey (composition stable) */
 export function zonesKey(opts: {
   version: string;
   scan_cache_key: string;
   symbol: string;
   tf: string;
-}) {
-  return key("zones", {
+}): string {
+  return buildKey("zones", {
     v: opts.version,
     scan: opts.scan_cache_key,
     symbol: opts.symbol,
@@ -199,14 +255,13 @@ export function zonesKey(opts: {
   });
 }
 
-/** Decision keys depend on zonesKey */
 export function decisionKey(opts: {
   version: string;
   zones_cache_key: string;
   symbol: string;
   tf: string;
-}) {
-  return key("decision", {
+}): string {
+  return buildKey("decision", {
     v: opts.version,
     zones: opts.zones_cache_key,
     symbol: opts.symbol,
@@ -214,9 +269,88 @@ export function decisionKey(opts: {
   });
 }
 
-/* ------------------------------ Debug helpers ----------------------------- */
-/** Optionnel : utile en dev pour vérifier que le cache fonctionne */
-export function __cacheStats() {
-  maybeGc();
-  return { size: mem.size, lastGcAt };
+/**
+ * Validation minimale pour sécuriser les routes qui réutilisent le snapshot.
+ * Objectif :
+ * - bloquer les formes cassées les plus probables
+ * - rester légère
+ */
+export function isScanSnapshot(value: unknown): value is ScanSnapshot {
+  if (!isRecord(value)) {
+    return false;
+  }
+
+  const snapshot = value as Partial<ScanSnapshot>;
+
+  if (snapshot.ok !== true) return false;
+  if (!safeStr(snapshot.ts)) return false;
+  if (!safeStr(snapshot.version)) return false;
+
+  if (
+    snapshot.source !== "scan" &&
+    snapshot.source !== "fallback" &&
+    snapshot.source !== "cache"
+  ) {
+    return false;
+  }
+
+  if (!Array.isArray(snapshot.data)) return false;
+  if (!snapshot.data.every(isScanAsset)) return false;
+
+  if (!isRecord(snapshot.meta)) return false;
+  if (!isRecord(snapshot.context)) return false;
+
+  const meta = snapshot.meta;
+  const context = snapshot.context;
+
+  if (meta.sort !== "score" && meta.sort !== "price") {
+    return false;
+  }
+
+  if (meta.order !== "asc" && meta.order !== "desc") {
+    return false;
+  }
+
+  if (
+    safeFiniteNumberOrNull(snapshot.count) === null ||
+    safeFiniteNumberOrNull(meta.limit) === null
+  ) {
+    return false;
+  }
+
+  if (!Array.isArray(meta.warnings) || meta.warnings.some((item) => typeof item !== "string")) {
+    return false;
+  }
+
+  if (
+    safeFiniteNumberOrNull(context.stable_ratio) === null &&
+    context.stable_ratio !== null
+  ) {
+    return false;
+  }
+
+  if (
+    safeFiniteNumberOrNull(context.transition_ratio) === null &&
+    context.transition_ratio !== null
+  ) {
+    return false;
+  }
+
+  if (
+    safeFiniteNumberOrNull(context.volatile_ratio) === null &&
+    context.volatile_ratio !== null
+  ) {
+    return false;
+  }
+
+  const marketRegime = context.market_regime;
+  if (
+    typeof marketRegime !== "string" &&
+    marketRegime !== null &&
+    marketRegime !== undefined
+  ) {
+    return false;
+  }
+
+  return true;
 }

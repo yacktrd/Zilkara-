@@ -1,13 +1,20 @@
 // app/api/account/quota/route.ts
+
 import { NextRequest, NextResponse } from "next/server";
-import { validateApiKey } from "@/lib/xyvala/auth";
+import {
+  enforceApiPolicy,
+  applyApiAuthHeaders,
+} from "@/lib/xyvala/auth";
+import {
+  trackUsage,
+  applyQuotaHeaders,
+} from "@/lib/xyvala/usage";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const revalidate = 0;
 
 const XYVALA_VERSION = "v1";
-
-/* --------------------------------- Types --------------------------------- */
 
 type AccountQuotaResponse = {
   ok: boolean;
@@ -38,9 +45,97 @@ type AccountQuotaResponse = {
   };
 };
 
-/* --------------------------------- Utils --------------------------------- */
+type AuthResult = ReturnType<typeof enforceApiPolicy>;
+type UsageResult = Awaited<ReturnType<typeof trackUsage>> | null;
 
-const NOW_ISO = () => new Date().toISOString();
+type QuotaSnapshot = {
+  usageMinute: number;
+  usageDay: number;
+  remainingMinute: number;
+  remainingDay: number;
+  quotaMinute: number | null;
+  quotaDay: number | null;
+};
+
+const nowIso = () => new Date().toISOString();
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function safeFiniteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function uniqueWarnings(...groups: Array<string[] | undefined | null>): string[] {
+  const merged = groups.flatMap((group) => (Array.isArray(group) ? group : []));
+  return [...new Set(merged.filter((item) => typeof item === "string" && item.trim().length > 0))];
+}
+
+function readNumberFromKeys(
+  source: Record<string, unknown>,
+  keys: string[]
+): number | null {
+  for (const key of keys) {
+    const value = safeFiniteNumber(source[key]);
+    if (value !== null) return value;
+  }
+
+  return null;
+}
+
+function readNestedNumber(
+  source: Record<string, unknown>,
+  parentKey: string,
+  childKey: string
+): number | null {
+  const parent = source[parentKey];
+  if (!isRecord(parent)) return null;
+  return safeFiniteNumber(parent[childKey]);
+}
+
+function extractQuotaSnapshot(usage: UsageResult): QuotaSnapshot {
+  const raw = isRecord(usage) ? usage : {};
+
+  const usageMinute =
+    readNumberFromKeys(raw, ["usageMinute", "minuteUsage"]) ??
+    readNestedNumber(raw, "usage", "minute") ??
+    0;
+
+  const usageDay =
+    readNumberFromKeys(raw, ["usageDay", "dayUsage"]) ??
+    readNestedNumber(raw, "usage", "day") ??
+    0;
+
+  const remainingMinute =
+    readNumberFromKeys(raw, ["remainingMinute", "minuteRemaining"]) ??
+    readNestedNumber(raw, "remaining", "minute") ??
+    0;
+
+  const remainingDay =
+    readNumberFromKeys(raw, ["remainingDay", "dayRemaining"]) ??
+    readNestedNumber(raw, "remaining", "day") ??
+    0;
+
+  const quotaMinute =
+    readNumberFromKeys(raw, ["quotaMinute", "minuteQuota"]) ??
+    readNestedNumber(raw, "quota", "minute") ??
+    usageMinute + remainingMinute;
+
+  const quotaDay =
+    readNumberFromKeys(raw, ["quotaDay", "dayQuota"]) ??
+    readNestedNumber(raw, "quota", "day") ??
+    usageDay + remainingDay;
+
+  return {
+    usageMinute,
+    usageDay,
+    remainingMinute,
+    remainingDay,
+    quotaMinute,
+    quotaDay,
+  };
+}
 
 function buildResponse(
   input: Partial<AccountQuotaResponse> & Pick<AccountQuotaResponse, "ts">
@@ -75,99 +170,121 @@ function buildResponse(
   };
 }
 
-function makeHeaders(auth?: {
-  plan: string;
-  remainingMinute: number;
-  remainingDay: number;
-  usage: { minute: number; day: number };
-}) {
-  const headers: Record<string, string> = {
-    "cache-control": "no-store",
-    "x-xyvala-version": XYVALA_VERSION,
-  };
+function respond(
+  payload: AccountQuotaResponse,
+  status: number,
+  auth?: AuthResult,
+  usage?: UsageResult
+) {
+  let res: NextResponse = NextResponse.json(payload, {
+    status,
+    headers: {
+      "cache-control": "no-store",
+      "x-xyvala-version": XYVALA_VERSION,
+      "x-xyvala-auth": auth && auth.ok ? "ok" : "failed",
+    },
+  });
 
-  if (auth) {
-    headers["x-xyvala-auth"] = "ok";
-    headers["x-xyvala-plan"] = String(auth.plan);
-    headers["x-xyvala-remaining-minute"] = String(auth.remainingMinute);
-    headers["x-xyvala-remaining-day"] = String(auth.remainingDay);
-    headers["x-xyvala-usage-minute"] = String(auth.usage.minute);
-    headers["x-xyvala-usage-day"] = String(auth.usage.day);
-  } else {
-    headers["x-xyvala-auth"] = "failed";
+  if (auth && auth.ok) {
+    res = applyApiAuthHeaders(res, auth);
   }
 
-  return headers;
+  if (usage) {
+    res = applyQuotaHeaders(res, usage);
+  }
+
+  return res;
 }
 
-/* -------------------------------- Handler -------------------------------- */
-
 export async function GET(req: NextRequest) {
-  const ts = NOW_ISO();
+  const ts = nowIso();
 
-  const auth = validateApiKey(req);
+  const auth = enforceApiPolicy(req);
 
   if (!auth.ok) {
     const res = buildResponse({
       ok: false,
       ts,
+      plan: null,
       error: auth.error,
       meta: {
         warnings: [],
       },
     });
 
-    return NextResponse.json(res, {
-      status: auth.status,
-      headers: makeHeaders(),
+    return respond(res, auth.status);
+  }
+
+  let usage: UsageResult = null;
+  let warnings: string[] = [];
+
+  try {
+    usage = await trackUsage({
+      key: auth.key,
+      keyType: auth.keyType,
+      endpoint: "/api/account/quota",
+      planOverride: auth.plan,
     });
+  } catch (error) {
+    warnings = uniqueWarnings([
+      error instanceof Error && error.message
+        ? `usage_track_failed:${error.message}`
+        : "usage_track_failed",
+    ]);
   }
 
   try {
+    const quotaState = extractQuotaSnapshot(usage);
+
     const res = buildResponse({
       ok: true,
       ts,
       plan: auth.plan,
 
       usage: {
-        minute: auth.usage.minute,
-        day: auth.usage.day,
+        minute: quotaState.usageMinute,
+        day: quotaState.usageDay,
       },
 
       remaining: {
-        minute: auth.remainingMinute,
-        day: auth.remainingDay,
+        minute: quotaState.remainingMinute,
+        day: quotaState.remainingDay,
       },
 
       quota: {
-        minute: auth.usage.minute + auth.remainingMinute,
-        day: auth.usage.day + auth.remainingDay,
+        minute: quotaState.quotaMinute,
+        day: quotaState.quotaDay,
       },
 
       error: null,
 
       meta: {
-        warnings: [],
+        warnings,
       },
     });
 
-    return NextResponse.json(res, {
-      status: 200,
-      headers: makeHeaders(auth),
-    });
-  } catch (e: any) {
+    return respond(res, 200, auth, usage);
+  } catch (error) {
     const res = buildResponse({
       ok: false,
       ts,
-      error: e?.message ? String(e.message) : "unknown_error",
+      plan: auth.plan,
+      error:
+        error instanceof Error && error.message
+          ? error.message
+          : "unknown_error",
       meta: {
-        warnings: ["route_exception"],
+        warnings: uniqueWarnings(
+          warnings,
+          [
+            error instanceof Error && error.message
+              ? `route_exception:${error.message}`
+              : "route_exception",
+          ]
+        ),
       },
     });
 
-    return NextResponse.json(res, {
-      status: 500,
-      headers: makeHeaders(),
-    });
+    return respond(res, 500, auth, usage);
   }
 }

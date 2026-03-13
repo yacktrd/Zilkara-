@@ -1,10 +1,14 @@
 // lib/xyvala/server-client.ts
 
+import "server-only";
+
 import { headers } from "next/headers";
 
 const DEFAULT_TIMEOUT_MS = 6000;
 const MIN_TIMEOUT_MS = 1000;
+const MAX_TIMEOUT_MS = 20000;
 
+type PrimitiveQueryValue = string | number | boolean | null | undefined;
 type JsonRecord = Record<string, unknown>;
 
 export type InternalApiResult<T> = {
@@ -13,142 +17,229 @@ export type InternalApiResult<T> = {
   data: T | null;
   error: string | null;
   warnings: string[];
-  meta: {
-    url: string | null;
-    usedInternalKey: boolean;
-    keySource: "env" | "override" | "missing";
-  };
+};
+
+export type InternalApiMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+
+export type InternalApiRequestOptions = {
+  method?: InternalApiMethod;
+  searchParams?: Record<string, PrimitiveQueryValue>;
+  body?: unknown;
+  timeoutMs?: number;
+  cache?: RequestCache;
+  next?: NextFetchRequestConfig;
+  headers?: Record<string, string>;
 };
 
 function safeStr(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function uniqueWarnings(
-  ...groups: Array<string[] | undefined | null>
-): string[] {
+function lowerStr(value: unknown): string {
+  return safeStr(value).toLowerCase();
+}
+
+function isRecord(value: unknown): value is JsonRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function uniqueWarnings(...groups: Array<string[] | undefined | null>): string[] {
   const merged = groups.flatMap((group) => (Array.isArray(group) ? group : []));
-  return [
-    ...new Set(
-      merged.filter(
-        (item) => typeof item === "string" && item.trim().length > 0
-      )
-    ),
-  ];
+  return [...new Set(merged.filter((item) => typeof item === "string" && item.trim().length > 0))];
 }
 
-function normalizePath(path: string): string | null {
-  const normalized = safeStr(path);
+function normalizeTimeoutMs(value: unknown): number {
+  const fallback = DEFAULT_TIMEOUT_MS;
+  const num = typeof value === "number" ? value : Number.parseInt(String(value), 10);
 
-  if (!normalized) return null;
-  if (!normalized.startsWith("/")) return null;
+  if (!Number.isFinite(num)) return fallback;
+  if (num < MIN_TIMEOUT_MS) return MIN_TIMEOUT_MS;
+  if (num > MAX_TIMEOUT_MS) return MAX_TIMEOUT_MS;
 
-  return normalized;
+  return Math.trunc(num);
 }
 
-function resolveBaseUrl(): string | null {
-  const h = headers();
+function normalizePath(path: string): string {
+  const value = safeStr(path);
+  if (!value) return "/";
+  return value.startsWith("/") ? value : `/${value}`;
+}
 
-  const forwardedHost = safeStr(h.get("x-forwarded-host"));
-  const host = forwardedHost || safeStr(h.get("host"));
-  const forwardedProto = safeStr(h.get("x-forwarded-proto"));
+function normalizeAbsoluteUrl(value: unknown): string | null {
+  const raw = safeStr(value);
+  if (!raw) return null;
 
-  if (host) {
-    const protocol =
-      forwardedProto ||
-      (host.includes("localhost") || host.startsWith("127.0.0.1")
-        ? "http"
-        : "https");
-
-    return `${protocol}://${host}`;
+  try {
+    const url = new URL(raw);
+    return url.origin;
+  } catch {
+    return null;
   }
+}
 
-  const siteUrl = safeStr(process.env.SITE_URL);
+function normalizeHostOrigin(host: string, proto?: string | null): string | null {
+  const cleanHost = safeStr(host);
+  if (!cleanHost) return null;
+
+  const protocol =
+    safeStr(proto) ||
+    (cleanHost.includes("localhost") || cleanHost.startsWith("127.0.0.1") ? "http" : "https");
+
+  try {
+    return new URL(`${protocol}://${cleanHost}`).origin;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveBaseUrl(): Promise<string | null> {
+  const h = await headers();
+
+  const forwardedHost = h.get("x-forwarded-host");
+  const host = forwardedHost ?? h.get("host");
+  const forwardedProto = h.get("x-forwarded-proto");
+
+  const requestOrigin = normalizeHostOrigin(host ?? "", forwardedProto);
+  if (requestOrigin) return requestOrigin;
+
+  const siteUrl =
+    normalizeAbsoluteUrl(process.env.XYVALA_SITE_URL) ??
+    normalizeAbsoluteUrl(process.env.SITE_URL) ??
+    normalizeAbsoluteUrl(process.env.NEXT_PUBLIC_SITE_URL) ??
+    normalizeAbsoluteUrl(process.env.NEXT_PUBLIC_APP_URL);
+
   if (siteUrl) return siteUrl;
 
-  const vercelUrl = safeStr(process.env.VERCEL_URL);
-  if (vercelUrl) return `https://${vercelUrl}`;
+  const apiBaseUrl =
+    normalizeAbsoluteUrl(process.env.XYVALA_API_BASE_URL) ??
+    normalizeAbsoluteUrl(process.env.API_BASE_URL) ??
+    normalizeAbsoluteUrl(process.env.NEXT_PUBLIC_API_BASE_URL);
 
-  const nextPublicSiteUrl = safeStr(process.env.NEXT_PUBLIC_SITE_URL);
-  if (nextPublicSiteUrl) return nextPublicSiteUrl;
+  if (apiBaseUrl) return apiBaseUrl;
+
+  const vercelProductionUrl = safeStr(process.env.VERCEL_PROJECT_PRODUCTION_URL);
+  if (vercelProductionUrl) {
+    return normalizeHostOrigin(vercelProductionUrl.replace(/^https?:\/\//i, ""), "https");
+  }
+
+  const vercelUrl = safeStr(process.env.VERCEL_URL);
+  if (vercelUrl) {
+    return normalizeHostOrigin(vercelUrl.replace(/^https?:\/\//i, ""), "https");
+  }
 
   return null;
 }
 
-function getInternalKey(override?: string): {
-  key: string | null;
-  source: "env" | "override" | "missing";
-} {
-  const overrideKey = safeStr(override);
+function getInternalKey(): string | null {
+  const key =
+    safeStr(process.env.XYVALA_INTERNAL_KEY) ||
+    safeStr(process.env.INTERNAL_API_KEY) ||
+    safeStr(process.env.XYVALA_API_INTERNAL_KEY);
 
-  if (overrideKey) {
+  return key || null;
+}
+
+function buildUrl(
+  baseUrl: string,
+  path: string,
+  searchParams?: Record<string, PrimitiveQueryValue>
+): string {
+  const url = new URL(normalizePath(path), baseUrl);
+
+  for (const [key, value] of Object.entries(searchParams ?? {})) {
+    if (value === null || typeof value === "undefined") continue;
+    url.searchParams.set(key, String(value));
+  }
+
+  return url.toString();
+}
+
+function parseErrorFromPayload(payload: unknown, fallback: string): string {
+  if (!isRecord(payload)) return fallback;
+
+  const directError = safeStr(payload.error);
+  if (directError) return directError;
+
+  const directMessage = safeStr(payload.message);
+  if (directMessage) return directMessage;
+
+  const directCode = safeStr(payload.code);
+  if (directCode) return directCode;
+
+  return fallback;
+}
+
+async function readResponsePayload(res: Response): Promise<{
+  data: unknown;
+  warnings: string[];
+}> {
+  const warnings: string[] = [];
+  const contentType = lowerStr(res.headers.get("content-type"));
+
+  let text = "";
+  try {
+    text = await res.text();
+  } catch {
     return {
-      key: overrideKey,
-      source: "override",
+      data: null,
+      warnings: ["response_read_failed"],
     };
   }
 
-  const envKey = safeStr(process.env.XYVALA_INTERNAL_KEY);
-
-  if (envKey) {
+  if (!text) {
     return {
-      key: envKey,
-      source: "env",
+      data: null,
+      warnings,
     };
   }
 
-  return {
-    key: null,
-    source: "missing",
+  try {
+    return {
+      data: JSON.parse(text),
+      warnings,
+    };
+  } catch {
+    if (contentType.includes("application/json")) {
+      warnings.push("json_parse_failed");
+    } else {
+      warnings.push("non_json_response");
+    }
+
+    return {
+      data: { raw: text },
+      warnings,
+    };
+  }
+}
+
+function buildRequestHeaders(
+  internalKey: string,
+  method: InternalApiMethod,
+  customHeaders?: Record<string, string>
+): Record<string, string> {
+  const result: Record<string, string> = {
+    "x-xyvala-key": internalKey,
+    "x-xyvala-request": "server-internal",
+    ...customHeaders,
   };
-}
 
-function normalizeTimeout(timeoutMs?: number): number {
-  if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs)) {
-    return DEFAULT_TIMEOUT_MS;
+  const upperMethod = method.toUpperCase() as InternalApiMethod;
+
+  if (upperMethod !== "GET" && !result["content-type"]) {
+    result["content-type"] = "application/json";
   }
 
-  return Math.max(MIN_TIMEOUT_MS, Math.trunc(timeoutMs));
-}
-
-function extractApiError(json: unknown): string | null {
-  if (!json || typeof json !== "object") return null;
-
-  const record = json as JsonRecord;
-  const error = safeStr(record.error);
-
-  return error || null;
+  return result;
 }
 
 export async function xyvalaServerFetch<T extends JsonRecord = JsonRecord>(
   path: string,
-  input?: {
-    searchParams?: Record<string, string | number | boolean | null | undefined>;
-    timeoutMs?: number;
-    internalKeyOverride?: string;
-  }
+  input?: InternalApiRequestOptions
 ): Promise<InternalApiResult<T>> {
   const warnings: string[] = [];
+  const method = (input?.method ?? "GET").toUpperCase() as InternalApiMethod;
 
-  const normalizedPath = normalizePath(path);
-
-  if (!normalizedPath) {
-    return {
-      ok: false,
-      status: 0,
-      data: null,
-      error: "invalid_internal_path",
-      warnings: ["invalid_internal_path"],
-      meta: {
-        url: null,
-        usedInternalKey: false,
-        keySource: "missing",
-      },
-    };
-  }
-
-  const baseUrl = resolveBaseUrl();
-
+  const baseUrl = await resolveBaseUrl();
   if (!baseUrl) {
     return {
       ok: false,
@@ -156,109 +247,112 @@ export async function xyvalaServerFetch<T extends JsonRecord = JsonRecord>(
       data: null,
       error: "internal_base_url_unavailable",
       warnings: ["internal_base_url_unavailable"],
-      meta: {
-        url: null,
-        usedInternalKey: false,
-        keySource: "missing",
-      },
     };
   }
 
-  const internalKeyInfo = getInternalKey(input?.internalKeyOverride);
-
-  if (!internalKeyInfo.key) {
+  const internalKey = getInternalKey();
+  if (!internalKey) {
     return {
       ok: false,
       status: 0,
       data: null,
       error: "internal_key_missing",
       warnings: ["internal_key_missing"],
-      meta: {
-        url: null,
-        usedInternalKey: false,
-        keySource: "missing",
-      },
     };
   }
 
-  const timeoutMs = normalizeTimeout(input?.timeoutMs);
-  const url = new URL(normalizedPath, baseUrl);
-
-  for (const [key, value] of Object.entries(input?.searchParams ?? {})) {
-    if (value === null || value === undefined) continue;
-    url.searchParams.set(key, String(value));
-  }
+  const timeoutMs = normalizeTimeoutMs(input?.timeoutMs);
+  const url = buildUrl(baseUrl, path, input?.searchParams);
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const res = await fetch(url.toString(), {
-      method: "GET",
-      headers: {
-        "x-xyvala-key": internalKeyInfo.key,
-        "x-xyvala-internal": "true",
-      },
-      cache: "no-store",
+    const res = await fetch(url, {
+      method,
+      headers: buildRequestHeaders(internalKey, method, input?.headers),
+      body:
+        typeof input?.body === "undefined" || method === "GET"
+          ? undefined
+          : JSON.stringify(input.body),
+      cache: input?.cache ?? "no-store",
+      next: input?.next,
       signal: controller.signal,
     });
 
-    let json: T | null = null;
-
-    try {
-      json = (await res.json()) as T;
-    } catch {
-      warnings.push("json_parse_failed");
-    }
+    const payload = await readResponsePayload(res);
 
     if (!res.ok) {
       return {
         ok: false,
         status: res.status,
-        data: json,
-        error: extractApiError(json) ?? `http_${res.status}`,
-        warnings: uniqueWarnings(warnings, [`http_${res.status}`]),
-        meta: {
-          url: url.toString(),
-          usedInternalKey: true,
-          keySource: internalKeyInfo.source,
-        },
+        data: (payload.data as T) ?? null,
+        error: parseErrorFromPayload(payload.data, `http_${res.status}`),
+        warnings: uniqueWarnings(warnings, payload.warnings, [`http_${res.status}`]),
       };
     }
 
     return {
       ok: true,
       status: res.status,
-      data: json,
+      data: (payload.data as T) ?? null,
       error: null,
-      warnings,
-      meta: {
-        url: url.toString(),
-        usedInternalKey: true,
-        keySource: internalKeyInfo.source,
-      },
+      warnings: uniqueWarnings(warnings, payload.warnings),
     };
   } catch (error) {
+    const isAbort = error instanceof Error && error.name === "AbortError";
+
     return {
       ok: false,
-      status: 0,
+      status: isAbort ? 504 : 0,
       data: null,
       error:
-        error instanceof Error && error.message
-          ? `fetch_failed:${error.message}`
-          : "fetch_failed",
-      warnings: uniqueWarnings(warnings, [
-        error instanceof Error && error.name === "AbortError"
+        isAbort
           ? "request_timeout"
-          : "request_failed",
+          : error instanceof Error && error.message
+            ? `fetch_failed:${error.message}`
+            : "fetch_failed",
+      warnings: uniqueWarnings(warnings, [
+        isAbort ? "request_timeout" : "request_failed",
       ]),
-      meta: {
-        url: url.toString(),
-        usedInternalKey: true,
-        keySource: internalKeyInfo.source,
-      },
     };
   } finally {
     clearTimeout(timeout);
   }
+}
+
+/**
+ * Alias rétrocompatible :
+ * garde la compatibilité avec les fichiers déjà migrés vers getInternalJson()
+ * sans casser les anciens appels xyvalaServerFetch().
+ */
+export async function getInternalJson<T extends JsonRecord = JsonRecord>(
+  path: string,
+  searchParams?: Record<string, PrimitiveQueryValue>,
+  options?: Omit<InternalApiRequestOptions, "method" | "searchParams" | "body">
+): Promise<InternalApiResult<T>> {
+  return xyvalaServerFetch<T>(path, {
+    method: "GET",
+    searchParams,
+    timeoutMs: options?.timeoutMs,
+    cache: options?.cache,
+    next: options?.next,
+    headers: options?.headers,
+  });
+}
+
+export async function postInternalJson<T extends JsonRecord = JsonRecord>(
+  path: string,
+  body?: unknown,
+  options?: Omit<InternalApiRequestOptions, "method" | "body">
+): Promise<InternalApiResult<T>> {
+  return xyvalaServerFetch<T>(path, {
+    method: "POST",
+    body,
+    searchParams: options?.searchParams,
+    timeoutMs: options?.timeoutMs,
+    cache: options?.cache ?? "no-store",
+    next: options?.next,
+    headers: options?.headers,
+  });
 }

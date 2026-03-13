@@ -1,383 +1,429 @@
-// app/api/state/route.ts
+// app/api/stats/route.ts
 
-import { NextRequest, NextResponse } from "next/server"
+import { NextRequest, NextResponse } from "next/server";
 import {
-  validateApiKey,
+  enforceApiPolicy,
   applyApiAuthHeaders,
-  buildApiKeyErrorResponse
-} from "@/lib/xyvala/auth"
-
+  buildApiKeyErrorResponse,
+} from "@/lib/xyvala/auth";
 import {
   trackUsage,
-  applyQuotaHeaders
-} from "@/lib/xyvala/usage"
-
+  applyQuotaHeaders,
+} from "@/lib/xyvala/usage";
 import {
-  getFromCache,
-  setToCache
-} from "@/lib/xyvala/snapshot"
+  listMemoryBySymbol,
+  listRecentMemory,
+  type SignalMemoryRecord,
+} from "@/lib/xyvala/memory";
 
-export const runtime = "nodejs"
-export const dynamic = "force-dynamic"
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
 
-const VERSION = "v1"
-const CACHE_TTL = 30000
+const XYVALA_VERSION = "v1";
+const DEFAULT_LIMIT = 200;
+const MAX_LIMIT = 5_000;
 
-type Quote = "usd" | "usdt" | "eur"
+type StatsResponse = {
+  ok: boolean;
+  ts: string;
+  version: string;
 
-type MarketRegime = "STABLE" | "TRANSITION" | "VOLATILE" | null
+  symbol: string | null;
+  limit: number;
 
-type VolatilityState = "LOW" | "NORMAL" | "HIGH" | null
-type LiquidityState = "LOW" | "NORMAL" | "HIGH" | null
-type RiskMode = "LOW" | "MODERATE" | "HIGH" | null
-type ExecutionBias = "AGGRESSIVE" | "SELECTIVE" | "DEFENSIVE" | null
+  totals: {
+    total_records: number;
+    open_records: number;
+    resolved_records: number;
+    positive: number;
+    negative: number;
+    neutral: number;
+  };
 
-type ContextResponse = {
- ok: boolean
- market_regime?: MarketRegime
- stable_ratio?: number | null
- transition_ratio?: number | null
- volatile_ratio?: number | null
- error?: string | null
- meta?: {
-  warnings?: string[]
- }
-}
+  metrics: {
+    winrate: number | null;
+    avg_result_pct: number | null;
+    avg_positive_pct: number | null;
+    avg_negative_pct: number | null;
+  };
 
-type StateResponse = {
- ok: boolean
- ts: string
- version: string
- state: {
-  market_regime: MarketRegime
-  volatility_state: VolatilityState
-  liquidity_state: LiquidityState
-  risk_mode: RiskMode
-  execution_bias: ExecutionBias
-  stable_ratio: number | null
-  transition_ratio: number | null
-  volatile_ratio: number | null
- }
- error: string | null
- meta: {
-  cache: "hit" | "miss" | "no-store"
-  source: "context_fetch" | "context_cache" | "fallback"
-  quote: Quote
-  warnings: string[]
- }
-}
+  breakdown: {
+    by_action: Array<{
+      action: "ALLOW" | "WATCH" | "BLOCK";
+      total: number;
+      resolved: number;
+      positive: number;
+      negative: number;
+      neutral: number;
+      winrate: number | null;
+      avg_result_pct: number | null;
+    }>;
+    by_regime: Array<{
+      market_regime: string;
+      total: number;
+      resolved: number;
+      positive: number;
+      negative: number;
+      neutral: number;
+      winrate: number | null;
+      avg_result_pct: number | null;
+    }>;
+  };
 
-const now = () => new Date().toISOString()
-
-function safeNum(v: unknown): number | null {
- return typeof v === "number" && Number.isFinite(v) ? v : null
-}
-
-function safeStr(v: unknown): string {
- return typeof v === "string" ? v.trim() : ""
-}
-
-function normalizeQuote(v: string | null): Quote {
- const s = safeStr(v).toLowerCase()
-
- if (s === "eur") return "eur"
- if (s === "usdt") return "usdt"
-
- return "usd"
-}
-
-function normalizeRegime(v: unknown): MarketRegime {
-
- const s = safeStr(v).toUpperCase()
-
- if (s === "STABLE") return "STABLE"
- if (s === "TRANSITION") return "TRANSITION"
- if (s === "VOLATILE") return "VOLATILE"
-
- return null
-}
-
-function cacheKey(quote: Quote) {
- return `xyvala:state:${VERSION}:${quote}`
-}
-
-function unique(...groups: Array<string[] | undefined>) {
-
- const arr = groups.flatMap(g => g ?? [])
-
- return [...new Set(arr)]
-}
-
-function inferVolatility(input: {
- regime: MarketRegime
- volatile: number | null
- transition: number | null
-}): VolatilityState {
-
- if (input.regime === "VOLATILE") return "HIGH"
-
- if (input.volatile !== null && input.volatile > 0.35) return "HIGH"
-
- if (input.transition !== null && input.transition > 0.45) return "NORMAL"
-
- if (input.regime === "STABLE") return "LOW"
-
- return "NORMAL"
-}
-
-function inferLiquidity(input: {
- stable: number | null
- volatile: number | null
- transition: number | null
-}): LiquidityState {
-
- if (input.stable !== null && input.stable > 0.5) return "HIGH"
-
- if (input.volatile !== null && input.volatile > 0.45) return "LOW"
-
- if (input.transition !== null && input.transition > 0.35) return "NORMAL"
-
- return "NORMAL"
-}
-
-function inferRisk(input: {
- regime: MarketRegime
- volatility: VolatilityState
- liquidity: LiquidityState
-}): RiskMode {
-
- if (input.regime === "VOLATILE") return "HIGH"
-
- if (input.volatility === "HIGH" && input.liquidity === "LOW") return "HIGH"
-
- if (input.regime === "STABLE" && input.liquidity === "HIGH") return "LOW"
-
- return "MODERATE"
-}
-
-function inferExecution(input: {
- regime: MarketRegime
- risk: RiskMode
- liquidity: LiquidityState
-}): ExecutionBias {
-
- if (input.risk === "HIGH") return "DEFENSIVE"
-
- if (input.regime === "STABLE" && input.liquidity === "HIGH")
-  return "AGGRESSIVE"
-
- return "SELECTIVE"
-}
-
-function build(payload: Partial<StateResponse> & { ts: string }): StateResponse {
-
- return {
-
-  ok: Boolean(payload.ok),
-
-  ts: payload.ts,
-
-  version: payload.version ?? VERSION,
-
-  state: {
-   market_regime: payload.state?.market_regime ?? null,
-   volatility_state: payload.state?.volatility_state ?? null,
-   liquidity_state: payload.state?.liquidity_state ?? null,
-   risk_mode: payload.state?.risk_mode ?? null,
-   execution_bias: payload.state?.execution_bias ?? null,
-   stable_ratio: payload.state?.stable_ratio ?? null,
-   transition_ratio: payload.state?.transition_ratio ?? null,
-   volatile_ratio: payload.state?.volatile_ratio ?? null
-  },
-
-  error: payload.error ?? null,
+  error: string | null;
 
   meta: {
-   cache: payload.meta?.cache ?? "miss",
-   source: payload.meta?.source ?? "fallback",
-   quote: payload.meta?.quote ?? "usd",
-   warnings: payload.meta?.warnings ?? []
-  }
- }
+    warnings: string[];
+  };
+};
+
+type AuthResult = ReturnType<typeof enforceApiPolicy>;
+type AuthSuccess = Extract<AuthResult, { ok: true }>;
+type UsageResult = ReturnType<typeof trackUsage> | null;
+
+const nowIso = () => new Date().toISOString();
+
+function safeStr(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
 }
 
-async function respond(
- payload: StateResponse,
- status: number,
- auth: any,
- usage: any
+function safeNum(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function clamp(n: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, n));
+}
+
+function round2(value: number | null): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  return Math.round(value * 100) / 100;
+}
+
+function uniqueWarnings(...groups: Array<string[] | undefined | null>): string[] {
+  const merged = groups.flatMap((group) => (Array.isArray(group) ? group : []));
+  return [...new Set(merged.filter((item) => typeof item === "string" && item.trim().length > 0))];
+}
+
+function sanitizeSymbol(symbol: string): string {
+  return symbol.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 20);
+}
+
+function parseLimit(value: string | null): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return DEFAULT_LIMIT;
+  return clamp(Math.trunc(parsed), 1, MAX_LIMIT);
+}
+
+function normalizeAction(value: unknown): "ALLOW" | "WATCH" | "BLOCK" | null {
+  const action = safeStr(value).toUpperCase();
+
+  if (action === "ALLOW") return "ALLOW";
+  if (action === "WATCH") return "WATCH";
+  if (action === "BLOCK") return "BLOCK";
+
+  return null;
+}
+
+function normalizeRegime(value: unknown): string {
+  const regime = safeStr(value).toUpperCase();
+  return regime || "UNKNOWN";
+}
+
+function normalizeStatus(value: unknown): "open" | "resolved" | "unknown" {
+  const status = safeStr(value).toLowerCase();
+
+  if (status === "open") return "open";
+  if (status === "resolved") return "resolved";
+
+  return "unknown";
+}
+
+function buildResponse(
+  input: Partial<StatsResponse> & Pick<StatsResponse, "ts" | "symbol" | "limit">
+): StatsResponse {
+  return {
+    ok: Boolean(input.ok),
+    ts: input.ts,
+    version: input.version ?? XYVALA_VERSION,
+
+    symbol: input.symbol ?? null,
+    limit: input.limit,
+
+    totals: {
+      total_records: input.totals?.total_records ?? 0,
+      open_records: input.totals?.open_records ?? 0,
+      resolved_records: input.totals?.resolved_records ?? 0,
+      positive: input.totals?.positive ?? 0,
+      negative: input.totals?.negative ?? 0,
+      neutral: input.totals?.neutral ?? 0,
+    },
+
+    metrics: {
+      winrate: input.metrics?.winrate ?? null,
+      avg_result_pct: input.metrics?.avg_result_pct ?? null,
+      avg_positive_pct: input.metrics?.avg_positive_pct ?? null,
+      avg_negative_pct: input.metrics?.avg_negative_pct ?? null,
+    },
+
+    breakdown: {
+      by_action: input.breakdown?.by_action ?? [],
+      by_regime: input.breakdown?.by_regime ?? [],
+    },
+
+    error: input.error ?? null,
+
+    meta: {
+      warnings: input.meta?.warnings ?? [],
+    },
+  };
+}
+
+function computeBaseStats(records: SignalMemoryRecord[]) {
+  let total_records = records.length;
+  let open_records = 0;
+  let resolved_records = 0;
+  let positive = 0;
+  let negative = 0;
+  let neutral = 0;
+
+  let resultSum = 0;
+  let resultCount = 0;
+
+  let positiveSum = 0;
+  let positiveCount = 0;
+
+  let negativeSum = 0;
+  let negativeCount = 0;
+
+  for (const record of records) {
+    const status = normalizeStatus(record.status);
+
+    if (status === "open") {
+      open_records += 1;
+    }
+
+    if (status === "resolved") {
+      resolved_records += 1;
+    }
+
+    const observedResult = safeNum(record.observed_result_pct);
+
+    if (observedResult !== null) {
+      resultSum += observedResult;
+      resultCount += 1;
+
+      if (observedResult > 0) {
+        positive += 1;
+        positiveSum += observedResult;
+        positiveCount += 1;
+      } else if (observedResult < 0) {
+        negative += 1;
+        negativeSum += observedResult;
+        negativeCount += 1;
+      } else {
+        neutral += 1;
+      }
+    }
+  }
+
+  const winrate =
+    resolved_records > 0 ? round2((positive / resolved_records) * 100) : null;
+
+  const avg_result_pct =
+    resultCount > 0 ? round2(resultSum / resultCount) : null;
+
+  const avg_positive_pct =
+    positiveCount > 0 ? round2(positiveSum / positiveCount) : null;
+
+  const avg_negative_pct =
+    negativeCount > 0 ? round2(negativeSum / negativeCount) : null;
+
+  return {
+    totals: {
+      total_records,
+      open_records,
+      resolved_records,
+      positive,
+      negative,
+      neutral,
+    },
+    metrics: {
+      winrate,
+      avg_result_pct,
+      avg_positive_pct,
+      avg_negative_pct,
+    },
+  };
+}
+
+function groupByAction(records: SignalMemoryRecord[]) {
+  const actions: Array<"ALLOW" | "WATCH" | "BLOCK"> = ["ALLOW", "WATCH", "BLOCK"];
+
+  return actions.map((action) => {
+    const subset = records.filter((record) => normalizeAction(record.action) === action);
+    const base = computeBaseStats(subset);
+
+    return {
+      action,
+      total: base.totals.total_records,
+      resolved: base.totals.resolved_records,
+      positive: base.totals.positive,
+      negative: base.totals.negative,
+      neutral: base.totals.neutral,
+      winrate: base.metrics.winrate,
+      avg_result_pct: base.metrics.avg_result_pct,
+    };
+  });
+}
+
+function groupByRegime(records: SignalMemoryRecord[]) {
+  const buckets = new Map<string, SignalMemoryRecord[]>();
+
+  for (const record of records) {
+    const regime = normalizeRegime(record.market_regime);
+    const current = buckets.get(regime) ?? [];
+    current.push(record);
+    buckets.set(regime, current);
+  }
+
+  return Array.from(buckets.entries())
+    .map(([market_regime, subset]) => {
+      const base = computeBaseStats(subset);
+
+      return {
+        market_regime,
+        total: base.totals.total_records,
+        resolved: base.totals.resolved_records,
+        positive: base.totals.positive,
+        negative: base.totals.negative,
+        neutral: base.totals.neutral,
+        winrate: base.metrics.winrate,
+        avg_result_pct: base.metrics.avg_result_pct,
+      };
+    })
+    .sort((a, b) => b.total - a.total || a.market_regime.localeCompare(b.market_regime));
+}
+
+function respond(
+  payload: StatsResponse,
+  status: number,
+  auth: AuthSuccess,
+  usage: UsageResult
 ) {
+  let res: NextResponse = NextResponse.json(payload, {
+    status,
+    headers: {
+      "cache-control": "no-store",
+      "x-xyvala-version": XYVALA_VERSION,
+    },
+  });
 
- let res = NextResponse.json(payload, {
-  status,
-  headers: {
-   "x-xyvala-version": VERSION,
-   "cache-control": "no-store"
+  res = applyApiAuthHeaders(res, auth);
+
+  if (usage) {
+    res = applyQuotaHeaders(res, usage);
   }
- })
 
- res = applyApiAuthHeaders(res, auth)
-
- if (usage) res = applyQuotaHeaders(res, usage)
-
- return res
+  return res;
 }
+
+/* ---------------- Handler ---------------- */
 
 export async function GET(req: NextRequest) {
+  const ts = nowIso();
 
- const ts = now()
-
- const quote = normalizeQuote(req.nextUrl.searchParams.get("quote"))
-
- const auth = validateApiKey(req)
-
- if (!auth.ok) {
-  return buildApiKeyErrorResponse(auth.error, auth.status)
- }
-
- let usage = null
-
- try {
-
-  usage = trackUsage({
-   key: auth.key,
-   keyType: auth.keyType,
-   endpoint: "/api/state",
-   planOverride: auth.plan
-  })
-
- } catch {}
-
- const noStore = req.nextUrl.searchParams.get("noStore") === "1"
-
- const key = cacheKey(quote)
-
- if (!noStore) {
-
-  try {
-
-   const cached = await getFromCache<StateResponse>(key, CACHE_TTL)
-
-   if (cached?.ok) {
-
-    return respond(
-     build({
-      ...cached,
-      ts,
-      meta: {
-       ...cached.meta,
-       cache: "hit",
-       source: "context_cache"
-      }
-     }),
-     200,
-     auth,
-     usage
-    )
-   }
-
-  } catch {}
- }
-
- let context: ContextResponse | null = null
-
- try {
-
-  const origin = new URL(req.url).origin
-
-  const url = new URL("/api/context", origin)
-
-  url.searchParams.set("quote", quote)
-
-  const res = await fetch(url.toString(), {
-   headers: { "x-xyvala-key": auth.key },
-   cache: "no-store"
-  })
-
-  if (res.ok) context = await res.json()
-
- } catch {}
-
- if (!context || !context.ok) {
-
-  return respond(
-   build({
-    ok: false,
-    ts,
-    error: context?.error ?? "context_unavailable",
-    meta: {
-     quote,
-     cache: noStore ? "no-store" : "miss",
-     source: "fallback"
-    }
-   }),
-   503,
-   auth,
-   usage
-  )
- }
-
- const regime = normalizeRegime(context.market_regime)
-
- const stable = safeNum(context.stable_ratio)
-
- const transition = safeNum(context.transition_ratio)
-
- const volatile = safeNum(context.volatile_ratio)
-
- const volatility = inferVolatility({
-  regime,
-  volatile,
-  transition
- })
-
- const liquidity = inferLiquidity({
-  stable,
-  volatile,
-  transition
- })
-
- const risk = inferRisk({
-  regime,
-  volatility,
-  liquidity
- })
-
- const execution = inferExecution({
-  regime,
-  risk,
-  liquidity
- })
-
- const payload = build({
-  ok: true,
-  ts,
-  state: {
-   market_regime: regime,
-   volatility_state: volatility,
-   liquidity_state: liquidity,
-   risk_mode: risk,
-   execution_bias: execution,
-   stable_ratio: stable,
-   transition_ratio: transition,
-   volatile_ratio: volatile
-  },
-  meta: {
-   quote,
-   cache: noStore ? "no-store" : "miss",
-   source: "context_fetch",
-   warnings: unique(context.meta?.warnings)
+  const auth = enforceApiPolicy(req);
+  if (!auth.ok) {
+    return buildApiKeyErrorResponse(auth.error, auth.status);
   }
- })
 
- if (!noStore) {
+  let usage: UsageResult = null;
+  let usageWarnings: string[] = [];
 
   try {
+    usage = trackUsage({
+      key: auth.key,
+      keyType: auth.keyType,
+      endpoint: "/api/stats",
+      planOverride: auth.plan,
+    });
+  } catch (error) {
+    usageWarnings = uniqueWarnings([
+      error instanceof Error && error.message
+        ? `usage_track_failed:${error.message}`
+        : "usage_track_failed",
+    ]);
+  }
 
-   await setToCache(key, payload)
+  try {
+    const sp = req.nextUrl.searchParams;
 
-  } catch {}
- }
+    const symbolRaw = safeStr(sp.get("symbol"));
+    const symbol = symbolRaw ? sanitizeSymbol(symbolRaw) : null;
+    const limit = parseLimit(sp.get("limit"));
 
- return respond(payload, 200, auth, usage)
+    let records: SignalMemoryRecord[] = [];
+    let routeWarnings: string[] = [...usageWarnings];
+
+    if (symbol) {
+      records = await listMemoryBySymbol({
+        symbol,
+        limit,
+        status: "all",
+      });
+    } else {
+      records = await listRecentMemory({
+        limit,
+        status: "all",
+      });
+
+      routeWarnings = uniqueWarnings(routeWarnings, ["global_stats_mode"]);
+    }
+
+    const base = computeBaseStats(records);
+
+    const payload = buildResponse({
+      ok: true,
+      ts,
+      symbol,
+      limit,
+      totals: base.totals,
+      metrics: base.metrics,
+      breakdown: {
+        by_action: groupByAction(records),
+        by_regime: groupByRegime(records),
+      },
+      error: null,
+      meta: {
+        warnings: routeWarnings,
+      },
+    });
+
+    return respond(payload, 200, auth, usage);
+  } catch (error) {
+    const payload = buildResponse({
+      ok: false,
+      ts,
+      symbol: null,
+      limit: 0,
+      error:
+        error instanceof Error && error.message
+          ? error.message
+          : "unknown_error",
+      meta: {
+        warnings: uniqueWarnings(
+          usageWarnings,
+          [
+            error instanceof Error && error.message
+              ? `route_exception:${error.message}`
+              : "route_exception",
+          ]
+        ),
+      },
+    });
+
+    return respond(payload, 500, auth, usage);
+  }
 }

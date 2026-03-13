@@ -1,8 +1,7 @@
 // lib/xyvala/api-keys.ts
 
+import type { ApiKeyType } from "@/lib/xyvala/auth";
 import type { ApiPlan } from "@/lib/xyvala/usage";
-
-export type ApiKeyType = "internal" | "public_demo" | "legacy";
 
 export type ApiKeyRecordType =
   | "internal"
@@ -10,27 +9,36 @@ export type ApiKeyRecordType =
   | "client"
   | "legacy";
 
+export type ApiKeySource = "env" | "registry";
+
 export type ApiKeyRecord = {
+  id: string;
   key: string;
   label: string;
   plan: ApiPlan;
   type: ApiKeyRecordType;
   enabled: boolean;
   createdAt: string;
+  updatedAt: string;
+  keySource: ApiKeySource;
 };
 
-type RawRegistryRecord = Partial<ApiKeyRecord> & {
-  key?: unknown;
-  label?: unknown;
-  plan?: unknown;
-  type?: unknown;
-  enabled?: unknown;
-  createdAt?: unknown;
+type BuildApiKeyRecordInput = {
+  key: string;
+  label: string;
+  plan: ApiPlan;
+  type: ApiKeyRecordType;
+  enabled?: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+  keySource?: ApiKeySource;
 };
-
-const DEFAULT_CREATED_AT = new Date(0).toISOString();
 
 let cachedRecords: ApiKeyRecord[] | null = null;
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
 
 function safeStr(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
@@ -45,73 +53,55 @@ function normalizeLabel(value: unknown, fallback: string): string {
   return label || fallback;
 }
 
-function normalizeBoolean(value: unknown, fallback: boolean): boolean {
-  if (typeof value === "boolean") return value;
-  return fallback;
-}
-
-function isApiPlan(value: unknown): value is ApiPlan {
-  return (
-    value === "internal" ||
-    value === "demo" ||
-    value === "trader" ||
-    value === "pro" ||
-    value === "enterprise"
-  );
-}
-
-function normalizePlan(value: unknown, fallback: ApiPlan): ApiPlan {
-  return isApiPlan(value) ? value : fallback;
-}
-
-function isApiKeyRecordType(value: unknown): value is ApiKeyRecordType {
-  return (
-    value === "internal" ||
-    value === "public_demo" ||
-    value === "client" ||
-    value === "legacy"
-  );
-}
-
-function normalizeType(
-  value: unknown,
-  fallback: ApiKeyRecordType
-): ApiKeyRecordType {
-  return isApiKeyRecordType(value) ? value : fallback;
-}
-
-function normalizeCreatedAt(value: unknown): string {
+function normalizeIsoDate(value: unknown, fallback: string): string {
   const raw = safeStr(value);
-  return raw || DEFAULT_CREATED_AT;
+  if (!raw) return fallback;
+
+  const parsed = new Date(raw);
+  return Number.isNaN(parsed.getTime()) ? fallback : parsed.toISOString();
 }
 
-function buildKeyRecord(input: {
-  key: unknown;
-  label: unknown;
-  plan: unknown;
-  type: unknown;
-  enabled?: unknown;
-  createdAt?: unknown;
-  fallbackLabel: string;
-  fallbackPlan: ApiPlan;
-  fallbackType: ApiKeyRecordType;
-}): ApiKeyRecord | null {
-  const key = normalizeKey(input.key);
+function buildRecordId(input: {
+  type: ApiKeyRecordType;
+  plan: ApiPlan;
+  label: string;
+}): string {
+  const normalizedLabel = normalizeLabel(input.label, input.type)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40);
 
-  if (!key) {
-    return null;
-  }
+  return `${input.type}:${input.plan}:${normalizedLabel || "key"}`;
+}
 
-  const type = normalizeType(input.type, input.fallbackType);
-  const plan = normalizePlan(input.plan, input.fallbackPlan);
+function cloneRecord(record: ApiKeyRecord): ApiKeyRecord {
+  return { ...record };
+}
+
+function buildApiKeyRecord(input: BuildApiKeyRecordInput): ApiKeyRecord | null {
+  const normalizedKey = normalizeKey(input.key);
+  if (!normalizedKey) return null;
+
+  const createdAtFallback = new Date(0).toISOString();
+  const updatedAtFallback = nowIso();
+
+  const label = normalizeLabel(input.label, input.type);
 
   return {
-    key,
-    label: normalizeLabel(input.label, input.fallbackLabel),
-    plan,
-    type,
-    enabled: normalizeBoolean(input.enabled, true),
-    createdAt: normalizeCreatedAt(input.createdAt),
+    id: buildRecordId({
+      type: input.type,
+      plan: input.plan,
+      label,
+    }),
+    key: normalizedKey,
+    label,
+    plan: input.plan,
+    type: input.type,
+    enabled: input.enabled ?? true,
+    createdAt: normalizeIsoDate(input.createdAt, createdAtFallback),
+    updatedAt: normalizeIsoDate(input.updatedAt, updatedAtFallback),
+    keySource: input.keySource ?? "env",
   };
 }
 
@@ -130,92 +120,74 @@ function dedupeRecords(records: ApiKeyRecord[]): ApiKeyRecord[] {
   return result;
 }
 
-function parseJsonRegistry(): ApiKeyRecord[] {
-  const raw = safeStr(process.env.XYVALA_API_KEYS_JSON);
-
-  if (!raw) {
-    return [];
-  }
-
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-
-    if (!Array.isArray(parsed)) {
-      return [];
-    }
-
-    return parsed
-      .map((entry) => {
-        const item = entry as RawRegistryRecord;
-
-        return buildKeyRecord({
-          key: item.key,
-          label: item.label,
-          plan: item.plan,
-          type: item.type,
-          enabled: item.enabled,
-          createdAt: item.createdAt,
-          fallbackLabel: "Client",
-          fallbackPlan: "trader",
-          fallbackType: "client",
-        });
-      })
-      .filter((record): record is ApiKeyRecord => Boolean(record));
-  } catch {
-    return [];
-  }
+function sortRecords(records: ApiKeyRecord[]): ApiKeyRecord[] {
+  return [...records].sort((a, b) => {
+    if (a.type !== b.type) return a.type.localeCompare(b.type);
+    if (a.plan !== b.plan) return a.plan.localeCompare(b.plan);
+    return a.label.localeCompare(b.label);
+  });
 }
 
 function loadEnvApiKeyRecords(): ApiKeyRecord[] {
   const records: Array<ApiKeyRecord | null> = [
-    buildKeyRecord({
-      key: process.env.XYVALA_INTERNAL_KEY,
-      label: process.env.XYVALA_INTERNAL_LABEL,
+    buildApiKeyRecord({
+      key: process.env.XYVALA_INTERNAL_KEY ?? "",
+      label: process.env.XYVALA_INTERNAL_LABEL ?? "Internal",
       plan: "internal",
       type: "internal",
-      fallbackLabel: "Internal",
-      fallbackPlan: "internal",
-      fallbackType: "internal",
+      keySource: "env",
+      createdAt: new Date(0).toISOString(),
     }),
 
-    buildKeyRecord({
-      key: process.env.XYVALA_PUBLIC_DEMO_KEY,
-      label: process.env.XYVALA_PUBLIC_DEMO_LABEL,
+    buildApiKeyRecord({
+      key: process.env.XYVALA_PUBLIC_DEMO_KEY ?? "",
+      label: process.env.XYVALA_PUBLIC_DEMO_LABEL ?? "Public Demo",
       plan: "demo",
       type: "public_demo",
-      fallbackLabel: "Public Demo",
-      fallbackPlan: "demo",
-      fallbackType: "public_demo",
+      keySource: "env",
+      createdAt: new Date(0).toISOString(),
     }),
 
-    buildKeyRecord({
-      key: process.env.XYVALA_API_KEY,
-      label: process.env.XYVALA_LEGACY_LABEL,
+    buildApiKeyRecord({
+      key: process.env.XYVALA_API_KEY ?? "",
+      label: process.env.XYVALA_LEGACY_LABEL ?? "Legacy",
       plan: "trader",
       type: "legacy",
-      fallbackLabel: "Legacy",
-      fallbackPlan: "trader",
-      fallbackType: "legacy",
+      keySource: "env",
+      createdAt: new Date(0).toISOString(),
     }),
   ];
 
-  return records.filter((record): record is ApiKeyRecord => Boolean(record));
+  return sortRecords(
+    dedupeRecords(records.filter((record): record is ApiKeyRecord => Boolean(record)))
+  );
 }
 
-function loadAllApiKeyRecords(): ApiKeyRecord[] {
-  const envRecords = loadEnvApiKeyRecords();
-  const jsonRecords = parseJsonRegistry();
+function loadRegistryRecords(): ApiKeyRecord[] {
+  /**
+   * Point d’extension futur :
+   * - JSON local versionné
+   * - KV / Redis
+   * - DB admin
+   *
+   * Pour l’instant : registre vide.
+   */
+  return [];
+}
 
-  return dedupeRecords([...envRecords, ...jsonRecords]);
+function loadApiKeyRegistry(): ApiKeyRecord[] {
+  const envRecords = loadEnvApiKeyRecords();
+  const registryRecords = loadRegistryRecords();
+
+  return sortRecords(dedupeRecords([...registryRecords, ...envRecords]));
 }
 
 export function getApiKeyRegistry(): ApiKeyRecord[] {
-  if (cachedRecords) {
-    return cachedRecords;
+  if (!cachedRecords) {
+    cachedRecords = loadApiKeyRegistry();
   }
 
-  cachedRecords = loadAllApiKeyRecords();
-  return cachedRecords;
+  return cachedRecords.map(cloneRecord);
 }
 
 export function clearApiKeyRegistryCache(): void {
@@ -228,17 +200,14 @@ export function listApiKeyRecords(): ApiKeyRecord[] {
 
 export function findApiKeyRecord(providedKey: string): ApiKeyRecord | null {
   const normalizedKey = normalizeKey(providedKey);
-
-  if (!normalizedKey) {
-    return null;
-  }
+  if (!normalizedKey) return null;
 
   const records = getApiKeyRegistry();
 
   for (const record of records) {
     if (!record.enabled) continue;
     if (record.key === normalizedKey) {
-      return record;
+      return cloneRecord(record);
     }
   }
 
