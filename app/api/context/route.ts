@@ -17,6 +17,7 @@ import {
   setToCache,
   type ScanSnapshot,
 } from "@/lib/xyvala/snapshot";
+import type { JsonRecord, JsonValue } from "@/lib/xyvala/json";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -25,6 +26,7 @@ export const revalidate = 0;
 const XYVALA_VERSION = "v1";
 const TTL_MS = 45_000;
 const CANONICAL_LIMIT = 250;
+const SCAN_SELF_HEAL_TIMEOUT_MS = 8_000;
 
 type Regime = "STABLE" | "TRANSITION" | "VOLATILE" | null;
 
@@ -50,7 +52,7 @@ type ContextResponse = {
   };
 };
 
-type ScanRouteResponse = {
+type ScanRouteResponse = JsonRecord & {
   ok?: boolean;
   ts?: string;
   version?: string;
@@ -58,7 +60,7 @@ type ScanRouteResponse = {
   market?: string;
   quote?: string;
   count?: number;
-  data?: unknown[];
+  data?: JsonValue[];
   context?: {
     market_regime?: unknown;
     stable_ratio?: unknown;
@@ -92,6 +94,11 @@ function safeNum(value: unknown): number | null {
 function uniqueWarnings(...groups: Array<string[] | undefined | null>): string[] {
   const merged = groups.flatMap((group) => (Array.isArray(group) ? group : []));
   return [...new Set(merged.filter((item) => typeof item === "string" && item.trim().length > 0))];
+}
+
+function parseBool(value: string | null): boolean {
+  const v = safeStr(value).toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
 }
 
 function normalizeRegime(value: unknown): Regime {
@@ -128,7 +135,12 @@ function buildContextResponse(
   };
 }
 
-function extractContextFromSnapshot(snapshot: ScanSnapshot) {
+function extractContextFromSnapshot(snapshot: ScanSnapshot): {
+  market_regime: Regime;
+  stable_ratio: number | null;
+  transition_ratio: number | null;
+  volatile_ratio: number | null;
+} {
   return {
     market_regime: normalizeRegime(snapshot.context?.market_regime),
     stable_ratio: safeNum(snapshot.context?.stable_ratio),
@@ -137,10 +149,15 @@ function extractContextFromSnapshot(snapshot: ScanSnapshot) {
   };
 }
 
+function isScanSnapshotData(value: JsonValue[] | undefined): value is ScanSnapshot["data"] {
+  return Array.isArray(value);
+}
+
 function normalizeScanSnapshot(input: ScanRouteResponse): ScanSnapshot | null {
   if (!input?.ok) return null;
   if (!Array.isArray(input.data)) return null;
   if (!input.context || typeof input.context !== "object") return null;
+  if (!isScanSnapshotData(input.data)) return null;
 
   return {
     ok: true,
@@ -156,7 +173,7 @@ function normalizeScanSnapshot(input: ScanRouteResponse): ScanSnapshot | null {
       typeof input.count === "number" && Number.isFinite(input.count)
         ? Math.max(0, Math.trunc(input.count))
         : input.data.length,
-    data: input.data as ScanSnapshot["data"],
+    data: input.data,
     context: {
       market_regime: normalizeRegime(input.context.market_regime),
       stable_ratio: safeNum(input.context.stable_ratio),
@@ -179,7 +196,6 @@ function normalizeScanSnapshot(input: ScanRouteResponse): ScanSnapshot | null {
 }
 
 async function getOrRebuildScanSnapshot(
-  auth: AuthSuccess,
   warnings: string[]
 ): Promise<{
   scan_cache_key: string;
@@ -206,6 +222,7 @@ async function getOrRebuildScanSnapshot(
   }
 
   const rebuilt = await xyvalaServerFetch<ScanRouteResponse>("/api/scan", {
+    method: "GET",
     searchParams: {
       quote: "usd",
       sort: "score",
@@ -213,7 +230,8 @@ async function getOrRebuildScanSnapshot(
       limit: CANONICAL_LIMIT,
       noStore: 1,
     },
-    timeoutMs: 8_000,
+    timeoutMs: SCAN_SELF_HEAL_TIMEOUT_MS,
+    cache: "no-store",
   });
 
   if (!rebuilt.ok || !rebuilt.data) {
@@ -257,7 +275,7 @@ function respond(
   status: number,
   auth: AuthSuccess,
   usage: UsageResult
-) {
+): NextResponse {
   let res: NextResponse = NextResponse.json(payload, {
     status,
     headers: {
@@ -275,8 +293,6 @@ function respond(
 
   return res;
 }
-
-/* -------------------------------- Handler -------------------------------- */
 
 export async function GET(req: NextRequest) {
   const ts = nowIso();
@@ -306,14 +322,13 @@ export async function GET(req: NextRequest) {
 
   try {
     const warnings: string[] = [...usageWarnings];
+    const noStore = parseBool(req.nextUrl.searchParams.get("noStore"));
 
     const { scan_cache_key, snapshot, source } = await getOrRebuildScanSnapshot(
-      auth,
       warnings
     );
 
     const context_cache_key = `xyvala:context:${XYVALA_VERSION}:scan=${scan_cache_key}`;
-    const noStore = req.nextUrl.searchParams.get("noStore") === "1";
 
     if (!noStore) {
       const cachedContext = getFromCache<ContextResponse>(context_cache_key, TTL_MS);
@@ -392,7 +407,7 @@ export async function GET(req: NextRequest) {
       message: null,
       error:
         error instanceof Error && error.message
-          ? String(error.message)
+          ? error.message
           : "unknown_error",
       source: "scan_self_heal",
       meta: {

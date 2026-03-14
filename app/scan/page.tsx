@@ -1,233 +1,288 @@
 // app/scan/page.tsx
 
 import React from "react";
-import { getRuntimeConfig } from "@/lib/xyvala/runtime-config";
-import { getInternalJson } from "@/lib/xyvala/server-client";
+import { getScanService, type ScanServiceItem } from "@/lib/xyvala/services/scan-service";
+import { getStateService } from "@/lib/xyvala/services/state-service";
 import { ScanTable } from "@/components/scan-table";
 import { MarketStatePanel } from "@/components/market-state";
-import type { ScanAsset } from "@/lib/xyvala/scan";
+import type { ScanAsset, Regime } from "@/lib/xyvala/scan";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
-type SearchParamsInput = {
-  quote?: string | string[];
-  sort?: string | string[];
-  limit?: string | string[];
+const DEFAULT_QUOTE = "usd";
+const DEFAULT_SORT = "score_desc";
+const DEFAULT_LIMIT = 100;
+
+type ScanTableItem = ScanAsset & {
+  affiliate_url: string;
 };
 
-type ScanPageProps = {
-  searchParams?: Promise<SearchParamsInput> | SearchParamsInput;
+type MarketState = {
+  market_regime?: string | null;
+  volatility_state?: string | null;
+  liquidity_state?: string | null;
+  risk_mode?: string | null;
+  execution_bias?: string | null;
+  stable_ratio?: number | null;
+  transition_ratio?: number | null;
+  volatile_ratio?: number | null;
 };
 
-type MarketState = Record<string, unknown> | null;
-
-type ScanApiResponse = {
-  assets?: ScanAsset[];
-  marketState?: MarketState;
-  warnings?: string[];
-  error?: string | null;
+type ScanPageViewModel = {
+  items: ScanTableItem[];
+  source: string;
+  quote: string;
+  count: number;
+  warnings: string[];
+  error: string | null;
 };
 
-const ALLOWED_SORTS = new Set([
-  "score_desc",
-  "score_asc",
-  "price_desc",
-  "price_asc",
-  "chg_24h_desc",
-  "chg_24h_asc",
-  "volume_desc",
-  "volume_asc",
-  "market_cap_desc",
-  "market_cap_asc",
-  "symbol_asc",
-  "symbol_desc",
-]);
-
-function safeStr(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "";
+function safeArray<T>(value: T[] | null | undefined): T[] {
+  return Array.isArray(value) ? value : [];
 }
 
-function firstValue(value: string | string[] | undefined): string {
-  if (Array.isArray(value)) return safeStr(value[0]);
-  return safeStr(value);
+function safeString(value: unknown, fallback: string): string {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : fallback;
 }
 
-function normalizeQuote(input: string, fallback: string): string {
-  const value = input.toLowerCase();
-  return value || fallback;
+function safeNumber(value: unknown, fallback = 0): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
-function normalizeSort(input: string, fallback: string): string {
-  const value = input.trim();
-  if (!value) return fallback;
-  return ALLOWED_SORTS.has(value) ? value : fallback;
+function safeOptionalNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-function normalizeLimit(input: string, fallback: number): number {
-  const parsed = Number.parseInt(input, 10);
-
-  if (!Number.isFinite(parsed)) return fallback;
-  if (parsed < 1) return 1;
-  if (parsed > 250) return 250;
-
-  return parsed;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function normalizeWarnings(...groups: Array<string[] | undefined | null>): string[] {
+function uniqueWarnings(...groups: Array<string[] | undefined | null>): string[] {
   const merged = groups.flatMap((group) => (Array.isArray(group) ? group : []));
   return [...new Set(merged.filter((item) => typeof item === "string" && item.trim().length > 0))];
 }
 
-function renderWarnings(warnings: string[]) {
-  if (warnings.length === 0) return null;
+function normalizeRegime(value: unknown): Regime {
+  const regime = safeString(value, "").toUpperCase();
 
-  return (
-    <section className="mb-6 rounded-2xl border border-amber-200 bg-amber-50 p-4">
-      <p className="text-sm font-medium text-amber-800">Avertissements</p>
-      <ul className="mt-2 space-y-1 text-sm text-amber-700">
-        {warnings.map((warning) => (
-          <li key={warning}>• {warning}</li>
-        ))}
-      </ul>
-    </section>
-  );
+  if (regime === "STABLE") return "STABLE";
+  if (regime === "TRANSITION") return "TRANSITION";
+  if (regime === "VOLATILE") return "VOLATILE";
+
+  return "TRANSITION";
 }
 
-function renderError(error: string | null, warnings: string[]) {
-  if (!error) return null;
-
-  return (
-    <section className="mb-6 rounded-2xl border border-red-200 bg-red-50 p-4">
-      <p className="text-sm font-medium text-red-800">Erreur: {error}</p>
-      {warnings.length > 0 ? (
-        <ul className="mt-2 space-y-1 text-sm text-red-700">
-          {warnings.map((warning) => (
-            <li key={warning}>• {warning}</li>
-          ))}
-        </ul>
-      ) : null}
-    </section>
-  );
+function mapScanServiceItemToTableItem(item: ScanServiceItem): ScanTableItem {
+    return {
+  ...item,
+  id: safeString(item.id, safeString(item.symbol, "unknown").toLowerCase()),
+  symbol: safeString(item.symbol, "UNKNOWN"),
+  name: safeString(item.name, safeString(item.symbol, "Unknown")),
+  price: safeNumber(item.price, 0),
+  chg_24h_pct: safeNumber(item.chg_24h_pct, 0),
+  confidence_score: safeNumber(item.confidence_score, 0),
+  regime: normalizeRegime(item.regime),
+  binance_url: safeString(item.binance_url, "#"),
+  affiliate_url: safeString(item.affiliate_url ?? item.binance_url, "#"),
+  market_cap: safeOptionalNumber(item.market_cap),
+  volume_24h: safeOptionalNumber(item.volume_24h),
+};
 }
 
-export default async function ScanPage(props: ScanPageProps) {
-  const runtimeConfig = await getRuntimeConfig();
-  const resolvedSearchParams = props.searchParams
-    ? await props.searchParams
-    : {};
+function normalizeItems(items: ScanServiceItem[] | null | undefined): ScanTableItem[] {
+  return safeArray(items).map(mapScanServiceItemToTableItem);
+}
 
-  const quote = normalizeQuote(
-    firstValue(resolvedSearchParams.quote),
-    runtimeConfig.defaultQuote
-  );
-
-  const sort = normalizeSort(
-    firstValue(resolvedSearchParams.sort),
-    runtimeConfig.defaultSort
-  );
-
-  const limit = normalizeLimit(
-    firstValue(resolvedSearchParams.limit),
-    runtimeConfig.defaultLimit
-  );
-
-  let assets: ScanAsset[] = [];
-  let marketState: MarketState = null;
-  let error: string | null = null;
-  let warnings: string[] = runtimeConfig.warnings ?? [];
-
-  const scanResult = await getInternalJson<ScanApiResponse>("/api/scan", {
-    quote,
-    sort,
-    limit,
+async function getScanData(): Promise<ScanPageViewModel> {
+  const result = await getScanService({
+    quote: DEFAULT_QUOTE,
+    sort: DEFAULT_SORT,
+    limit: DEFAULT_LIMIT,
+    noStore: false,
   });
 
-  if (!scanResult.ok || !scanResult.data) {
-    error = scanResult.error ?? "scan_request_failed";
-    warnings = normalizeWarnings(warnings, scanResult.warnings);
-  } else {
-    assets = Array.isArray(scanResult.data.assets) ? scanResult.data.assets : [];
-    marketState = isRecord(scanResult.data.marketState)
-      ? scanResult.data.marketState
-      : null;
-    error = safeStr(scanResult.data.error) || null;
-    warnings = normalizeWarnings(
-      warnings,
-      scanResult.warnings,
-      scanResult.data.warnings
-    );
+  return {
+    items: normalizeItems(result.data),
+    source: safeString(result.source, "fallback"),
+    quote: safeString(result.quote, DEFAULT_QUOTE),
+    count:
+      typeof result.count === "number" && Number.isFinite(result.count)
+        ? result.count
+        : result.data.length,
+    warnings: uniqueWarnings(result.warnings),
+    error:
+      typeof result.error === "string" && result.error.trim().length > 0
+        ? result.error
+        : null,
+  };
+}
+
+async function getMarketState(): Promise<{
+  state: MarketState | null;
+  warning: string | null;
+}> {
+  const result = await getStateService({
+    quote: DEFAULT_QUOTE,
+    noStore: false,
+  });
+
+  if (!result.ok || !result.state) {
+    return {
+      state: null,
+      warning: result.error ?? "market_state_unavailable",
+    };
   }
 
+  return {
+    state: {
+      market_regime: result.state.market_regime ?? null,
+      volatility_state: result.state.volatility_state ?? null,
+      liquidity_state: result.state.liquidity_state ?? null,
+      risk_mode: result.state.risk_mode ?? null,
+      execution_bias: result.state.execution_bias ?? null,
+      stable_ratio: result.state.stable_ratio ?? null,
+      transition_ratio: result.state.transition_ratio ?? null,
+      volatile_ratio: result.state.volatile_ratio ?? null,
+    },
+    warning:
+      result.warnings.length > 0
+        ? uniqueWarnings(result.warnings).join(" | ")
+        : null,
+  };
+}
+
+function InfoPill({ children }: { children: React.ReactNode }) {
   return (
-    <main className="mx-auto w-full max-w-7xl px-4 py-6 md:px-6">
-      <section className="mb-6">
-        <div className="flex flex-col gap-2">
+    <span className="rounded-full border border-neutral-800 bg-neutral-900/70 px-3 py-1 text-xs text-neutral-300">
+      {children}
+    </span>
+  );
+}
+
+function NoticeBox({
+  title,
+  children,
+  tone = "neutral",
+}: {
+  title: string;
+  children: React.ReactNode;
+  tone?: "neutral" | "warning" | "error" | "info";
+}) {
+  const toneClasses =
+    tone === "error"
+      ? "border-red-500/20 bg-red-500/5 text-red-200"
+      : tone === "warning"
+        ? "border-amber-500/20 bg-amber-500/5 text-amber-200"
+        : tone === "info"
+          ? "border-blue-500/20 bg-blue-500/5 text-blue-200"
+          : "border-neutral-800 bg-neutral-900/60 text-neutral-200";
+
+  return (
+    <div className={`rounded-2xl border p-4 ${toneClasses}`}>
+      <p className="text-sm font-medium">{title}</p>
+      <div className="mt-1 text-sm opacity-90">{children}</div>
+    </div>
+  );
+}
+
+export default async function ScanPage() {
+  let fatalError: string | null = null;
+  let viewModel: ScanPageViewModel = {
+    items: [],
+    source: "fallback",
+    quote: DEFAULT_QUOTE,
+    count: 0,
+    warnings: [],
+    error: null,
+  };
+  let marketState: MarketState | null = null;
+  const pageWarnings: string[] = [];
+
+  const [scanResult, stateResult] = await Promise.allSettled([
+    getScanData(),
+    getMarketState(),
+  ]);
+
+  if (scanResult.status === "fulfilled") {
+    viewModel = scanResult.value;
+  } else {
+    fatalError =
+      scanResult.reason instanceof Error && scanResult.reason.message
+        ? scanResult.reason.message
+        : "scan_page_failed";
+  }
+
+  if (stateResult.status === "fulfilled") {
+    marketState = stateResult.value.state;
+    if (stateResult.value.warning) {
+      pageWarnings.push(stateResult.value.warning);
+    }
+  } else {
+    pageWarnings.push("market_state_request_failed");
+  }
+
+  const items = viewModel.items;
+  const allWarnings = uniqueWarnings(viewModel.warnings, pageWarnings);
+
+  return (
+    <main className="mx-auto max-w-7xl px-4 py-8">
+      <div className="mb-6 flex flex-col gap-4">
+        <div>
           <h1 className="text-2xl font-semibold tracking-tight">Xyvala Scan</h1>
-          <p className="text-sm text-neutral-500">
-            Runtime centralisé, transport interne unifié.
+          <p className="mt-2 text-sm text-neutral-500">
+            Structured crypto scan ranked by confidence score.
           </p>
         </div>
-      </section>
 
-      {renderError(error, warnings)}
-      {!error ? renderWarnings(warnings) : null}
-
-      <section className="mb-6">
-        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
-          <div className="rounded-xl border p-3">
-            <div className="text-xs uppercase tracking-wide text-neutral-400">
-              Quote
-            </div>
-            <div className="mt-1 font-medium text-neutral-900">{quote}</div>
+        {!fatalError ? (
+          <div className="flex flex-wrap gap-2">
+            <InfoPill>Source: {viewModel.source}</InfoPill>
+            <InfoPill>Quote: {viewModel.quote.toUpperCase()}</InfoPill>
+            <InfoPill>Assets: {viewModel.count}</InfoPill>
           </div>
+        ) : null}
+      </div>
 
-          <div className="rounded-xl border p-3">
-            <div className="text-xs uppercase tracking-wide text-neutral-400">
-              Sort
-            </div>
-            <div className="mt-1 font-medium text-neutral-900">{sort}</div>
-          </div>
-
-          <div className="rounded-xl border p-3">
-            <div className="text-xs uppercase tracking-wide text-neutral-400">
-              Limit
-            </div>
-            <div className="mt-1 font-medium text-neutral-900">{limit}</div>
-          </div>
-
-          <div className="rounded-xl border p-3">
-            <div className="text-xs uppercase tracking-wide text-neutral-400">
-              Env
-            </div>
-            <div className="mt-1 font-medium text-neutral-900">
-              {runtimeConfig.appEnv}
-            </div>
-          </div>
-
-          <div className="rounded-xl border p-3">
-            <div className="text-xs uppercase tracking-wide text-neutral-400">
-              Internal Key
-            </div>
-            <div className="mt-1 font-medium text-neutral-900">
-              {runtimeConfig.hasRequiredApiKeys ? "available" : "missing"}
-            </div>
-          </div>
+      {fatalError ? (
+        <div className="mb-6">
+          <NoticeBox title="Erreur de chargement" tone="error">
+            {fatalError}
+          </NoticeBox>
         </div>
-      </section>
+      ) : null}
 
-      <section className="mb-6">
-        <MarketStatePanel state={marketState} />
-      </section>
+      {!fatalError && viewModel.error ? (
+        <div className="mb-6">
+          <NoticeBox title="Source partiellement dégradée" tone="warning">
+            {viewModel.error}
+          </NoticeBox>
+        </div>
+      ) : null}
 
-      <section>
-        <ScanTable assets={assets} quote={quote} sort={sort} limit={limit} />
-      </section>
+      {!fatalError && allWarnings.length > 0 ? (
+        <div className="mb-6">
+          <NoticeBox title="Warnings" tone="neutral">
+            <ul className="space-y-1">
+              {allWarnings.map((warning) => (
+                <li key={warning}>• {warning}</li>
+              ))}
+            </ul>
+          </NoticeBox>
+        </div>
+      ) : null}
+
+      {!fatalError ? (
+        <div className="mb-6">
+          <MarketStatePanel state={marketState} />
+        </div>
+      ) : null}
+
+      {!fatalError ? (
+        <ScanTable
+          assets={items}
+          quote={viewModel.quote}
+          sort={DEFAULT_SORT}
+          limit={DEFAULT_LIMIT}
+        />
+      ) : null}
     </main>
   );
 }

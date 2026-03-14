@@ -20,6 +20,7 @@ import {
   type Quote,
 } from "@/lib/xyvala/snapshot";
 import { xyvalaServerFetch } from "@/lib/xyvala/server-client";
+import type { JsonRecord, JsonValue } from "@/lib/xyvala/json";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -83,7 +84,7 @@ export type AssetsResponse = {
   error: string | null;
 };
 
-type ScanRouteResponse = {
+type ScanRouteResponse = JsonRecord & {
   ok?: boolean;
   ts?: string;
   version?: string;
@@ -91,7 +92,7 @@ type ScanRouteResponse = {
   market?: string;
   quote?: string;
   count?: number;
-  data?: unknown[];
+  data?: JsonValue[];
   context?: ScanSnapshot["context"];
   meta?: {
     limit?: number;
@@ -110,7 +111,7 @@ type CacheEntry = {
 
 const mem = new Map<string, CacheEntry>();
 
-const nowIso = () => new Date().toISOString();
+const nowIso = (): string => new Date().toISOString();
 
 function safeStr(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
@@ -384,13 +385,20 @@ function sortAssets(list: AssetsItem[], sort: SortKey, order: SortOrder): void {
 
     if (aHas !== bHas) return aHas ? -1 : 1;
     if (!aHas && !bHas) return tieBreak(a, b);
-    if (aValue !== bValue) return ((aValue as number) - (bValue as number)) * direction;
+
+    if (aHas && bHas && aValue !== bValue) {
+      return (aValue - bValue) * direction;
+    }
 
     return tieBreak(a, b);
   });
 }
 
-function paginate(list: AssetsItem[], cursor: number, limit: number) {
+function paginate(list: AssetsItem[], cursor: number, limit: number): {
+  data: AssetsItem[];
+  total: number;
+  nextCursor: string | null;
+} {
   const start = Math.max(0, cursor);
   const end = Math.min(list.length, start + limit);
 
@@ -401,10 +409,15 @@ function paginate(list: AssetsItem[], cursor: number, limit: number) {
   };
 }
 
+function isScanAssetArray(value: JsonValue[] | undefined): value is ScanAsset[] {
+  return Array.isArray(value);
+}
+
 function normalizeScanSnapshot(input: ScanRouteResponse): ScanSnapshot | null {
   if (!input?.ok) return null;
   if (!Array.isArray(input.data)) return null;
   if (!input.context) return null;
+  if (!isScanAssetArray(input.data)) return null;
 
   const candidate: ScanSnapshot = {
     ok: true,
@@ -420,7 +433,7 @@ function normalizeScanSnapshot(input: ScanRouteResponse): ScanSnapshot | null {
       typeof input.count === "number" && Number.isFinite(input.count)
         ? Math.max(0, Math.trunc(input.count))
         : input.data.length,
-    data: input.data as ScanAsset[],
+    data: input.data,
     context: input.context,
     meta: {
       limit:
@@ -561,7 +574,7 @@ function respond(
   status: number,
   auth: AuthSuccess,
   usage: UsageResult
-) {
+): NextResponse {
   let res: NextResponse = NextResponse.json(payload, {
     status,
     headers: {
@@ -612,7 +625,7 @@ export async function GET(req: NextRequest) {
     const requestedMarket = normalizeMarket(sp.get("market"));
     const market = DEFAULT_MARKET;
     const quote = normalizeQuote(sp.get("quote"));
-    const q = safeStr(sp.get("q"))?.toLowerCase() ?? null;
+    const q = safeStr(sp.get("q")) || null;
     const sort = normalizeSort(sp.get("sort"));
     const order = normalizeOrder(sp.get("order"));
     const limit = parseLimit(sp.get("limit"));
@@ -654,10 +667,7 @@ export async function GET(req: NextRequest) {
       }
     }
 
-    const snapshotResult = await loadCanonicalSnapshot({
-      quote,
-    });
-
+    const snapshotResult = await loadCanonicalSnapshot({ quote });
     requestWarnings = uniqueWarnings(requestWarnings, snapshotResult.warnings);
 
     let source: AssetsResponse["source"] = "scan";

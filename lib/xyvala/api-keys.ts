@@ -1,12 +1,16 @@
 // lib/xyvala/api-keys.ts
 
-import type { ApiKeyType } from "@/lib/xyvala/auth";
 import type { ApiPlan } from "@/lib/xyvala/usage";
 
 export type ApiKeyRecordType =
   | "internal"
   | "public_demo"
   | "client"
+  | "legacy";
+
+export type ApiKeyType =
+  | "internal"
+  | "public_demo"
   | "legacy";
 
 export type ApiKeySource = "env" | "registry";
@@ -79,6 +83,13 @@ function cloneRecord(record: ApiKeyRecord): ApiKeyRecord {
   return { ...record };
 }
 
+function normalizePlanForType(type: ApiKeyRecordType, plan: ApiPlan): ApiPlan {
+  if (type === "internal") return "internal";
+  if (type === "public_demo") return "demo";
+  if (type === "legacy" && plan === "internal") return "trader";
+  return plan;
+}
+
 function buildApiKeyRecord(input: BuildApiKeyRecordInput): ApiKeyRecord | null {
   const normalizedKey = normalizeKey(input.key);
   if (!normalizedKey) return null;
@@ -87,16 +98,17 @@ function buildApiKeyRecord(input: BuildApiKeyRecordInput): ApiKeyRecord | null {
   const updatedAtFallback = nowIso();
 
   const label = normalizeLabel(input.label, input.type);
+  const normalizedPlan = normalizePlanForType(input.type, input.plan);
 
   return {
     id: buildRecordId({
       type: input.type,
-      plan: input.plan,
+      plan: normalizedPlan,
       label,
     }),
     key: normalizedKey,
     label,
-    plan: input.plan,
+    plan: normalizedPlan,
     type: input.type,
     enabled: input.enabled ?? true,
     createdAt: normalizeIsoDate(input.createdAt, createdAtFallback),
@@ -164,14 +176,6 @@ function loadEnvApiKeyRecords(): ApiKeyRecord[] {
 }
 
 function loadRegistryRecords(): ApiKeyRecord[] {
-  /**
-   * Point d’extension futur :
-   * - JSON local versionné
-   * - KV / Redis
-   * - DB admin
-   *
-   * Pour l’instant : registre vide.
-   */
   return [];
 }
 

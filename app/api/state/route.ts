@@ -1,4 +1,4 @@
-// app/api/stats/route.ts
+// app/api/state/route.ts
 
 import { NextRequest, NextResponse } from "next/server";
 import {
@@ -11,69 +11,43 @@ import {
   applyQuotaHeaders,
 } from "@/lib/xyvala/usage";
 import {
-  listMemoryBySymbol,
-  listRecentMemory,
-  type SignalMemoryRecord,
-} from "@/lib/xyvala/memory";
+  getStateService,
+  type StateServiceResult,
+} from "@/lib/xyvala/services/state-service";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
-const XYVALA_VERSION = "v1";
-const DEFAULT_LIMIT = 200;
-const MAX_LIMIT = 5_000;
+const VERSION = "v1";
 
-type StatsResponse = {
+type Quote = "usd" | "usdt" | "eur";
+
+type MarketRegime = "STABLE" | "TRANSITION" | "VOLATILE" | null;
+type VolatilityState = "LOW" | "NORMAL" | "HIGH" | null;
+type LiquidityState = "LOW" | "NORMAL" | "HIGH" | null;
+type RiskMode = "LOW" | "MODERATE" | "HIGH" | null;
+type ExecutionBias = "AGGRESSIVE" | "SELECTIVE" | "DEFENSIVE" | null;
+
+type StateResponse = {
   ok: boolean;
   ts: string;
   version: string;
-
-  symbol: string | null;
-  limit: number;
-
-  totals: {
-    total_records: number;
-    open_records: number;
-    resolved_records: number;
-    positive: number;
-    negative: number;
-    neutral: number;
+  state: {
+    market_regime: MarketRegime;
+    volatility_state: VolatilityState;
+    liquidity_state: LiquidityState;
+    risk_mode: RiskMode;
+    execution_bias: ExecutionBias;
+    stable_ratio: number | null;
+    transition_ratio: number | null;
+    volatile_ratio: number | null;
   };
-
-  metrics: {
-    winrate: number | null;
-    avg_result_pct: number | null;
-    avg_positive_pct: number | null;
-    avg_negative_pct: number | null;
-  };
-
-  breakdown: {
-    by_action: Array<{
-      action: "ALLOW" | "WATCH" | "BLOCK";
-      total: number;
-      resolved: number;
-      positive: number;
-      negative: number;
-      neutral: number;
-      winrate: number | null;
-      avg_result_pct: number | null;
-    }>;
-    by_regime: Array<{
-      market_regime: string;
-      total: number;
-      resolved: number;
-      positive: number;
-      negative: number;
-      neutral: number;
-      winrate: number | null;
-      avg_result_pct: number | null;
-    }>;
-  };
-
   error: string | null;
-
   meta: {
+    cache: "hit" | "miss" | "no-store";
+    source: "state_cache" | "scan_snapshot" | "fallback";
+    quote: Quote;
     warnings: string[];
   };
 };
@@ -88,17 +62,11 @@ function safeStr(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function safeNum(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function clamp(n: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, n));
-}
-
-function round2(value: number | null): number | null {
-  if (typeof value !== "number" || !Number.isFinite(value)) return null;
-  return Math.round(value * 100) / 100;
+function normalizeQuote(value: string | null): Quote {
+  const s = safeStr(value).toLowerCase();
+  if (s === "eur") return "eur";
+  if (s === "usdt") return "usdt";
+  return "usd";
 }
 
 function uniqueWarnings(...groups: Array<string[] | undefined | null>): string[] {
@@ -106,217 +74,119 @@ function uniqueWarnings(...groups: Array<string[] | undefined | null>): string[]
   return [...new Set(merged.filter((item) => typeof item === "string" && item.trim().length > 0))];
 }
 
-function sanitizeSymbol(symbol: string): string {
-  return symbol.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 20);
+function parseNoStore(req: NextRequest): boolean {
+  const value = safeStr(req.nextUrl.searchParams.get("noStore")).toLowerCase();
+  return value === "1" || value === "true" || value === "yes" || value === "on";
 }
 
-function parseLimit(value: string | null): number {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) return DEFAULT_LIMIT;
-  return clamp(Math.trunc(parsed), 1, MAX_LIMIT);
-}
-
-function normalizeAction(value: unknown): "ALLOW" | "WATCH" | "BLOCK" | null {
-  const action = safeStr(value).toUpperCase();
-
-  if (action === "ALLOW") return "ALLOW";
-  if (action === "WATCH") return "WATCH";
-  if (action === "BLOCK") return "BLOCK";
-
+function normalizeVolatilityState(value: unknown): VolatilityState {
+  const s = safeStr(value).toUpperCase();
+  if (s === "LOW") return "LOW";
+  if (s === "NORMAL") return "NORMAL";
+  if (s === "HIGH") return "HIGH";
   return null;
 }
 
-function normalizeRegime(value: unknown): string {
-  const regime = safeStr(value).toUpperCase();
-  return regime || "UNKNOWN";
+function normalizeLiquidityState(value: unknown): LiquidityState {
+  const s = safeStr(value).toUpperCase();
+  if (s === "LOW") return "LOW";
+  if (s === "NORMAL") return "NORMAL";
+  if (s === "HIGH") return "HIGH";
+  return null;
 }
 
-function normalizeStatus(value: unknown): "open" | "resolved" | "unknown" {
-  const status = safeStr(value).toLowerCase();
-
-  if (status === "open") return "open";
-  if (status === "resolved") return "resolved";
-
-  return "unknown";
+function normalizeRiskMode(value: unknown): RiskMode {
+  const s = safeStr(value).toUpperCase();
+  if (s === "LOW") return "LOW";
+  if (s === "MODERATE") return "MODERATE";
+  if (s === "HIGH") return "HIGH";
+  return null;
 }
 
-function buildResponse(
-  input: Partial<StatsResponse> & Pick<StatsResponse, "ts" | "symbol" | "limit">
-): StatsResponse {
+function normalizeExecutionBias(value: unknown): ExecutionBias {
+  const s = safeStr(value).toUpperCase();
+  if (s === "AGGRESSIVE") return "AGGRESSIVE";
+  if (s === "SELECTIVE") return "SELECTIVE";
+  if (s === "DEFENSIVE") return "DEFENSIVE";
+  return null;
+}
+
+function normalizeMarketRegime(value: unknown): MarketRegime {
+  const s = safeStr(value).toUpperCase();
+  if (s === "STABLE") return "STABLE";
+  if (s === "TRANSITION") return "TRANSITION";
+  if (s === "VOLATILE") return "VOLATILE";
+  return null;
+}
+
+function toApiCache(value: StateServiceResult["source"], noStore: boolean): "hit" | "miss" | "no-store" {
+  if (noStore) return "no-store";
+  if (value === "state_cache") return "hit";
+  return "miss";
+}
+
+function buildEmptyState() {
   return {
-    ok: Boolean(input.ok),
+    market_regime: null as MarketRegime,
+    volatility_state: null as VolatilityState,
+    liquidity_state: null as LiquidityState,
+    risk_mode: null as RiskMode,
+    execution_bias: null as ExecutionBias,
+    stable_ratio: null as number | null,
+    transition_ratio: null as number | null,
+    volatile_ratio: null as number | null,
+  };
+}
+
+function buildStateResponse(
+  input: {
+    ts: string;
+    quote: Quote;
+    service: StateServiceResult;
+    usageWarnings?: string[];
+    noStore?: boolean;
+  }
+): StateResponse {
+  const serviceState = input.service.state;
+
+  return {
+    ok: input.service.ok,
     ts: input.ts,
-    version: input.version ?? XYVALA_VERSION,
-
-    symbol: input.symbol ?? null,
-    limit: input.limit,
-
-    totals: {
-      total_records: input.totals?.total_records ?? 0,
-      open_records: input.totals?.open_records ?? 0,
-      resolved_records: input.totals?.resolved_records ?? 0,
-      positive: input.totals?.positive ?? 0,
-      negative: input.totals?.negative ?? 0,
-      neutral: input.totals?.neutral ?? 0,
-    },
-
-    metrics: {
-      winrate: input.metrics?.winrate ?? null,
-      avg_result_pct: input.metrics?.avg_result_pct ?? null,
-      avg_positive_pct: input.metrics?.avg_positive_pct ?? null,
-      avg_negative_pct: input.metrics?.avg_negative_pct ?? null,
-    },
-
-    breakdown: {
-      by_action: input.breakdown?.by_action ?? [],
-      by_regime: input.breakdown?.by_regime ?? [],
-    },
-
-    error: input.error ?? null,
-
+    version: VERSION,
+    state: serviceState
+      ? {
+          market_regime: normalizeMarketRegime(serviceState.market_regime),
+          volatility_state: normalizeVolatilityState(serviceState.volatility_state),
+          liquidity_state: normalizeLiquidityState(serviceState.liquidity_state),
+          risk_mode: normalizeRiskMode(serviceState.risk_mode),
+          execution_bias: normalizeExecutionBias(serviceState.execution_bias),
+          stable_ratio: serviceState.stable_ratio ?? null,
+          transition_ratio: serviceState.transition_ratio ?? null,
+          volatile_ratio: serviceState.volatile_ratio ?? null,
+        }
+      : buildEmptyState(),
+    error: input.service.error,
     meta: {
-      warnings: input.meta?.warnings ?? [],
+      cache: toApiCache(input.service.source, input.noStore === true),
+      source: input.service.source,
+      quote: input.quote,
+      warnings: uniqueWarnings(input.service.warnings, input.usageWarnings),
     },
   };
-}
-
-function computeBaseStats(records: SignalMemoryRecord[]) {
-  let total_records = records.length;
-  let open_records = 0;
-  let resolved_records = 0;
-  let positive = 0;
-  let negative = 0;
-  let neutral = 0;
-
-  let resultSum = 0;
-  let resultCount = 0;
-
-  let positiveSum = 0;
-  let positiveCount = 0;
-
-  let negativeSum = 0;
-  let negativeCount = 0;
-
-  for (const record of records) {
-    const status = normalizeStatus(record.status);
-
-    if (status === "open") {
-      open_records += 1;
-    }
-
-    if (status === "resolved") {
-      resolved_records += 1;
-    }
-
-    const observedResult = safeNum(record.observed_result_pct);
-
-    if (observedResult !== null) {
-      resultSum += observedResult;
-      resultCount += 1;
-
-      if (observedResult > 0) {
-        positive += 1;
-        positiveSum += observedResult;
-        positiveCount += 1;
-      } else if (observedResult < 0) {
-        negative += 1;
-        negativeSum += observedResult;
-        negativeCount += 1;
-      } else {
-        neutral += 1;
-      }
-    }
-  }
-
-  const winrate =
-    resolved_records > 0 ? round2((positive / resolved_records) * 100) : null;
-
-  const avg_result_pct =
-    resultCount > 0 ? round2(resultSum / resultCount) : null;
-
-  const avg_positive_pct =
-    positiveCount > 0 ? round2(positiveSum / positiveCount) : null;
-
-  const avg_negative_pct =
-    negativeCount > 0 ? round2(negativeSum / negativeCount) : null;
-
-  return {
-    totals: {
-      total_records,
-      open_records,
-      resolved_records,
-      positive,
-      negative,
-      neutral,
-    },
-    metrics: {
-      winrate,
-      avg_result_pct,
-      avg_positive_pct,
-      avg_negative_pct,
-    },
-  };
-}
-
-function groupByAction(records: SignalMemoryRecord[]) {
-  const actions: Array<"ALLOW" | "WATCH" | "BLOCK"> = ["ALLOW", "WATCH", "BLOCK"];
-
-  return actions.map((action) => {
-    const subset = records.filter((record) => normalizeAction(record.action) === action);
-    const base = computeBaseStats(subset);
-
-    return {
-      action,
-      total: base.totals.total_records,
-      resolved: base.totals.resolved_records,
-      positive: base.totals.positive,
-      negative: base.totals.negative,
-      neutral: base.totals.neutral,
-      winrate: base.metrics.winrate,
-      avg_result_pct: base.metrics.avg_result_pct,
-    };
-  });
-}
-
-function groupByRegime(records: SignalMemoryRecord[]) {
-  const buckets = new Map<string, SignalMemoryRecord[]>();
-
-  for (const record of records) {
-    const regime = normalizeRegime(record.market_regime);
-    const current = buckets.get(regime) ?? [];
-    current.push(record);
-    buckets.set(regime, current);
-  }
-
-  return Array.from(buckets.entries())
-    .map(([market_regime, subset]) => {
-      const base = computeBaseStats(subset);
-
-      return {
-        market_regime,
-        total: base.totals.total_records,
-        resolved: base.totals.resolved_records,
-        positive: base.totals.positive,
-        negative: base.totals.negative,
-        neutral: base.totals.neutral,
-        winrate: base.metrics.winrate,
-        avg_result_pct: base.metrics.avg_result_pct,
-      };
-    })
-    .sort((a, b) => b.total - a.total || a.market_regime.localeCompare(b.market_regime));
 }
 
 function respond(
-  payload: StatsResponse,
+  payload: StateResponse,
   status: number,
   auth: AuthSuccess,
   usage: UsageResult
-) {
+): NextResponse {
   let res: NextResponse = NextResponse.json(payload, {
     status,
     headers: {
+      "x-xyvala-version": VERSION,
       "cache-control": "no-store",
-      "x-xyvala-version": XYVALA_VERSION,
+      "x-xyvala-cache": payload.meta.cache,
     },
   });
 
@@ -329,10 +199,10 @@ function respond(
   return res;
 }
 
-/* ---------------- Handler ---------------- */
-
 export async function GET(req: NextRequest) {
   const ts = nowIso();
+  const quote = normalizeQuote(req.nextUrl.searchParams.get("quote"));
+  const noStore = parseNoStore(req);
 
   const auth = enforceApiPolicy(req);
   if (!auth.ok) {
@@ -346,7 +216,7 @@ export async function GET(req: NextRequest) {
     usage = trackUsage({
       key: auth.key,
       keyType: auth.keyType,
-      endpoint: "/api/stats",
+      endpoint: "/api/state",
       planOverride: auth.plan,
     });
   } catch (error) {
@@ -358,61 +228,36 @@ export async function GET(req: NextRequest) {
   }
 
   try {
-    const sp = req.nextUrl.searchParams;
-
-    const symbolRaw = safeStr(sp.get("symbol"));
-    const symbol = symbolRaw ? sanitizeSymbol(symbolRaw) : null;
-    const limit = parseLimit(sp.get("limit"));
-
-    let records: SignalMemoryRecord[] = [];
-    let routeWarnings: string[] = [...usageWarnings];
-
-    if (symbol) {
-      records = await listMemoryBySymbol({
-        symbol,
-        limit,
-        status: "all",
-      });
-    } else {
-      records = await listRecentMemory({
-        limit,
-        status: "all",
-      });
-
-      routeWarnings = uniqueWarnings(routeWarnings, ["global_stats_mode"]);
-    }
-
-    const base = computeBaseStats(records);
-
-    const payload = buildResponse({
-      ok: true,
-      ts,
-      symbol,
-      limit,
-      totals: base.totals,
-      metrics: base.metrics,
-      breakdown: {
-        by_action: groupByAction(records),
-        by_regime: groupByRegime(records),
-      },
-      error: null,
-      meta: {
-        warnings: routeWarnings,
-      },
+    const service = await getStateService({
+      quote,
+      noStore,
     });
 
-    return respond(payload, 200, auth, usage);
+    const payload = buildStateResponse({
+      ts,
+      quote,
+      service,
+      usageWarnings,
+      noStore,
+    });
+
+    const status = payload.ok ? 200 : 503;
+
+    return respond(payload, status, auth, usage);
   } catch (error) {
-    const payload = buildResponse({
+    const payload: StateResponse = {
       ok: false,
       ts,
-      symbol: null,
-      limit: 0,
+      version: VERSION,
+      state: buildEmptyState(),
       error:
         error instanceof Error && error.message
           ? error.message
           : "unknown_error",
       meta: {
+        cache: noStore ? "no-store" : "miss",
+        source: "fallback",
+        quote,
         warnings: uniqueWarnings(
           usageWarnings,
           [
@@ -422,7 +267,7 @@ export async function GET(req: NextRequest) {
           ]
         ),
       },
-    });
+    };
 
     return respond(payload, 500, auth, usage);
   }

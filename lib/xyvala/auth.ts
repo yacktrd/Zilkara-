@@ -1,16 +1,23 @@
 // lib/xyvala/auth.ts
 
 import { NextRequest, NextResponse } from "next/server";
+import {
+  findApiKeyRecord,
+  mapRecordTypeToAuthType,
+  type ApiKeyRecord,
+} from "@/lib/xyvala/api-keys";
+import type { ApiPlan } from "@/lib/xyvala/usage";
 
 export type ApiKeyType = "internal" | "public_demo" | "legacy";
-export type ApiPlan = "internal" | "demo" | "trader" | "pro" | "enterprise";
 
 export type ApiKeyAuthSuccess = {
   ok: true;
   key: string;
   keyType: ApiKeyType;
   plan: ApiPlan;
-  isInternal: boolean;
+  label: string;
+  keySource: "header" | "query";
+  record: ApiKeyRecord;
 };
 
 export type ApiKeyAuthFailure = {
@@ -18,7 +25,9 @@ export type ApiKeyAuthFailure = {
   key: null;
   keyType: null;
   plan: null;
-  isInternal: false;
+  label: null;
+  keySource: null;
+  record: null;
   error: "missing_api_key" | "invalid_api_key";
   status: 401;
 };
@@ -26,103 +35,70 @@ export type ApiKeyAuthFailure = {
 export type ApiKeyAuthResult = ApiKeyAuthSuccess | ApiKeyAuthFailure;
 
 const HEADER_NAME = "x-xyvala-key";
-
-type KeyDescriptor = {
-  value: string;
-  type: ApiKeyType;
-  plan: ApiPlan;
-};
+const QUERY_NAMES = ["api_key", "key", "x_key"] as const;
 
 function normalizeKey(value: string | null | undefined): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function getProvidedKey(req: NextRequest): string {
+function getHeaderKey(req: NextRequest): string {
   return normalizeKey(req.headers.get(HEADER_NAME));
 }
 
-function dedupeKeys(candidates: Array<KeyDescriptor | null>): KeyDescriptor[] {
-  const seen = new Set<string>();
-  const normalized: KeyDescriptor[] = [];
-
-  for (const item of candidates) {
-    if (!item) continue;
-    if (!item.value) continue;
-    if (seen.has(item.value)) continue;
-
-    seen.add(item.value);
-    normalized.push(item);
+function getQueryKey(req: NextRequest): string {
+  for (const name of QUERY_NAMES) {
+    const value = normalizeKey(req.nextUrl.searchParams.get(name));
+    if (value) return value;
   }
 
-  return normalized;
+  return "";
 }
 
-function getConfiguredKeys(): KeyDescriptor[] {
-  return dedupeKeys([
-    process.env.XYVALA_INTERNAL_KEY?.trim()
-      ? {
-          value: process.env.XYVALA_INTERNAL_KEY.trim(),
-          type: "internal",
-          plan: "internal",
-        }
-      : null,
+function getProvidedKey(req: NextRequest): {
+  key: string;
+  source: "header" | "query" | null;
+} {
+  const headerKey = getHeaderKey(req);
+  if (headerKey) {
+    return { key: headerKey, source: "header" };
+  }
 
-    process.env.XYVALA_PUBLIC_DEMO_KEY?.trim()
-      ? {
-          value: process.env.XYVALA_PUBLIC_DEMO_KEY.trim(),
-          type: "public_demo",
-          plan: "demo",
-        }
-      : null,
+  const queryKey = getQueryKey(req);
+  if (queryKey) {
+    return { key: queryKey, source: "query" };
+  }
 
-    process.env.XYVALA_API_KEY?.trim()
-      ? {
-          value: process.env.XYVALA_API_KEY.trim(),
-          type: "legacy",
-          plan: "trader",
-        }
-      : null,
-  ]);
+  return { key: "", source: null };
 }
 
 export function validateApiKey(req: NextRequest): ApiKeyAuthResult {
-  const providedKey = getProvidedKey(req);
+  const provided = getProvidedKey(req);
 
-  if (!providedKey) {
+  if (!provided.key || !provided.source) {
     return {
       ok: false,
       key: null,
       keyType: null,
       plan: null,
-      isInternal: false,
+      label: null,
+      keySource: null,
+      record: null,
       error: "missing_api_key",
       status: 401,
     };
   }
 
-  const configuredKeys = getConfiguredKeys();
+  const record = findApiKeyRecord(provided.key);
 
-  if (configuredKeys.length === 0) {
+  if (!record || !record.enabled) {
     return {
       ok: false,
       key: null,
       keyType: null,
       plan: null,
-      isInternal: false,
-      error: "invalid_api_key",
-      status: 401,
-    };
-  }
-
-  const matched = configuredKeys.find((entry) => entry.value === providedKey);
-
-  if (!matched) {
-    return {
-      ok: false,
-      key: null,
-      keyType: null,
-      plan: null,
-      isInternal: false,
+      label: null,
+      keySource: null,
+      record: null,
       error: "invalid_api_key",
       status: 401,
     };
@@ -130,17 +106,18 @@ export function validateApiKey(req: NextRequest): ApiKeyAuthResult {
 
   return {
     ok: true,
-    key: providedKey,
-    keyType: matched.type,
-    plan: matched.plan,
-    isInternal: matched.type === "internal",
+    key: record.key,
+    keyType: mapRecordTypeToAuthType(record.type),
+    plan: record.plan,
+    label: record.label,
+    keySource: provided.source,
+    record,
   };
 }
 
 /**
- * Couche de compatibilité + point d’entrée standard pour les routes API.
- * Aujourd’hui : s’appuie sur validateApiKey().
- * Demain : peut intégrer policy, plans, restrictions endpoint, allowlists, etc.
+ * Alias officiel possible pour garder la compatibilité
+ * avec les routes déjà migrées sur enforceApiPolicy().
  */
 export function enforceApiPolicy(req: NextRequest): ApiKeyAuthResult {
   return validateApiKey(req);
@@ -168,13 +145,13 @@ export function buildApiKeyErrorResponse(
 export function applyApiAuthHeaders(
   response: NextResponse,
   auth: ApiKeyAuthSuccess
-) {
+): NextResponse {
   response.headers.set("cache-control", "no-store");
   response.headers.set("x-xyvala-auth", "ok");
-  response.headers.set("x-xyvala-key-present", auth.key ? "true" : "false");
+  response.headers.set("x-xyvala-key-present", "true");
   response.headers.set("x-xyvala-key-type", auth.keyType);
   response.headers.set("x-xyvala-plan", auth.plan);
-  response.headers.set("x-xyvala-internal", auth.isInternal ? "true" : "false");
+  response.headers.set("x-xyvala-key-source", auth.keySource);
 
   return response;
 }
