@@ -1,6 +1,7 @@
 // lib/xyvala/usage.ts
 
 import { NextResponse } from "next/server";
+import type { ApiKeyType } from "@/lib/xyvala/api-keys";
 
 export type ApiPlan =
   | "internal"
@@ -9,17 +10,10 @@ export type ApiPlan =
   | "pro"
   | "enterprise";
 
-export type UsageKeyType =
-  | "internal"
-  | "public_demo"
-  | "legacy"
-  | "client"
-  | string;
-
 export type TrackUsageInput = {
   key?: string;
   apiKey?: string;
-  keyType?: UsageKeyType;
+  keyType?: ApiKeyType | string;
   endpoint?: string;
   planOverride?: ApiPlan | string;
 };
@@ -72,23 +66,22 @@ type UsageStoreEntry = {
   updatedAt: number;
   plan: ApiPlan;
   keyType: string;
+  key: string;
+  endpoint: string;
 };
 
-type EndpointUsageEntry = UsageStoreEntry & {
-  keys: Set<string>;
-};
-
-type UsageViewByKey = {
+export type UsageViewByKey = {
   key: string;
   plan: ApiPlan;
   keyType: string;
   totalCount: number;
   minuteCount: number;
   dayCount: number;
+  endpoints: number;
   updatedAt: number;
 };
 
-type UsageViewByEndpoint = {
+export type UsageViewByEndpoint = {
   endpoint: string;
   totalCount: number;
   minuteCount: number;
@@ -96,13 +89,25 @@ type UsageViewByEndpoint = {
   keys: number;
 };
 
-type UsageTotals = {
+export type UsageTotals = {
   totalKeys: number;
   totalEndpoints: number;
   totalUsageCount: number;
   totalMinuteCount: number;
   totalDayCount: number;
   quotaExceededKeys: number;
+};
+
+type UsageAggregateByKey = {
+  totalCount: number;
+  minuteCount: number;
+  dayCount: number;
+  endpoints: number;
+  updatedAt: number;
+  plan: ApiPlan;
+  keyType: string;
+  resetMinute: number;
+  resetDay: number;
 };
 
 const PLAN_LIMITS: Record<ApiPlan, { minute: number; day: number }> = {
@@ -114,20 +119,27 @@ const PLAN_LIMITS: Record<ApiPlan, { minute: number; day: number }> = {
 };
 
 const DEFAULT_ENDPOINT = "unknown";
+const USAGE_STORE_KEY_SEPARATOR = "::";
 
 /**
- * V1/V2 transitoire :
- * - stockage mémoire uniquement
- * - non persistant
- * - non multi-instance
- * - acceptable pour dev, preview, proto SaaS avancé
- *
- * Cible suivante :
- * - Redis / KV / stockage persistant
- * sans casser l’API publique du module.
+ * Nettoyage opportuniste mémoire.
+ * Garde le store sain sans casser la simplicité du mode mémoire.
  */
-const keyStore = new Map<string, UsageStoreEntry>();
-const endpointStore = new Map<string, EndpointUsageEntry>();
+const MEMORY_CLEANUP_INTERVAL_MS = 60_000;
+const STALE_ENTRY_TTL_MS = 3 * 24 * 60 * 60 * 1000;
+
+/**
+ * Source principale de vérité :
+ * une entrée par couple key:endpoint.
+ *
+ * Note :
+ * ce store mémoire reste adapté au dev, preview et proto avancé.
+ * Pour une prod monétisée multi-instance, la cible naturelle reste un store persistant
+ * (KV / Redis / Postgres).
+ */
+const usageStore = new Map<string, UsageStoreEntry>();
+
+let lastCleanupAt = 0;
 
 function nowTs(): string {
   return new Date().toISOString();
@@ -147,6 +159,10 @@ function normalizeEndpoint(value: unknown): string {
 
 function normalizeKey(input: TrackUsageInput): string {
   return safeStr(input.key) || safeStr(input.apiKey);
+}
+
+function buildUsageStoreKey(key: string, endpoint: string): string {
+  return `${key}${USAGE_STORE_KEY_SEPARATOR}${endpoint}`;
 }
 
 function resolvePlanFromKeyType(keyType: string): ApiPlan {
@@ -202,7 +218,13 @@ function ensureBucket(
   return bucket;
 }
 
-function createStoreEntry(plan: ApiPlan, keyType: string, currentMs: number): UsageStoreEntry {
+function createStoreEntry(
+  key: string,
+  endpoint: string,
+  plan: ApiPlan,
+  keyType: string,
+  currentMs: number
+): UsageStoreEntry {
   return {
     totalCount: 0,
     minute: {
@@ -216,84 +238,183 @@ function createStoreEntry(plan: ApiPlan, keyType: string, currentMs: number): Us
     updatedAt: currentMs,
     plan,
     keyType,
+    key,
+    endpoint,
   };
 }
 
-function createEndpointStoreEntry(
-  plan: ApiPlan,
-  keyType: string,
+function normalizeEntryForTime(
+  entry: UsageStoreEntry,
   currentMs: number
-): EndpointUsageEntry {
-  return {
-    ...createStoreEntry(plan, keyType, currentMs),
-    keys: new Set<string>(),
+): UsageStoreEntry {
+  const minute = ensureBucket(entry.minute, "minute", currentMs);
+  const day = ensureBucket(entry.day, "day", currentMs);
+
+  if (
+    minute.count === entry.minute.count &&
+    minute.resetAt === entry.minute.resetAt &&
+    day.count === entry.day.count &&
+    day.resetAt === entry.day.resetAt
+  ) {
+    return entry;
+  }
+
+  const normalized: UsageStoreEntry = {
+    ...entry,
+    minute,
+    day,
   };
+
+  usageStore.set(buildUsageStoreKey(entry.key, entry.endpoint), normalized);
+  return normalized;
 }
 
-function trackKeyEntry(
-  storeKey: string,
+function maybeCleanupUsageStore(currentMs: number): void {
+  if (currentMs - lastCleanupAt < MEMORY_CLEANUP_INTERVAL_MS) {
+    return;
+  }
+
+  lastCleanupAt = currentMs;
+
+  for (const [storeKey, rawEntry] of usageStore.entries()) {
+    const entry = normalizeEntryForTime(rawEntry, currentMs);
+
+    if (currentMs - entry.updatedAt > STALE_ENTRY_TTL_MS) {
+      usageStore.delete(storeKey);
+    }
+  }
+}
+
+function trackStoreEntry(
+  key: string,
+  endpoint: string,
   plan: ApiPlan,
   keyType: string,
   currentMs: number
 ): UsageStoreEntry {
-  const existing = keyStore.get(storeKey) ?? createStoreEntry(plan, keyType, currentMs);
+  maybeCleanupUsageStore(currentMs);
 
-  const minute = ensureBucket(existing.minute, "minute", currentMs);
-  const day = ensureBucket(existing.day, "day", currentMs);
+  const storeKey = buildUsageStoreKey(key, endpoint);
+
+  const existing =
+    usageStore.get(storeKey) ??
+    createStoreEntry(key, endpoint, plan, keyType, currentMs);
+
+  const normalizedExisting = normalizeEntryForTime(existing, currentMs);
 
   const updated: UsageStoreEntry = {
-    totalCount: existing.totalCount + 1,
+    totalCount: normalizedExisting.totalCount + 1,
     minute: {
-      count: minute.count + 1,
-      resetAt: minute.resetAt,
+      count: normalizedExisting.minute.count + 1,
+      resetAt: normalizedExisting.minute.resetAt,
     },
     day: {
-      count: day.count + 1,
-      resetAt: day.resetAt,
+      count: normalizedExisting.day.count + 1,
+      resetAt: normalizedExisting.day.resetAt,
     },
     updatedAt: currentMs,
     plan,
     keyType,
+    key,
+    endpoint,
   };
 
-  keyStore.set(storeKey, updated);
+  usageStore.set(storeKey, updated);
   return updated;
 }
 
-function trackEndpointEntry(
-  endpoint: string,
-  key: string,
-  plan: ApiPlan,
-  keyType: string,
-  currentMs: number
-): EndpointUsageEntry {
-  const existing =
-    endpointStore.get(endpoint) ?? createEndpointStoreEntry(plan, keyType, currentMs);
+function aggregateByKey(key: string, currentMs = nowMs()): UsageAggregateByKey {
+  let totalCount = 0;
+  let minuteCount = 0;
+  let dayCount = 0;
+  let endpoints = 0;
+  let updatedAt = 0;
+  let plan: ApiPlan = "trader";
+  let keyType = "legacy";
+  let resetMinute = 0;
+  let resetDay = 0;
 
-  const minute = ensureBucket(existing.minute, "minute", currentMs);
-  const day = ensureBucket(existing.day, "day", currentMs);
+  for (const rawEntry of usageStore.values()) {
+    if (rawEntry.key !== key) continue;
 
-  const keys = new Set(existing.keys);
-  keys.add(key);
+    const entry = normalizeEntryForTime(rawEntry, currentMs);
 
-  const updated: EndpointUsageEntry = {
-    totalCount: existing.totalCount + 1,
-    minute: {
-      count: minute.count + 1,
-      resetAt: minute.resetAt,
-    },
-    day: {
-      count: day.count + 1,
-      resetAt: day.resetAt,
-    },
-    updatedAt: currentMs,
+    totalCount += entry.totalCount;
+    minuteCount += entry.minute.count;
+    dayCount += entry.day.count;
+    endpoints += 1;
+
+    if (entry.updatedAt >= updatedAt) {
+      updatedAt = entry.updatedAt;
+      plan = entry.plan;
+      keyType = entry.keyType;
+    }
+
+    if (resetMinute === 0) {
+      resetMinute = entry.minute.resetAt;
+    } else {
+      resetMinute = Math.min(resetMinute, entry.minute.resetAt);
+    }
+
+    if (resetDay === 0) {
+      resetDay = entry.day.resetAt;
+    } else {
+      resetDay = Math.min(resetDay, entry.day.resetAt);
+    }
+  }
+
+  if (resetMinute === 0) {
+    resetMinute = getMinuteReset(currentMs);
+  }
+
+  if (resetDay === 0) {
+    resetDay = getDayReset(currentMs);
+  }
+
+  return {
+    totalCount,
+    minuteCount,
+    dayCount,
+    endpoints,
+    updatedAt,
     plan,
     keyType,
-    keys,
+    resetMinute,
+    resetDay,
   };
+}
 
-  endpointStore.set(endpoint, updated);
-  return updated;
+function aggregateByEndpoint(
+  endpoint: string,
+  currentMs = nowMs()
+): {
+  totalCount: number;
+  minuteCount: number;
+  dayCount: number;
+  keys: number;
+} {
+  let totalCount = 0;
+  let minuteCount = 0;
+  let dayCount = 0;
+  const keys = new Set<string>();
+
+  for (const rawEntry of usageStore.values()) {
+    if (rawEntry.endpoint !== endpoint) continue;
+
+    const entry = normalizeEntryForTime(rawEntry, currentMs);
+
+    totalCount += entry.totalCount;
+    minuteCount += entry.minute.count;
+    dayCount += entry.day.count;
+    keys.add(entry.key);
+  }
+
+  return {
+    totalCount,
+    minuteCount,
+    dayCount,
+    keys: keys.size,
+  };
 }
 
 function buildSnapshot(input: {
@@ -301,33 +422,35 @@ function buildSnapshot(input: {
   endpoint: string;
   plan: ApiPlan;
   keyType: string;
-  entry: UsageStoreEntry;
+  totalCount: number;
+  minuteCount: number;
+  dayCount: number;
+  resetMinute: number;
+  resetDay: number;
 }): UsageSnapshot {
   const limits = PLAN_LIMITS[input.plan];
 
-  const usageMinute = input.entry.minute.count;
-  const usageDay = input.entry.day.count;
+  const remainingMinute = Math.max(limits.minute - input.minuteCount, 0);
+  const remainingDay = Math.max(limits.day - input.dayCount, 0);
 
-  const remainingMinute = Math.max(limits.minute - usageMinute, 0);
-  const remainingDay = Math.max(limits.day - usageDay, 0);
-
-  const quotaExceeded = usageMinute >= limits.minute || usageDay >= limits.day;
+  const quotaExceeded =
+    input.minuteCount > limits.minute || input.dayCount > limits.day;
 
   return {
     key: input.key,
     endpoint: input.endpoint,
     plan: input.plan,
     keyType: input.keyType,
-    usageCount: input.entry.totalCount,
-    usageMinute,
-    usageDay,
+    usageCount: input.totalCount,
+    usageMinute: input.minuteCount,
+    usageDay: input.dayCount,
     quotaMinute: limits.minute,
     quotaDay: limits.day,
     remainingMinute,
     remainingDay,
     quotaExceeded,
-    resetMinute: input.entry.minute.resetAt,
-    resetDay: input.entry.day.resetAt,
+    resetMinute: input.resetMinute,
+    resetDay: input.resetDay,
     ts: nowTs(),
   };
 }
@@ -344,33 +467,26 @@ export function trackUsage(input: TrackUsageInput): UsageState {
 
   const currentMs = nowMs();
 
-  const keyEntry = trackKeyEntry(
-    key,
-    plan,
-    keyType,
-    currentMs
-  );
+  trackStoreEntry(key, endpoint, plan, keyType, currentMs);
 
-  trackEndpointEntry(
-    endpoint,
-    key,
-    plan,
-    keyType,
-    currentMs
-  );
+  const byKey = aggregateByKey(key, currentMs);
 
   const snapshot = buildSnapshot({
     key,
     endpoint,
-    plan,
-    keyType,
-    entry: keyEntry,
+    plan: byKey.plan,
+    keyType: byKey.keyType,
+    totalCount: byKey.totalCount,
+    minuteCount: byKey.minuteCount,
+    dayCount: byKey.dayCount,
+    resetMinute: byKey.resetMinute,
+    resetDay: byKey.resetDay,
   });
 
   return {
-    plan,
+    plan: snapshot.plan,
     key,
-    keyType,
+    keyType: snapshot.keyType,
     endpoint,
     usageCount: snapshot.usageCount,
     usageMinute: snapshot.usageMinute,
@@ -387,51 +503,83 @@ export function trackUsage(input: TrackUsageInput): UsageState {
 }
 
 export function listUsageByKey(): UsageViewByKey[] {
-  return Array.from(keyStore.entries())
-    .map(([key, entry]) => ({
-      key,
-      plan: entry.plan,
-      keyType: entry.keyType,
-      totalCount: entry.totalCount,
-      minuteCount: entry.minute.count,
-      dayCount: entry.day.count,
-      updatedAt: entry.updatedAt,
-    }))
+  const currentMs = nowMs();
+  maybeCleanupUsageStore(currentMs);
+
+  const keys = new Set<string>();
+
+  for (const entry of usageStore.values()) {
+    keys.add(entry.key);
+  }
+
+  return Array.from(keys)
+    .map((key) => {
+      const agg = aggregateByKey(key, currentMs);
+
+      return {
+        key,
+        plan: agg.plan,
+        keyType: agg.keyType,
+        totalCount: agg.totalCount,
+        minuteCount: agg.minuteCount,
+        dayCount: agg.dayCount,
+        endpoints: agg.endpoints,
+        updatedAt: agg.updatedAt,
+      };
+    })
     .sort((a, b) => b.totalCount - a.totalCount || b.updatedAt - a.updatedAt);
 }
 
 export function listUsageByEndpoint(): UsageViewByEndpoint[] {
-  return Array.from(endpointStore.entries())
-    .map(([endpoint, entry]) => ({
-      endpoint,
-      totalCount: entry.totalCount,
-      minuteCount: entry.minute.count,
-      dayCount: entry.day.count,
-      keys: entry.keys.size,
-    }))
-    .sort((a, b) => b.totalCount - a.totalCount || a.endpoint.localeCompare(b.endpoint));
+  const currentMs = nowMs();
+  maybeCleanupUsageStore(currentMs);
+
+  const endpoints = new Set<string>();
+
+  for (const entry of usageStore.values()) {
+    endpoints.add(entry.endpoint);
+  }
+
+  return Array.from(endpoints)
+    .map((endpoint) => {
+      const agg = aggregateByEndpoint(endpoint, currentMs);
+
+      return {
+        endpoint,
+        totalCount: agg.totalCount,
+        minuteCount: agg.minuteCount,
+        dayCount: agg.dayCount,
+        keys: agg.keys,
+      };
+    })
+    .sort(
+      (a, b) => b.totalCount - a.totalCount || a.endpoint.localeCompare(b.endpoint)
+    );
 }
 
 export function getUsageTotals(): UsageTotals {
+  const byKey = listUsageByKey();
+  const byEndpoint = listUsageByEndpoint();
+
   let totalUsageCount = 0;
   let totalMinuteCount = 0;
   let totalDayCount = 0;
   let quotaExceededKeys = 0;
 
-  for (const [, entry] of keyStore.entries()) {
-    totalUsageCount += entry.totalCount;
-    totalMinuteCount += entry.minute.count;
-    totalDayCount += entry.day.count;
+  for (const row of byKey) {
+    totalUsageCount += row.totalCount;
+    totalMinuteCount += row.minuteCount;
+    totalDayCount += row.dayCount;
 
-    const limits = PLAN_LIMITS[entry.plan];
-    if (entry.minute.count >= limits.minute || entry.day.count >= limits.day) {
+    const limits = PLAN_LIMITS[row.plan];
+    if (row.minuteCount > limits.minute || row.dayCount > limits.day) {
       quotaExceededKeys += 1;
     }
   }
 
   return {
-    totalKeys: keyStore.size,
-    totalEndpoints: endpointStore.size,
+    totalKeys: byKey.length,
+    totalEndpoints: byEndpoint.length,
     totalUsageCount,
     totalMinuteCount,
     totalDayCount,
@@ -445,19 +593,17 @@ export function applyQuotaHeaders(
 ): NextResponse {
   res.headers.set("x-xyvala-plan", usage.plan);
   res.headers.set("x-xyvala-endpoint", usage.endpoint);
-
   res.headers.set("x-xyvala-usage-count", String(usage.usageCount));
-
   res.headers.set("x-xyvala-usage-minute", String(usage.usageMinute));
   res.headers.set("x-xyvala-usage-day", String(usage.usageDay));
-
   res.headers.set("x-xyvala-quota-minute", String(usage.quotaMinute));
   res.headers.set("x-xyvala-quota-day", String(usage.quotaDay));
-
   res.headers.set("x-xyvala-remaining-minute", String(usage.remainingMinute));
   res.headers.set("x-xyvala-remaining-day", String(usage.remainingDay));
-
-  res.headers.set("x-xyvala-quota-exceeded", usage.quotaExceeded ? "true" : "false");
+  res.headers.set(
+    "x-xyvala-quota-exceeded",
+    usage.quotaExceeded ? "true" : "false"
+  );
   res.headers.set("x-xyvala-reset-minute", String(usage.resetMinute));
   res.headers.set("x-xyvala-reset-day", String(usage.resetDay));
 

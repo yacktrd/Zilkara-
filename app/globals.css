@@ -62,7 +62,7 @@ body {
   --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
 
   /* Layout */
-  --maxw: 720px; /* mobile-first, still good on desktop */
+  --maxw: 1280px; /* mobile-first, still good on desktop */
 }
 
 /* 4) Tokens — Light theme (default) */

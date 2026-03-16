@@ -1,239 +1,350 @@
 // lib/xyvala/runtime-config.ts
 
-import "server-only";
-import { headers } from "next/headers";
-
-export type XyvalaAppEnv = "development" | "preview" | "production";
+import type { ApiPlan } from "@/lib/xyvala/usage";
 
 export type XyvalaRuntimeConfig = {
-  appEnv: XyvalaAppEnv;
-  nodeEnv: string;
-  isDev: boolean;
-  isPreview: boolean;
-  isProd: boolean;
+  version: number;
 
-  siteUrl: string | null;
-  apiBaseUrl: string | null;
+  flags: {
+    enableMarketStatePanel: boolean;
+    enableAdminRoutes: boolean;
+    enableSecondaryEnrichment: boolean;
+    degradedModeEnabled: boolean;
+  };
 
-  defaultQuote: string;
-  defaultSort: string;
-  defaultLimit: number;
-  requestTimeoutMs: number;
+  timeouts: {
+    internalApiMs: number;
+    marketStateMs: number;
+  };
 
-  hasRequiredApiKeys: boolean;
-  warnings: string[];
+  scan: {
+    defaultQuote: "usd" | "usdt" | "eur";
+    defaultSort: string;
+    defaultLimit: number;
+    maxLimit: number;
+  };
+
+  cache: {
+    stateTtlMs: number;
+    contextTtlMs: number;
+  };
+
+  plans: Record<
+    ApiPlan,
+    {
+      scanLimit: number;
+      marketStateEnabled: boolean;
+    }
+  >;
 };
 
-type RuntimeConfigOptions = {
-  requestHeaders?: Headers | null;
-};
+const DEFAULT_CONFIG = Object.freeze({
+  version: 1,
 
-const DEFAULT_QUOTE = "usd";
-const DEFAULT_SORT = "score_desc";
-const DEFAULT_LIMIT = 100;
-const MAX_LIMIT = 250;
-const DEFAULT_TIMEOUT_MS = 6000;
-const MAX_TIMEOUT_MS = 20000;
+  flags: {
+    enableMarketStatePanel: true,
+    enableAdminRoutes: true,
+    enableSecondaryEnrichment: true,
+    degradedModeEnabled: false,
+  },
 
-function safeString(value: unknown): string {
+  timeouts: {
+    internalApiMs: 6000,
+    marketStateMs: 3500,
+  },
+
+  scan: {
+    defaultQuote: "usd",
+    defaultSort: "score_desc",
+    defaultLimit: 100,
+    maxLimit: 200,
+  },
+
+  cache: {
+    stateTtlMs: 30_000,
+    contextTtlMs: 30_000,
+  },
+
+  plans: {
+    internal: {
+      scanLimit: 500,
+      marketStateEnabled: true,
+    },
+    demo: {
+      scanLimit: 25,
+      marketStateEnabled: true,
+    },
+    trader: {
+      scanLimit: 100,
+      marketStateEnabled: true,
+    },
+    pro: {
+      scanLimit: 200,
+      marketStateEnabled: true,
+    },
+    enterprise: {
+      scanLimit: 500,
+      marketStateEnabled: true,
+    },
+  },
+} satisfies XyvalaRuntimeConfig);
+
+function safeStr(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function lower(value: unknown): string {
-  return safeString(value).toLowerCase();
-}
-
-function normalizePositiveInt(
+function safeInt(
   value: unknown,
   fallback: number,
-  min: number,
-  max: number
+  min?: number,
+  max?: number
 ): number {
-  const raw = safeString(value);
-  const parsed = Number.parseInt(raw, 10);
+  const parsed =
+    typeof value === "number"
+      ? value
+      : typeof value === "string"
+        ? Number.parseInt(value.trim(), 10)
+        : Number.NaN;
 
-  if (!Number.isFinite(parsed)) return fallback;
-  if (parsed < min) return min;
-  if (parsed > max) return max;
-
-  return parsed;
-}
-
-function normalizeUrl(value: unknown): string | null {
-  const raw = safeString(value);
-  if (!raw) return null;
-
-  try {
-    const url = new URL(raw);
-    return url.origin;
-  } catch {
-    return null;
-  }
-}
-
-function normalizeHostLikeOrigin(
-  host: string,
-  proto?: string | null
-): string | null {
-  const cleanHost = safeString(host);
-  if (!cleanHost) return null;
-
-  const protocol =
-    safeString(proto) ||
-    (cleanHost.includes("localhost") || cleanHost.startsWith("127.0.0.1")
-      ? "http"
-      : "https");
-
-  try {
-    return new URL(`${protocol}://${cleanHost}`).origin;
-  } catch {
-    return null;
-  }
-}
-
-function detectAppEnv(): XyvalaAppEnv {
-  const vercelEnv = lower(process.env.VERCEL_ENV);
-  const nodeEnv = lower(process.env.NODE_ENV);
-
-  if (vercelEnv === "production") return "production";
-  if (vercelEnv === "preview") return "preview";
-  if (nodeEnv === "production") return "production";
-
-  return "development";
-}
-
-function resolveExplicitSiteUrl(): string | null {
-  return (
-    normalizeUrl(process.env.XYVALA_SITE_URL) ??
-    normalizeUrl(process.env.NEXT_PUBLIC_SITE_URL) ??
-    normalizeUrl(process.env.NEXT_PUBLIC_APP_URL) ??
-    normalizeUrl(process.env.APP_URL) ??
-    normalizeUrl(process.env.SITE_URL)
-  );
-}
-
-function resolveExplicitApiBaseUrl(): string | null {
-  return (
-    normalizeUrl(process.env.XYVALA_API_BASE_URL) ??
-    normalizeUrl(process.env.NEXT_PUBLIC_API_BASE_URL) ??
-    normalizeUrl(process.env.API_BASE_URL)
-  );
-}
-
-function resolveFromVercel(): string | null {
-  const url =
-    safeString(process.env.VERCEL_PROJECT_PRODUCTION_URL) ||
-    safeString(process.env.VERCEL_URL);
-
-  if (!url) return null;
-
-  const host = url.replace(/^https?:\/\//i, "");
-  return normalizeHostLikeOrigin(host, "https");
-}
-
-function buildWarnings(input: {
-  siteUrl: string | null;
-  apiBaseUrl: string | null;
-  hasRequiredApiKeys: boolean;
-}): string[] {
-  const warnings: string[] = [];
-
-  if (!input.siteUrl) {
-    warnings.push("runtime_site_url_unresolved");
+  if (!Number.isFinite(parsed)) {
+    return fallback;
   }
 
-  if (!input.apiBaseUrl) {
-    warnings.push("runtime_api_base_url_unresolved");
-  }
+  let result = Math.trunc(parsed);
 
-  if (!input.hasRequiredApiKeys) {
-    warnings.push("runtime_missing_required_api_keys");
-  }
+  if (typeof min === "number") result = Math.max(min, result);
+  if (typeof max === "number") result = Math.min(max, result);
 
-  return warnings;
+  return result;
 }
 
-/**
- * Version pure :
- * - ne lit pas headers()
- * - utile dans les routes où tu as déjà les headers
- */
-export function buildRuntimeConfig(
-  options: RuntimeConfigOptions = {}
-): XyvalaRuntimeConfig {
-  const appEnv = detectAppEnv();
-  const nodeEnv = safeString(process.env.NODE_ENV) || "development";
-  const isDev = appEnv === "development";
-  const isPreview = appEnv === "preview";
-  const isProd = appEnv === "production";
+function safeBool(value: unknown, fallback: boolean): boolean {
+  if (typeof value === "boolean") return value;
 
-  const explicitSiteUrl = resolveExplicitSiteUrl();
-  const explicitApiBaseUrl = resolveExplicitApiBaseUrl();
-  const vercelOrigin = resolveFromVercel();
+  const normalized = safeStr(value).toLowerCase();
 
-  const requestHeaders = options.requestHeaders ?? null;
+  if (
+    normalized === "true" ||
+    normalized === "1" ||
+    normalized === "yes" ||
+    normalized === "on"
+  ) {
+    return true;
+  }
 
-  const forwardedHost = requestHeaders?.get("x-forwarded-host") ?? "";
-  const host = forwardedHost || requestHeaders?.get("host") || "";
-  const forwardedProto = requestHeaders?.get("x-forwarded-proto") ?? "";
+  if (
+    normalized === "false" ||
+    normalized === "0" ||
+    normalized === "no" ||
+    normalized === "off"
+  ) {
+    return false;
+  }
 
-  const requestOrigin = normalizeHostLikeOrigin(host, forwardedProto);
+  return fallback;
+}
 
-  const siteUrl = explicitSiteUrl ?? vercelOrigin ?? requestOrigin;
-  const apiBaseUrl = explicitApiBaseUrl ?? siteUrl;
+function safeQuote(
+  value: unknown,
+  fallback: XyvalaRuntimeConfig["scan"]["defaultQuote"]
+): XyvalaRuntimeConfig["scan"]["defaultQuote"] {
+  const normalized = safeStr(value).toLowerCase();
 
-  const defaultQuote = lower(process.env.XYVALA_DEFAULT_QUOTE) || DEFAULT_QUOTE;
-  const defaultSort = safeString(process.env.XYVALA_DEFAULT_SORT) || DEFAULT_SORT;
+  if (normalized === "usd" || normalized === "usdt" || normalized === "eur") {
+    return normalized;
+  }
 
-  const defaultLimit = normalizePositiveInt(
-    process.env.XYVALA_DEFAULT_LIMIT,
-    DEFAULT_LIMIT,
-    1,
-    MAX_LIMIT
-  );
+  return fallback;
+}
 
-  const requestTimeoutMs = normalizePositiveInt(
-    process.env.XYVALA_REQUEST_TIMEOUT_MS,
-    DEFAULT_TIMEOUT_MS,
-    1000,
-    MAX_TIMEOUT_MS
-  );
-
-  const hasRequiredApiKeys = Boolean(
-    safeString(process.env.COINGECKO_API_KEY) ||
-      safeString(process.env.XYVALA_API_KEY) ||
-      safeString(process.env.NEXT_PUBLIC_XYVALA_API_KEY)
-  );
-
-  const warnings = buildWarnings({
-    siteUrl,
-    apiBaseUrl,
-    hasRequiredApiKeys,
-  });
-
+function cloneDefaultConfig(): XyvalaRuntimeConfig {
   return {
-    appEnv,
-    nodeEnv,
-    isDev,
-    isPreview,
-    isProd,
-    siteUrl,
-    apiBaseUrl,
-    defaultQuote,
-    defaultSort,
-    defaultLimit,
-    requestTimeoutMs,
-    hasRequiredApiKeys,
-    warnings,
+    version: DEFAULT_CONFIG.version,
+
+    flags: {
+      ...DEFAULT_CONFIG.flags,
+    },
+
+    timeouts: {
+      ...DEFAULT_CONFIG.timeouts,
+    },
+
+    scan: {
+      ...DEFAULT_CONFIG.scan,
+    },
+
+    cache: {
+      ...DEFAULT_CONFIG.cache,
+    },
+
+    plans: {
+      internal: { ...DEFAULT_CONFIG.plans.internal },
+      demo: { ...DEFAULT_CONFIG.plans.demo },
+      trader: { ...DEFAULT_CONFIG.plans.trader },
+      pro: { ...DEFAULT_CONFIG.plans.pro },
+      enterprise: { ...DEFAULT_CONFIG.plans.enterprise },
+    },
   };
 }
 
-/**
- * Version App Router :
- * - lit headers() proprement
- * - à utiliser dans page.tsx / layout.tsx / server helpers
- */
-export async function getRuntimeConfig(): Promise<XyvalaRuntimeConfig> {
-  const requestHeaders = await headers();
-  return buildRuntimeConfig({ requestHeaders });
+function loadConfigFromEnv(base: XyvalaRuntimeConfig): XyvalaRuntimeConfig {
+  const next = cloneDefaultConfig();
+
+  next.version = safeInt(process.env.XYVALA_CONFIG_VERSION, base.version, 1);
+
+  next.flags.enableMarketStatePanel = safeBool(
+    process.env.XYVALA_ENABLE_MARKET_STATE_PANEL,
+    base.flags.enableMarketStatePanel
+  );
+
+  next.flags.enableAdminRoutes = safeBool(
+    process.env.XYVALA_ENABLE_ADMIN_ROUTES,
+    base.flags.enableAdminRoutes
+  );
+
+  next.flags.enableSecondaryEnrichment = safeBool(
+    process.env.XYVALA_ENABLE_SECONDARY_ENRICHMENT,
+    base.flags.enableSecondaryEnrichment
+  );
+
+  next.flags.degradedModeEnabled = safeBool(
+    process.env.XYVALA_DEGRADED_MODE,
+    base.flags.degradedModeEnabled
+  );
+
+  next.timeouts.internalApiMs = safeInt(
+    process.env.XYVALA_INTERNAL_API_TIMEOUT_MS,
+    base.timeouts.internalApiMs,
+    1000,
+    30000
+  );
+
+  next.timeouts.marketStateMs = safeInt(
+    process.env.XYVALA_MARKET_STATE_TIMEOUT_MS,
+    base.timeouts.marketStateMs,
+    1000,
+    15000
+  );
+
+  next.scan.defaultQuote = safeQuote(
+    process.env.XYVALA_SCAN_DEFAULT_QUOTE,
+    base.scan.defaultQuote
+  );
+
+  next.scan.defaultSort =
+    safeStr(process.env.XYVALA_SCAN_DEFAULT_SORT) || base.scan.defaultSort;
+
+  next.scan.defaultLimit = safeInt(
+    process.env.XYVALA_SCAN_DEFAULT_LIMIT,
+    base.scan.defaultLimit,
+    1,
+    1000
+  );
+
+  next.scan.maxLimit = safeInt(
+    process.env.XYVALA_SCAN_MAX_LIMIT,
+    base.scan.maxLimit,
+    1,
+    5000
+  );
+
+  next.cache.stateTtlMs = safeInt(
+    process.env.XYVALA_STATE_TTL_MS,
+    base.cache.stateTtlMs,
+    1000,
+    300000
+  );
+
+  next.cache.contextTtlMs = safeInt(
+    process.env.XYVALA_CONTEXT_TTL_MS,
+    base.cache.contextTtlMs,
+    1000,
+    300000
+  );
+
+  next.plans.internal.scanLimit = safeInt(
+    process.env.XYVALA_PLAN_INTERNAL_SCAN_LIMIT,
+    base.plans.internal.scanLimit,
+    1,
+    5000
+  );
+
+  next.plans.demo.scanLimit = safeInt(
+    process.env.XYVALA_PLAN_DEMO_SCAN_LIMIT,
+    base.plans.demo.scanLimit,
+    1,
+    next.scan.maxLimit
+  );
+
+  next.plans.trader.scanLimit = safeInt(
+    process.env.XYVALA_PLAN_TRADER_SCAN_LIMIT,
+    base.plans.trader.scanLimit,
+    1,
+    next.scan.maxLimit
+  );
+
+  next.plans.pro.scanLimit = safeInt(
+    process.env.XYVALA_PLAN_PRO_SCAN_LIMIT,
+    base.plans.pro.scanLimit,
+    1,
+    next.scan.maxLimit
+  );
+
+  next.plans.enterprise.scanLimit = safeInt(
+    process.env.XYVALA_PLAN_ENTERPRISE_SCAN_LIMIT,
+    base.plans.enterprise.scanLimit,
+    1,
+    5000
+  );
+
+  next.plans.internal.marketStateEnabled = safeBool(
+    process.env.XYVALA_PLAN_INTERNAL_MARKET_STATE_ENABLED,
+    base.plans.internal.marketStateEnabled
+  );
+
+  next.plans.demo.marketStateEnabled = safeBool(
+    process.env.XYVALA_PLAN_DEMO_MARKET_STATE_ENABLED,
+    base.plans.demo.marketStateEnabled
+  );
+
+  next.plans.trader.marketStateEnabled = safeBool(
+    process.env.XYVALA_PLAN_TRADER_MARKET_STATE_ENABLED,
+    base.plans.trader.marketStateEnabled
+  );
+
+  next.plans.pro.marketStateEnabled = safeBool(
+    process.env.XYVALA_PLAN_PRO_MARKET_STATE_ENABLED,
+    base.plans.pro.marketStateEnabled
+  );
+
+  next.plans.enterprise.marketStateEnabled = safeBool(
+    process.env.XYVALA_PLAN_ENTERPRISE_MARKET_STATE_ENABLED,
+    base.plans.enterprise.marketStateEnabled
+  );
+
+  return next;
+}
+
+let cachedRuntimeConfig: XyvalaRuntimeConfig | null = null;
+
+export function getRuntimeConfig(): XyvalaRuntimeConfig {
+  if (cachedRuntimeConfig) {
+    return cachedRuntimeConfig;
+  }
+
+  cachedRuntimeConfig = loadConfigFromEnv(cloneDefaultConfig());
+  return cachedRuntimeConfig;
+}
+
+export function refreshRuntimeConfig(): XyvalaRuntimeConfig {
+  cachedRuntimeConfig = loadConfigFromEnv(cloneDefaultConfig());
+  return cachedRuntimeConfig;
+}
+
+export function clearRuntimeConfigCache(): void {
+  cachedRuntimeConfig = null;
+}
+
+export function getRuntimeConfigVersion(): number {
+  return getRuntimeConfig().version;
 }

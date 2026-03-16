@@ -17,6 +17,11 @@ import {
   setToCache,
   type ScanSnapshot,
 } from "@/lib/xyvala/snapshot";
+import {
+  resolveAccessScope,
+  buildAccessMeta,
+} from "@/lib/xyvala/access";
+import type { AccessMeta } from "@/lib/xyvala/access";
 import type { JsonRecord, JsonValue } from "@/lib/xyvala/json";
 
 export const runtime = "nodejs";
@@ -49,6 +54,7 @@ type ContextResponse = {
     context_cache_key: string;
     cache: "hit" | "miss" | "no-store";
     warnings: string[];
+    access: AccessMeta;
   };
 };
 
@@ -131,6 +137,11 @@ function buildContextResponse(
       context_cache_key: input.meta?.context_cache_key ?? "",
       cache: input.meta?.cache ?? "miss",
       warnings: input.meta?.warnings ?? [],
+      access: input.meta?.access ?? {
+        compartment: "public_10",
+        visiblePercent: 10,
+        maxAssets: 10,
+      },
     },
   };
 }
@@ -282,6 +293,8 @@ function respond(
       "cache-control": "no-store",
       "x-xyvala-version": XYVALA_VERSION,
       "x-xyvala-cache": payload.meta.cache,
+      "x-xyvala-access-compartment": payload.meta.access.compartment,
+      "x-xyvala-visible-percent": String(payload.meta.access.visiblePercent),
     },
   });
 
@@ -301,6 +314,9 @@ export async function GET(req: NextRequest) {
   if (!auth.ok) {
     return buildApiKeyErrorResponse(auth.error, auth.status);
   }
+
+  const accessScope = resolveAccessScope(auth);
+  const accessMeta = buildAccessMeta(accessScope);
 
   let usage: UsageResult = null;
   let usageWarnings: string[] = [];
@@ -324,11 +340,34 @@ export async function GET(req: NextRequest) {
     const warnings: string[] = [...usageWarnings];
     const noStore = parseBool(req.nextUrl.searchParams.get("noStore"));
 
+    if (!accessScope.showMarketContext) {
+      const res = buildContextResponse({
+        ok: true,
+        ts,
+        market_regime: null,
+        stable_ratio: null,
+        transition_ratio: null,
+        volatile_ratio: null,
+        message: "context_hidden_by_access_compartment",
+        error: null,
+        source: "context_cache",
+        meta: {
+          scan_cache_key: "",
+          context_cache_key: "",
+          cache: noStore ? "no-store" : "miss",
+          warnings: uniqueWarnings(warnings, ["context_hidden_by_access_compartment"]),
+          access: accessMeta,
+        },
+      });
+
+      return respond(res, 200, auth, usage);
+    }
+
     const { scan_cache_key, snapshot, source } = await getOrRebuildScanSnapshot(
       warnings
     );
 
-    const context_cache_key = `xyvala:context:${XYVALA_VERSION}:scan=${scan_cache_key}`;
+    const context_cache_key = `xyvala:context:${XYVALA_VERSION}:scan=${scan_cache_key}:access=${accessMeta.compartment}`;
 
     if (!noStore) {
       const cachedContext = getFromCache<ContextResponse>(context_cache_key, TTL_MS);
@@ -342,6 +381,7 @@ export async function GET(req: NextRequest) {
             ...cachedContext.meta,
             cache: "hit",
             warnings: uniqueWarnings(cachedContext.meta.warnings, warnings),
+            access: accessMeta,
           },
         });
 
@@ -365,6 +405,7 @@ export async function GET(req: NextRequest) {
           context_cache_key,
           cache: noStore ? "no-store" : "miss",
           warnings,
+          access: accessMeta,
         },
       });
 
@@ -388,6 +429,7 @@ export async function GET(req: NextRequest) {
         context_cache_key,
         cache: noStore ? "no-store" : "miss",
         warnings,
+        access: accessMeta,
       },
     });
 
@@ -422,6 +464,7 @@ export async function GET(req: NextRequest) {
               : "route_exception",
           ]
         ),
+        access: accessMeta,
       },
     });
 

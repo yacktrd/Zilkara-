@@ -13,8 +13,16 @@ import {
 import {
   getScanService,
   type ScanServiceResult,
+  type ScanServiceItem,
 } from "@/lib/xyvala/services/scan-service";
-import type { Quote, Regime, ScanAsset } from "@/lib/xyvala/snapshot";
+import {
+  resolveAccessScope,
+  applyScanCompartment,
+  buildAccessMeta,
+} from "@/lib/xyvala/access";
+import type { AccessMeta } from "@/lib/xyvala/access";
+import type { Quote } from "@/lib/xyvala/snapshot";
+import type { Regime, ScanAsset } from "@/lib/xyvala/contracts/scan-contract";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -47,11 +55,13 @@ type ScanResponse = {
   };
   meta: {
     limit: number;
+    applied_limit: number;
     sort: SortKey;
     order: SortOrder;
     q: string | null;
     cache: "hit" | "miss" | "no-store";
     warnings: string[];
+    access: AccessMeta;
   };
   error: string | null;
 };
@@ -60,6 +70,16 @@ const nowIso = () => new Date().toISOString();
 
 function safeStr(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function safeNullableNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function safeNullableString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0
+    ? value.trim()
+    : null;
 }
 
 function normalizeQuote(value: string | null): Quote {
@@ -76,17 +96,30 @@ function normalizeSort(value: string | null): {
 } {
   const s = safeStr(value).toLowerCase();
 
-  if (s === "price") return { sort: "price", order: "desc", sortLabel: "price_desc" };
-  if (s === "price_desc") return { sort: "price", order: "desc", sortLabel: "price_desc" };
-  if (s === "price_asc") return { sort: "price", order: "asc", sortLabel: "price_asc" };
-  if (s === "score_asc") return { sort: "score", order: "asc", sortLabel: "score_asc" };
+  if (s === "price") {
+    return { sort: "price", order: "desc", sortLabel: "price_desc" };
+  }
+
+  if (s === "price_desc") {
+    return { sort: "price", order: "desc", sortLabel: "price_desc" };
+  }
+
+  if (s === "price_asc") {
+    return { sort: "price", order: "asc", sortLabel: "price_asc" };
+  }
+
+  if (s === "score_asc") {
+    return { sort: "score", order: "asc", sortLabel: "score_asc" };
+  }
 
   return { sort: "score", order: "desc", sortLabel: "score_desc" };
 }
 
 function parseLimit(value: string | null): number {
   const parsed = Number(value);
+
   if (!Number.isFinite(parsed)) return 100;
+
   return Math.max(1, Math.min(250, Math.trunc(parsed)));
 }
 
@@ -97,7 +130,28 @@ function parseBool(value: string | null): boolean {
 
 function uniqueWarnings(...groups: Array<string[] | undefined | null>): string[] {
   const merged = groups.flatMap((group) => (Array.isArray(group) ? group : []));
-  return [...new Set(merged.filter((item) => typeof item === "string" && item.trim().length > 0))];
+  return [
+    ...new Set(
+      merged.filter((item) => typeof item === "string" && item.trim().length > 0)
+    ),
+  ];
+}
+
+function toApiAsset(item: ScanServiceItem): ScanAsset {
+  return {
+    id: item.id,
+    symbol: item.symbol,
+    name: item.name,
+    price: item.price,
+    chg_24h_pct: item.chg_24h_pct,
+    confidence_score: item.confidence_score,
+    score_delta: safeNullableNumber(item.score_delta),
+    score_trend: safeNullableString(item.score_trend),
+    regime: item.regime,
+    market_cap: item.market_cap,
+    volume_24h: item.volume_24h,
+    binance_url: item.binance_url,
+  };
 }
 
 function computeContext(data: ScanAsset[]) {
@@ -142,7 +196,10 @@ function toApiSource(source: ScanServiceResult["source"]): "scan" | "fallback" |
   return "scan";
 }
 
-function toApiCache(source: ScanServiceResult["source"], noStore: boolean): "hit" | "miss" | "no-store" {
+function toApiCache(
+  source: ScanServiceResult["source"],
+  noStore: boolean
+): "hit" | "miss" | "no-store" {
   if (noStore) return "no-store";
   return source === "scan_cache" ? "hit" : "miss";
 }
@@ -152,14 +209,39 @@ function buildResponse(input: {
   quote: Quote;
   sort: SortKey;
   order: SortOrder;
-  sortLabel: string;
-  limit: number;
+  requestedLimit: number;
+  appliedLimit: number;
   q: string | null;
   noStore: boolean;
   service: ScanServiceResult;
+  access: AccessMeta;
   usageWarnings?: string[];
 }): ScanResponse {
-  const context = computeContext(input.service.data);
+  const compartmentedData = applyScanCompartment(
+    input.service.data.map(toApiAsset),
+    {
+      compartment: input.access.compartment,
+      visiblePercent: input.access.visiblePercent,
+      maxAssets: input.access.maxAssets,
+      showScoreDelta:
+        input.access.compartment === "trader_60" ||
+        input.access.compartment === "full_100",
+      showScoreTrend:
+        input.access.compartment !== "public_10",
+      showMarketContext:
+        input.access.compartment !== "public_10",
+      showAdvancedStats:
+        input.access.compartment === "trader_60" ||
+        input.access.compartment === "full_100",
+      showHistory:
+        input.access.compartment === "trader_60" ||
+        input.access.compartment === "full_100",
+      showDecision: input.access.compartment === "full_100",
+      showAdmin: input.access.compartment === "full_100",
+    }
+  );
+
+  const context = computeContext(compartmentedData);
 
   return {
     ok: input.service.ok,
@@ -168,16 +250,18 @@ function buildResponse(input: {
     source: toApiSource(input.service.source),
     market: "crypto",
     quote: input.quote,
-    count: input.service.count,
-    data: input.service.data,
+    count: compartmentedData.length,
+    data: compartmentedData,
     context,
     meta: {
-      limit: input.limit,
+      limit: input.requestedLimit,
+      applied_limit: input.appliedLimit,
       sort: input.sort,
       order: input.order,
       q: input.q,
       cache: toApiCache(input.service.source, input.noStore),
       warnings: uniqueWarnings(input.service.warnings, input.usageWarnings),
+      access: input.access,
     },
     error: input.service.error,
   };
@@ -195,6 +279,8 @@ function respond(
       "cache-control": "no-store",
       "x-xyvala-version": XYVALA_VERSION,
       "x-xyvala-cache": payload.meta.cache,
+      "x-xyvala-access-compartment": payload.meta.access.compartment,
+      "x-xyvala-visible-percent": String(payload.meta.access.visiblePercent),
     },
   });
 
@@ -214,6 +300,9 @@ export async function GET(req: NextRequest) {
   if (!auth.ok) {
     return buildApiKeyErrorResponse(auth.error, auth.status);
   }
+
+  const accessScope = resolveAccessScope(auth);
+  const accessMeta = buildAccessMeta(accessScope);
 
   let usage: UsageResult = null;
   let usageWarnings: string[] = [];
@@ -238,14 +327,16 @@ export async function GET(req: NextRequest) {
 
     const quote = normalizeQuote(sp.get("quote"));
     const { sort, order, sortLabel } = normalizeSort(sp.get("sort"));
-    const limit = parseLimit(sp.get("limit"));
+    const requestedLimit = parseLimit(sp.get("limit"));
     const q = safeStr(sp.get("q")).toLowerCase() || null;
     const noStore = parseBool(sp.get("noStore"));
+
+    const appliedLimit = Math.min(requestedLimit, accessScope.maxAssets);
 
     const service = await getScanService({
       quote,
       sort: sortLabel,
-      limit,
+      limit: appliedLimit,
       q,
       noStore,
     });
@@ -255,11 +346,12 @@ export async function GET(req: NextRequest) {
       quote,
       sort,
       order,
-      sortLabel,
-      limit,
+      requestedLimit,
+      appliedLimit,
       q,
       noStore,
       service,
+      access: accessMeta,
       usageWarnings,
     });
 
@@ -284,6 +376,7 @@ export async function GET(req: NextRequest) {
       },
       meta: {
         limit: 0,
+        applied_limit: 0,
         sort: "score",
         order: "desc",
         q: null,
@@ -296,6 +389,7 @@ export async function GET(req: NextRequest) {
               : "route_exception",
           ]
         ),
+        access: accessMeta,
       },
       error:
         error instanceof Error && error.message

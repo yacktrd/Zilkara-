@@ -11,6 +11,7 @@ export type ApiKeyRecordType =
 export type ApiKeyType =
   | "internal"
   | "public_demo"
+  | "client"
   | "legacy";
 
 export type ApiKeySource = "env" | "registry";
@@ -38,7 +39,13 @@ type BuildApiKeyRecordInput = {
   keySource?: ApiKeySource;
 };
 
-let cachedRecords: ApiKeyRecord[] | null = null;
+type RegistryLoadResult = {
+  records: ApiKeyRecord[];
+};
+
+let cachedRegistry: RegistryLoadResult | null = null;
+
+const EPOCH_ISO = new Date(0).toISOString();
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -49,7 +56,13 @@ function safeStr(value: unknown): string {
 }
 
 function normalizeKey(value: unknown): string {
-  return safeStr(value);
+  const normalized = safeStr(value);
+
+  if (!normalized) return "";
+  if (normalized.includes(" ")) return "";
+  if (normalized.length < 8) return "";
+
+  return normalized;
 }
 
 function normalizeLabel(value: unknown, fallback: string): string {
@@ -65,7 +78,28 @@ function normalizeIsoDate(value: unknown, fallback: string): string {
   return Number.isNaN(parsed.getTime()) ? fallback : parsed.toISOString();
 }
 
+function normalizePlanForType(type: ApiKeyRecordType, plan: ApiPlan): ApiPlan {
+  if (type === "internal") return "internal";
+  if (type === "public_demo") return "demo";
+  if (type === "legacy" && plan === "internal") return "trader";
+  return plan;
+}
+
+function buildKeyFingerprint(key: string): string {
+  const source = normalizeKey(key);
+  if (!source) return "invalid";
+
+  let hash = 0;
+
+  for (let i = 0; i < source.length; i += 1) {
+    hash = (hash * 31 + source.charCodeAt(i)) >>> 0;
+  }
+
+  return hash.toString(36).padStart(7, "0");
+}
+
 function buildRecordId(input: {
+  key: string;
   type: ApiKeyRecordType;
   plan: ApiPlan;
   label: string;
@@ -76,32 +110,25 @@ function buildRecordId(input: {
     .replace(/^-+|-+$/g, "")
     .slice(0, 40);
 
-  return `${input.type}:${input.plan}:${normalizedLabel || "key"}`;
+  const fingerprint = buildKeyFingerprint(input.key);
+
+  return `${input.type}:${input.plan}:${normalizedLabel || "key"}:${fingerprint}`;
 }
 
 function cloneRecord(record: ApiKeyRecord): ApiKeyRecord {
   return { ...record };
 }
 
-function normalizePlanForType(type: ApiKeyRecordType, plan: ApiPlan): ApiPlan {
-  if (type === "internal") return "internal";
-  if (type === "public_demo") return "demo";
-  if (type === "legacy" && plan === "internal") return "trader";
-  return plan;
-}
-
 function buildApiKeyRecord(input: BuildApiKeyRecordInput): ApiKeyRecord | null {
   const normalizedKey = normalizeKey(input.key);
   if (!normalizedKey) return null;
-
-  const createdAtFallback = new Date(0).toISOString();
-  const updatedAtFallback = nowIso();
 
   const label = normalizeLabel(input.label, input.type);
   const normalizedPlan = normalizePlanForType(input.type, input.plan);
 
   return {
     id: buildRecordId({
+      key: normalizedKey,
       type: input.type,
       plan: normalizedPlan,
       label,
@@ -111,33 +138,89 @@ function buildApiKeyRecord(input: BuildApiKeyRecordInput): ApiKeyRecord | null {
     plan: normalizedPlan,
     type: input.type,
     enabled: input.enabled ?? true,
-    createdAt: normalizeIsoDate(input.createdAt, createdAtFallback),
-    updatedAt: normalizeIsoDate(input.updatedAt, updatedAtFallback),
+    createdAt: normalizeIsoDate(input.createdAt, EPOCH_ISO),
+    updatedAt: normalizeIsoDate(input.updatedAt, nowIso()),
     keySource: input.keySource ?? "env",
   };
 }
 
-function dedupeRecords(records: ApiKeyRecord[]): ApiKeyRecord[] {
-  const seen = new Set<string>();
-  const result: ApiKeyRecord[] = [];
+function getTypeRank(type: ApiKeyRecordType): number {
+  if (type === "internal") return 0;
+  if (type === "client") return 1;
+  if (type === "legacy") return 2;
+  return 3;
+}
 
-  for (const record of records) {
-    if (!record.key) continue;
-    if (seen.has(record.key)) continue;
+function getSourceRank(source: ApiKeySource): number {
+  if (source === "registry") return 0;
+  return 1;
+}
 
-    seen.add(record.key);
-    result.push(record);
-  }
+function compareRecords(a: ApiKeyRecord, b: ApiKeyRecord): number {
+  const typeRankDiff = getTypeRank(a.type) - getTypeRank(b.type);
+  if (typeRankDiff !== 0) return typeRankDiff;
 
-  return result;
+  const sourceRankDiff = getSourceRank(a.keySource) - getSourceRank(b.keySource);
+  if (sourceRankDiff !== 0) return sourceRankDiff;
+
+  if (a.plan !== b.plan) return a.plan.localeCompare(b.plan);
+  if (a.label !== b.label) return a.label.localeCompare(b.label);
+  return a.id.localeCompare(b.id);
 }
 
 function sortRecords(records: ApiKeyRecord[]): ApiKeyRecord[] {
-  return [...records].sort((a, b) => {
-    if (a.type !== b.type) return a.type.localeCompare(b.type);
-    if (a.plan !== b.plan) return a.plan.localeCompare(b.plan);
-    return a.label.localeCompare(b.label);
-  });
+  return [...records].sort(compareRecords);
+}
+
+function choosePreferredRecord(current: ApiKeyRecord, incoming: ApiKeyRecord): ApiKeyRecord {
+  if (getSourceRank(incoming.keySource) < getSourceRank(current.keySource)) {
+    return incoming;
+  }
+
+  if (getSourceRank(incoming.keySource) > getSourceRank(current.keySource)) {
+    return current;
+  }
+
+  if (incoming.enabled && !current.enabled) {
+    return incoming;
+  }
+
+  if (!incoming.enabled && current.enabled) {
+    return current;
+  }
+
+  if (getTypeRank(incoming.type) < getTypeRank(current.type)) {
+    return incoming;
+  }
+
+  if (getTypeRank(incoming.type) > getTypeRank(current.type)) {
+    return current;
+  }
+
+  if (incoming.updatedAt > current.updatedAt) {
+    return incoming;
+  }
+
+  return current;
+}
+
+function dedupeRecords(records: ApiKeyRecord[]): ApiKeyRecord[] {
+  const byKey = new Map<string, ApiKeyRecord>();
+
+  for (const record of records) {
+    if (!record.key) continue;
+
+    const existing = byKey.get(record.key);
+
+    if (!existing) {
+      byKey.set(record.key, record);
+      continue;
+    }
+
+    byKey.set(record.key, choosePreferredRecord(existing, record));
+  }
+
+  return sortRecords([...byKey.values()]);
 }
 
 function loadEnvApiKeyRecords(): ApiKeyRecord[] {
@@ -148,7 +231,8 @@ function loadEnvApiKeyRecords(): ApiKeyRecord[] {
       plan: "internal",
       type: "internal",
       keySource: "env",
-      createdAt: new Date(0).toISOString(),
+      createdAt: EPOCH_ISO,
+      updatedAt: nowIso(),
     }),
 
     buildApiKeyRecord({
@@ -157,7 +241,8 @@ function loadEnvApiKeyRecords(): ApiKeyRecord[] {
       plan: "demo",
       type: "public_demo",
       keySource: "env",
-      createdAt: new Date(0).toISOString(),
+      createdAt: EPOCH_ISO,
+      updatedAt: nowIso(),
     }),
 
     buildApiKeyRecord({
@@ -166,12 +251,13 @@ function loadEnvApiKeyRecords(): ApiKeyRecord[] {
       plan: "trader",
       type: "legacy",
       keySource: "env",
-      createdAt: new Date(0).toISOString(),
+      createdAt: EPOCH_ISO,
+      updatedAt: nowIso(),
     }),
   ];
 
-  return sortRecords(
-    dedupeRecords(records.filter((record): record is ApiKeyRecord => Boolean(record)))
+  return dedupeRecords(
+    records.filter((record): record is ApiKeyRecord => Boolean(record))
   );
 }
 
@@ -179,23 +265,27 @@ function loadRegistryRecords(): ApiKeyRecord[] {
   return [];
 }
 
-function loadApiKeyRegistry(): ApiKeyRecord[] {
-  const envRecords = loadEnvApiKeyRecords();
+function loadApiKeyRegistry(): RegistryLoadResult {
   const registryRecords = loadRegistryRecords();
+  const envRecords = loadEnvApiKeyRecords();
 
-  return sortRecords(dedupeRecords([...registryRecords, ...envRecords]));
+  const records = dedupeRecords([...registryRecords, ...envRecords]);
+
+  return {
+    records,
+  };
 }
 
 export function getApiKeyRegistry(): ApiKeyRecord[] {
-  if (!cachedRecords) {
-    cachedRecords = loadApiKeyRegistry();
+  if (!cachedRegistry) {
+    cachedRegistry = loadApiKeyRegistry();
   }
 
-  return cachedRecords.map(cloneRecord);
+  return cachedRegistry.records.map(cloneRecord);
 }
 
 export function clearApiKeyRegistryCache(): void {
-  cachedRecords = null;
+  cachedRegistry = null;
 }
 
 export function listApiKeyRecords(): ApiKeyRecord[] {
@@ -210,9 +300,8 @@ export function findApiKeyRecord(providedKey: string): ApiKeyRecord | null {
 
   for (const record of records) {
     if (!record.enabled) continue;
-    if (record.key === normalizedKey) {
-      return cloneRecord(record);
-    }
+    if (record.key !== normalizedKey) continue;
+    return cloneRecord(record);
   }
 
   return null;
@@ -221,5 +310,6 @@ export function findApiKeyRecord(providedKey: string): ApiKeyRecord | null {
 export function mapRecordTypeToAuthType(type: ApiKeyRecordType): ApiKeyType {
   if (type === "internal") return "internal";
   if (type === "public_demo") return "public_demo";
+  if (type === "client") return "client";
   return "legacy";
 }

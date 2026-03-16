@@ -14,6 +14,12 @@ import {
   getStateService,
   type StateServiceResult,
 } from "@/lib/xyvala/services/state-service";
+import {
+  resolveAccessScope,
+  buildAccessMeta,
+} from "@/lib/xyvala/access";
+import type { AccessMeta, AccessScope } from "@/lib/xyvala/access";
+import type { Quote } from "@/lib/xyvala/snapshot";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -21,34 +27,36 @@ export const revalidate = 0;
 
 const VERSION = "v1";
 
-type Quote = "usd" | "usdt" | "eur";
-
 type MarketRegime = "STABLE" | "TRANSITION" | "VOLATILE" | null;
 type VolatilityState = "LOW" | "NORMAL" | "HIGH" | null;
 type LiquidityState = "LOW" | "NORMAL" | "HIGH" | null;
 type RiskMode = "LOW" | "MODERATE" | "HIGH" | null;
 type ExecutionBias = "AGGRESSIVE" | "SELECTIVE" | "DEFENSIVE" | null;
 
+type StatePayload = {
+  market_regime: MarketRegime;
+  volatility_state: VolatilityState;
+  liquidity_state: LiquidityState;
+  risk_mode: RiskMode;
+  execution_bias: ExecutionBias;
+  stable_ratio: number | null;
+  transition_ratio: number | null;
+  volatile_ratio: number | null;
+};
+
 type StateResponse = {
   ok: boolean;
   ts: string;
   version: string;
-  state: {
-    market_regime: MarketRegime;
-    volatility_state: VolatilityState;
-    liquidity_state: LiquidityState;
-    risk_mode: RiskMode;
-    execution_bias: ExecutionBias;
-    stable_ratio: number | null;
-    transition_ratio: number | null;
-    volatile_ratio: number | null;
-  };
+  state: StatePayload;
+  message: string | null;
   error: string | null;
   meta: {
     cache: "hit" | "miss" | "no-store";
     source: "state_cache" | "scan_snapshot" | "fallback";
     quote: Quote;
     warnings: string[];
+    access: AccessMeta;
   };
 };
 
@@ -56,10 +64,30 @@ type AuthResult = ReturnType<typeof enforceApiPolicy>;
 type AuthSuccess = Extract<AuthResult, { ok: true }>;
 type UsageResult = ReturnType<typeof trackUsage> | null;
 
-const nowIso = () => new Date().toISOString();
+function nowIso(): string {
+  return new Date().toISOString();
+}
 
 function safeStr(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function safeNum(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function uniqueWarnings(...groups: Array<string[] | undefined | null>): string[] {
+  const merged = groups.flatMap((group) => (Array.isArray(group) ? group : []));
+  return [
+    ...new Set(
+      merged.filter((item) => typeof item === "string" && item.trim().length > 0)
+    ),
+  ];
+}
+
+function parseNoStore(req: NextRequest): boolean {
+  const value = safeStr(req.nextUrl.searchParams.get("noStore")).toLowerCase();
+  return value === "1" || value === "true" || value === "yes" || value === "on";
 }
 
 function normalizeQuote(value: string | null): Quote {
@@ -69,14 +97,12 @@ function normalizeQuote(value: string | null): Quote {
   return "usd";
 }
 
-function uniqueWarnings(...groups: Array<string[] | undefined | null>): string[] {
-  const merged = groups.flatMap((group) => (Array.isArray(group) ? group : []));
-  return [...new Set(merged.filter((item) => typeof item === "string" && item.trim().length > 0))];
-}
-
-function parseNoStore(req: NextRequest): boolean {
-  const value = safeStr(req.nextUrl.searchParams.get("noStore")).toLowerCase();
-  return value === "1" || value === "true" || value === "yes" || value === "on";
+function normalizeMarketRegime(value: unknown): MarketRegime {
+  const s = safeStr(value).toUpperCase();
+  if (s === "STABLE") return "STABLE";
+  if (s === "TRANSITION") return "TRANSITION";
+  if (s === "VOLATILE") return "VOLATILE";
+  return null;
 }
 
 function normalizeVolatilityState(value: unknown): VolatilityState {
@@ -111,66 +137,114 @@ function normalizeExecutionBias(value: unknown): ExecutionBias {
   return null;
 }
 
-function normalizeMarketRegime(value: unknown): MarketRegime {
-  const s = safeStr(value).toUpperCase();
-  if (s === "STABLE") return "STABLE";
-  if (s === "TRANSITION") return "TRANSITION";
-  if (s === "VOLATILE") return "VOLATILE";
-  return null;
-}
-
-function toApiCache(value: StateServiceResult["source"], noStore: boolean): "hit" | "miss" | "no-store" {
-  if (noStore) return "no-store";
-  if (value === "state_cache") return "hit";
-  return "miss";
-}
-
-function buildEmptyState() {
+function buildEmptyState(): StatePayload {
   return {
-    market_regime: null as MarketRegime,
-    volatility_state: null as VolatilityState,
-    liquidity_state: null as LiquidityState,
-    risk_mode: null as RiskMode,
-    execution_bias: null as ExecutionBias,
-    stable_ratio: null as number | null,
-    transition_ratio: null as number | null,
-    volatile_ratio: null as number | null,
+    market_regime: null,
+    volatility_state: null,
+    liquidity_state: null,
+    risk_mode: null,
+    execution_bias: null,
+    stable_ratio: null,
+    transition_ratio: null,
+    volatile_ratio: null,
   };
 }
 
-function buildStateResponse(
-  input: {
-    ts: string;
-    quote: Quote;
-    service: StateServiceResult;
-    usageWarnings?: string[];
-    noStore?: boolean;
-  }
-): StateResponse {
-  const serviceState = input.service.state;
-
+function toStatePayload(service: StateServiceResult | null | undefined): StatePayload {
   return {
-    ok: input.service.ok,
+    market_regime: normalizeMarketRegime(service?.state?.market_regime),
+    volatility_state: normalizeVolatilityState(service?.state?.volatility_state),
+    liquidity_state: normalizeLiquidityState(service?.state?.liquidity_state),
+    risk_mode: normalizeRiskMode(service?.state?.risk_mode),
+    execution_bias: normalizeExecutionBias(service?.state?.execution_bias),
+    stable_ratio: safeNum(service?.state?.stable_ratio),
+    transition_ratio: safeNum(service?.state?.transition_ratio),
+    volatile_ratio: safeNum(service?.state?.volatile_ratio),
+  };
+}
+
+function normalizeSource(
+  value: StateServiceResult["source"] | string | undefined
+): "state_cache" | "scan_snapshot" | "fallback" {
+  if (value === "state_cache") return "state_cache";
+  if (value === "scan_snapshot") return "scan_snapshot";
+  return "fallback";
+}
+
+function buildHiddenStateResponse(input: {
+  ts: string;
+  quote: Quote;
+  noStore: boolean;
+  access: AccessMeta;
+  usageWarnings?: string[];
+}): StateResponse {
+  return {
+    ok: true,
     ts: input.ts,
     version: VERSION,
-    state: serviceState
-      ? {
-          market_regime: normalizeMarketRegime(serviceState.market_regime),
-          volatility_state: normalizeVolatilityState(serviceState.volatility_state),
-          liquidity_state: normalizeLiquidityState(serviceState.liquidity_state),
-          risk_mode: normalizeRiskMode(serviceState.risk_mode),
-          execution_bias: normalizeExecutionBias(serviceState.execution_bias),
-          stable_ratio: serviceState.stable_ratio ?? null,
-          transition_ratio: serviceState.transition_ratio ?? null,
-          volatile_ratio: serviceState.volatile_ratio ?? null,
-        }
-      : buildEmptyState(),
-    error: input.service.error,
+    state: buildEmptyState(),
+    message: "state_hidden_by_access_compartment",
+    error: null,
     meta: {
-      cache: toApiCache(input.service.source, input.noStore === true),
-      source: input.service.source,
+      cache: input.noStore ? "no-store" : "miss",
+      source: "fallback",
+      quote: input.quote,
+      warnings: uniqueWarnings(input.usageWarnings, [
+        "state_hidden_by_access_compartment",
+      ]),
+      access: input.access,
+    },
+  };
+}
+
+function buildErrorStateResponse(input: {
+  ts: string;
+  quote: Quote;
+  noStore: boolean;
+  access: AccessMeta;
+  error: string | null;
+  usageWarnings?: string[];
+}): StateResponse {
+  return {
+    ok: false,
+    ts: input.ts,
+    version: VERSION,
+    state: buildEmptyState(),
+    message: null,
+    error: input.error,
+    meta: {
+      cache: input.noStore ? "no-store" : "miss",
+      source: "fallback",
+      quote: input.quote,
+      warnings: uniqueWarnings(input.usageWarnings),
+      access: input.access,
+    },
+  };
+}
+
+function buildStateResponse(input: {
+  ts: string;
+  quote: Quote;
+  service: StateServiceResult;
+  noStore: boolean;
+  access: AccessMeta;
+  usageWarnings?: string[];
+}): StateResponse {
+  const source = normalizeSource(input.service.source);
+
+  return {
+    ok: Boolean(input.service.ok),
+    ts: input.ts,
+    version: VERSION,
+    state: toStatePayload(input.service),
+    message: null,
+    error: input.service.error ?? null,
+    meta: {
+      cache: input.noStore ? "no-store" : source === "state_cache" ? "hit" : "miss",
+      source,
       quote: input.quote,
       warnings: uniqueWarnings(input.service.warnings, input.usageWarnings),
+      access: input.access,
     },
   };
 }
@@ -184,9 +258,11 @@ function respond(
   let res: NextResponse = NextResponse.json(payload, {
     status,
     headers: {
-      "x-xyvala-version": VERSION,
       "cache-control": "no-store",
+      "x-xyvala-version": VERSION,
       "x-xyvala-cache": payload.meta.cache,
+      "x-xyvala-access-compartment": payload.meta.access.compartment,
+      "x-xyvala-visible-percent": String(payload.meta.access.visiblePercent),
     },
   });
 
@@ -199,6 +275,10 @@ function respond(
   return res;
 }
 
+function canExposeState(accessScope: AccessScope): boolean {
+  return accessScope.showMarketContext;
+}
+
 export async function GET(req: NextRequest) {
   const ts = nowIso();
   const quote = normalizeQuote(req.nextUrl.searchParams.get("quote"));
@@ -208,6 +288,9 @@ export async function GET(req: NextRequest) {
   if (!auth.ok) {
     return buildApiKeyErrorResponse(auth.error, auth.status);
   }
+
+  const accessScope = resolveAccessScope(auth);
+  const accessMeta = buildAccessMeta(accessScope);
 
   let usage: UsageResult = null;
   let usageWarnings: string[] = [];
@@ -228,6 +311,18 @@ export async function GET(req: NextRequest) {
   }
 
   try {
+    if (!canExposeState(accessScope)) {
+      const payload = buildHiddenStateResponse({
+        ts,
+        quote,
+        noStore,
+        access: accessMeta,
+        usageWarnings,
+      });
+
+      return respond(payload, 200, auth, usage);
+    }
+
     const service = await getStateService({
       quote,
       noStore,
@@ -237,37 +332,28 @@ export async function GET(req: NextRequest) {
       ts,
       quote,
       service,
-      usageWarnings,
       noStore,
+      access: accessMeta,
+      usageWarnings,
     });
 
-    const status = payload.ok ? 200 : 503;
-
-    return respond(payload, status, auth, usage);
+    return respond(payload, payload.ok ? 200 : 503, auth, usage);
   } catch (error) {
-    const payload: StateResponse = {
-      ok: false,
+    const payload = buildErrorStateResponse({
       ts,
-      version: VERSION,
-      state: buildEmptyState(),
+      quote,
+      noStore,
+      access: accessMeta,
       error:
         error instanceof Error && error.message
           ? error.message
           : "unknown_error",
-      meta: {
-        cache: noStore ? "no-store" : "miss",
-        source: "fallback",
-        quote,
-        warnings: uniqueWarnings(
-          usageWarnings,
-          [
-            error instanceof Error && error.message
-              ? `route_exception:${error.message}`
-              : "route_exception",
-          ]
-        ),
-      },
-    };
+      usageWarnings: uniqueWarnings(usageWarnings, [
+        error instanceof Error && error.message
+          ? `route_exception:${error.message}`
+          : "route_exception",
+      ]),
+    });
 
     return respond(payload, 500, auth, usage);
   }

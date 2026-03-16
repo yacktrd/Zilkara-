@@ -1,56 +1,321 @@
 // components/scan-table.tsx
 
-import type { ScanAsset } from "@/lib/xyvala/scan";
+"use client";
 
-type ScanTableProps = {
-  assets: ScanAsset[];
-  quote: string;
-  sort: string;
-  limit: number;
+import React, { useMemo, useState } from "react";
+import type { ScanAsset, Regime } from "@/lib/xyvala/scan";
+
+type RegimeFilter = "ALL" | Regime;
+type SortDirection = "none" | "asc" | "desc";
+type SortPreset = "score_desc" | "score_asc" | "price_desc" | "price_asc";
+
+type ScanTableAsset = ScanAsset & {
+  affiliate_url?: string;
 };
 
-function formatPrice(n: number | null | undefined) {
-  if (typeof n !== "number" || !Number.isFinite(n)) return "-";
-  if (n >= 1000) {
-    return n.toLocaleString("fr-FR", { maximumFractionDigits: 2 });
+type Props = {
+  assets: ScanTableAsset[];
+  quote: string;
+  sort?: string;
+  limit?: number;
+};
+
+function safeString(value: unknown, fallback = ""): string {
+  return typeof value === "string" && value.trim().length > 0
+    ? value.trim()
+    : fallback;
+}
+
+function safeNumber(value: unknown, fallback = 0): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function normalizeSortPreset(value: string | undefined): SortPreset {
+  const normalized = safeString(value, "score_desc").toLowerCase();
+
+  if (normalized === "score_asc") return "score_asc";
+  if (normalized === "price_desc") return "price_desc";
+  if (normalized === "price_asc") return "price_asc";
+
+  return "score_desc";
+}
+
+function normalizeLimit(value: number | undefined, fallback: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  return Math.max(1, Math.floor(value));
+}
+
+function formatPrice(value: number, quote: string): string {
+  if (!Number.isFinite(value)) return "-";
+
+  const formatted =
+    value >= 1000
+      ? value.toLocaleString("fr-FR", { maximumFractionDigits: 2 })
+      : value >= 1
+        ? value.toLocaleString("fr-FR", { maximumFractionDigits: 4 })
+        : value.toLocaleString("fr-FR", { maximumFractionDigits: 8 });
+
+  return `${formatted} ${quote.toUpperCase()}`;
+}
+
+function formatPct(value: number): string {
+  if (!Number.isFinite(value)) return "-";
+  const sign = value > 0 ? "+" : "";
+  return `${sign}${value.toFixed(2)}%`;
+}
+
+function getPctClass(value: number): string {
+  if (!Number.isFinite(value)) return "z-muted";
+  if (value > 0) return "z-pos";
+  if (value < 0) return "z-neg";
+  return "z-muted";
+}
+
+function getRegimeLabel(regime: Regime): string {
+  if (regime === "STABLE") return "Stable";
+  if (regime === "TRANSITION") return "Transition";
+  return "Instable";
+}
+
+function getInitialSortState(sort: SortPreset): {
+  priceSort: SortDirection;
+  scoreSort: SortDirection;
+} {
+  if (sort === "price_asc") {
+    return { priceSort: "asc", scoreSort: "none" };
   }
-  if (n >= 1) {
-    return n.toLocaleString("fr-FR", { maximumFractionDigits: 4 });
+
+  if (sort === "price_desc") {
+    return { priceSort: "desc", scoreSort: "none" };
   }
-  return n.toLocaleString("fr-FR", { maximumFractionDigits: 8 });
+
+  if (sort === "score_asc") {
+    return { priceSort: "none", scoreSort: "asc" };
+  }
+
+  return { priceSort: "none", scoreSort: "desc" };
 }
 
-function formatPct(n: number | null | undefined) {
-  if (typeof n !== "number" || !Number.isFinite(n)) return "-";
-  const sign = n > 0 ? "+" : "";
-  return `${sign}${n.toFixed(2)}%`;
+function resolveAssetHref(asset: ScanTableAsset): string {
+  return safeString(asset.affiliate_url) || safeString(asset.binance_url) || "#";
 }
 
-function formatScore(n: number | null | undefined) {
-  if (typeof n !== "number" || !Number.isFinite(n)) return "-";
-  return String(Math.round(n));
+function resolveAssetKey(asset: ScanTableAsset): string {
+  const id = safeString(asset.id);
+  const symbol = safeString(asset.symbol, "UNKNOWN");
+  return id ? `${id}-${symbol}` : symbol;
 }
 
-function pctTone(n: number | null | undefined): string {
-  if (typeof n !== "number" || !Number.isFinite(n)) return "text-neutral-500";
-  if (n > 0) return "text-emerald-600";
-  if (n < 0) return "text-red-600";
-  return "text-neutral-500";
+function FilterButton({
+  active,
+  children,
+  onClick,
+}: {
+  active: boolean;
+  children: React.ReactNode;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`z-filterBtn${active ? " is-active" : ""}`}
+      aria-pressed={active}
+    >
+      {children}
+    </button>
+  );
 }
 
-function scoreTone(n: number | null | undefined): string {
-  if (typeof n !== "number" || !Number.isFinite(n)) return "bg-neutral-100 text-neutral-500";
-  if (n >= 85) return "bg-emerald-100 text-emerald-700";
-  if (n >= 70) return "bg-blue-100 text-blue-700";
-  if (n >= 55) return "bg-amber-100 text-amber-700";
-  return "bg-neutral-100 text-neutral-600";
+function FilterGroup({
+  title,
+  children,
+}: {
+  title: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="z-filterGroup">
+      <p className="z-filterTitle">{title}</p>
+      <div className="z-filterRow">{children}</div>
+    </div>
+  );
 }
 
-function regimeTone(regime: string | null | undefined): string {
-  if (regime === "STABLE") return "bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200";
-  if (regime === "TRANSITION") return "bg-amber-50 text-amber-700 ring-1 ring-amber-200";
-  if (regime === "VOLATILE") return "bg-red-50 text-red-700 ring-1 ring-red-200";
-  return "bg-neutral-100 text-neutral-600 ring-1 ring-neutral-200";
+function SearchInput({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (next: string) => void;
+}) {
+  return (
+    <input
+      type="search"
+      value={value}
+      onChange={(event) => onChange(event.target.value)}
+      placeholder="Rechercher BTC, ETH, SOL..."
+      autoComplete="off"
+      autoCorrect="off"
+      autoCapitalize="off"
+      spellCheck={false}
+      className="z-search"
+    />
+  );
+}
+
+function ResultMeta({
+  visible,
+  total,
+}: {
+  visible: number;
+  total: number;
+}) {
+  return (
+    <div className="z-toolbarMeta">
+      <span className="z-toolbarCount">Actifs affichés</span>
+      <span className="z-chip">
+        {visible} / {total}
+      </span>
+    </div>
+  );
+}
+
+function EmptyState({ children }: { children: React.ReactNode }) {
+  return <div className="z-empty">{children}</div>;
+}
+
+function MobileAssetCard({
+  asset,
+  quote,
+}: {
+  asset: ScanTableAsset;
+  quote: string;
+}) {
+  const href = resolveAssetHref(asset);
+  const symbol = safeString(asset.symbol, "UNKNOWN");
+  const name = safeString(asset.name, symbol);
+  const regime = asset.regime;
+  const score = Math.round(safeNumber(asset.confidence_score, 0));
+  const price = formatPrice(safeNumber(asset.price, 0), quote);
+  const change = safeNumber(asset.chg_24h_pct, 0);
+
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="z-card z-hiddenDesktop"
+      aria-label={`Ouvrir ${symbol}`}
+    >
+      <div className="z-asset">
+        <p className="z-symbol">{symbol}</p>
+        <p className="z-name">{name}</p>
+      </div>
+
+      <div className="z-score z-num">{score}</div>
+
+      <div className="z-regime">
+        <span className="z-dot" data-regime={regime} aria-hidden="true" />
+        <span>{getRegimeLabel(regime)}</span>
+      </div>
+
+      <div className="z-stats">
+        <div className="z-stat">
+          <span className="z-statLabel">Prix</span>
+          <span className="z-statValue z-num">{price}</span>
+        </div>
+
+        <div className="z-stat">
+          <span className="z-statLabel">24h</span>
+          <span className={`z-statValue z-num ${getPctClass(change)}`}>
+            {formatPct(change)}
+          </span>
+        </div>
+      </div>
+
+      <span className="z-trade">Ouvrir</span>
+    </a>
+  );
+}
+
+function DesktopTable({
+  assets,
+  quote,
+}: {
+  assets: ScanTableAsset[];
+  quote: string;
+}) {
+  return (
+    <div className="z-tableWrap z-hiddenMobile">
+      <div className="z-tableScroll">
+        <table className="z-table">
+          <thead>
+            <tr>
+              <th className="z-colAsset">Actif</th>
+              <th className="z-colPrice">Prix</th>
+              <th className="z-col24h">24h</th>
+              <th className="z-colRegime">Régime</th>
+              <th className="z-colScore">Score</th>
+            </tr>
+          </thead>
+
+          <tbody>
+            {assets.map((asset) => {
+              const href = resolveAssetHref(asset);
+              const symbol = safeString(asset.symbol, "UNKNOWN");
+              const name = safeString(asset.name, symbol);
+              const price = formatPrice(safeNumber(asset.price, 0), quote);
+              const change = safeNumber(asset.chg_24h_pct, 0);
+              const score = Math.round(safeNumber(asset.confidence_score, 0));
+
+              return (
+                <tr key={resolveAssetKey(asset)}>
+                  <td>
+                    <a
+                      href={href}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="z-cellAsset"
+                    >
+                      <span
+                        className="z-dot"
+                        data-regime={asset.regime}
+                        aria-hidden="true"
+                      />
+                      <div className="z-assetText">
+                        <span className="z-assetName">{symbol}</span>
+                        <span className="z-assetSub">{name}</span>
+                      </div>
+                    </a>
+                  </td>
+
+                  <td className="z-num">{price}</td>
+
+                  <td className={`z-num ${getPctClass(change)}`}>
+                    {formatPct(change)}
+                  </td>
+
+                  <td>
+                    <span className="z-regime">
+                      <span
+                        className="z-dot"
+                        data-regime={asset.regime}
+                        aria-hidden="true"
+                      />
+                      <span>{getRegimeLabel(asset.regime)}</span>
+                    </span>
+                  </td>
+
+                  <td className="z-scoreCell z-num">{score}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
 }
 
 export function ScanTable({
@@ -58,98 +323,163 @@ export function ScanTable({
   quote,
   sort,
   limit,
-}: ScanTableProps) {
+}: Props) {
+  const initialSort = getInitialSortState(normalizeSortPreset(sort));
+  const normalizedLimit = normalizeLimit(limit, assets.length);
+
+  const [query, setQuery] = useState("");
+  const [regimeFilter, setRegimeFilter] = useState<RegimeFilter>("ALL");
+  const [priceSort, setPriceSort] = useState<SortDirection>(initialSort.priceSort);
+  const [scoreSort, setScoreSort] = useState<SortDirection>(initialSort.scoreSort);
+
+  const filteredAssets = useMemo(() => {
+    const normalizedQuery = query.trim().toLowerCase();
+
+    const filtered = assets.filter((asset) => {
+      const symbol = safeString(asset.symbol).toLowerCase();
+      const name = safeString(asset.name).toLowerCase();
+
+      const matchesQuery =
+        normalizedQuery.length === 0 ||
+        symbol.includes(normalizedQuery) ||
+        name.includes(normalizedQuery);
+
+      const matchesRegime =
+        regimeFilter === "ALL" || asset.regime === regimeFilter;
+
+      return matchesQuery && matchesRegime;
+    });
+
+    const sorted = [...filtered].sort((a, b) => {
+      const aScore = safeNumber(a.confidence_score);
+      const bScore = safeNumber(b.confidence_score);
+      const aPrice = safeNumber(a.price);
+      const bPrice = safeNumber(b.price);
+
+      if (scoreSort !== "none") {
+        const scoreDelta =
+          scoreSort === "asc" ? aScore - bScore : bScore - aScore;
+        if (scoreDelta !== 0) return scoreDelta;
+      }
+
+      if (priceSort !== "none") {
+        const priceDelta =
+          priceSort === "asc" ? aPrice - bPrice : bPrice - aPrice;
+        if (priceDelta !== 0) return priceDelta;
+      }
+
+      return safeString(a.symbol).localeCompare(safeString(b.symbol));
+    });
+
+    return sorted.slice(0, normalizedLimit);
+  }, [assets, query, regimeFilter, priceSort, scoreSort, normalizedLimit]);
+
   if (!assets.length) {
-    return (
-      <section className="rounded-2xl border border-neutral-200 bg-white p-4">
-        <p className="text-sm text-neutral-600">Aucun résultat.</p>
-      </section>
-    );
+    return <EmptyState>Aucun résultat.</EmptyState>;
   }
 
   return (
-    <section className="overflow-hidden rounded-2xl border border-neutral-200 bg-white shadow-sm">
-      <div className="flex flex-wrap items-center gap-2 border-b border-neutral-200 px-4 py-3 text-xs text-neutral-500">
-        <span className="rounded-full bg-neutral-100 px-2.5 py-1">
-          Quote: {quote.toUpperCase()}
-        </span>
-        <span className="rounded-full bg-neutral-100 px-2.5 py-1">
-          Sort: {sort}
-        </span>
-        <span className="rounded-full bg-neutral-100 px-2.5 py-1">
-          Limit: {limit}
-        </span>
+    <div className="z-scanShell">
+      <div className="z-scanToolbar">
+        <SearchInput value={query} onChange={setQuery} />
+        <ResultMeta visible={filteredAssets.length} total={assets.length} />
+
+        <div className="z-filterGrid">
+          <FilterGroup title="Régime">
+            <FilterButton
+              active={regimeFilter === "ALL"}
+              onClick={() => setRegimeFilter("ALL")}
+            >
+              Tout
+            </FilterButton>
+
+            <FilterButton
+              active={regimeFilter === "STABLE"}
+              onClick={() => setRegimeFilter("STABLE")}
+            >
+              Stable
+            </FilterButton>
+
+            <FilterButton
+              active={regimeFilter === "TRANSITION"}
+              onClick={() => setRegimeFilter("TRANSITION")}
+            >
+              Transition
+            </FilterButton>
+
+            <FilterButton
+              active={regimeFilter === "VOLATILE"}
+              onClick={() => setRegimeFilter("VOLATILE")}
+            >
+              Instable
+            </FilterButton>
+          </FilterGroup>
+
+          <FilterGroup title="Prix">
+            <FilterButton
+              active={priceSort === "asc"}
+              onClick={() => setPriceSort("asc")}
+            >
+              Croissant
+            </FilterButton>
+
+            <FilterButton
+              active={priceSort === "desc"}
+              onClick={() => setPriceSort("desc")}
+            >
+              Décroissant
+            </FilterButton>
+
+            <FilterButton
+              active={priceSort === "none"}
+              onClick={() => setPriceSort("none")}
+            >
+              Neutre
+            </FilterButton>
+          </FilterGroup>
+
+          <FilterGroup title="Score">
+            <FilterButton
+              active={scoreSort === "asc"}
+              onClick={() => setScoreSort("asc")}
+            >
+              Croissant
+            </FilterButton>
+
+            <FilterButton
+              active={scoreSort === "desc"}
+              onClick={() => setScoreSort("desc")}
+            >
+              Décroissant
+            </FilterButton>
+
+            <FilterButton
+              active={scoreSort === "none"}
+              onClick={() => setScoreSort("none")}
+            >
+              Neutre
+            </FilterButton>
+          </FilterGroup>
+        </div>
       </div>
 
-      <div className="overflow-x-auto">
-        <table className="w-full min-w-[760px] border-collapse text-sm">
-          <thead className="sticky top-0 z-10 bg-white">
-            <tr className="border-b border-neutral-200 text-left text-xs uppercase tracking-wide text-neutral-500">
-              <th className="px-4 py-3 font-semibold">Asset</th>
-              <th className="px-4 py-3 font-semibold">Prix</th>
-              <th className="px-4 py-3 font-semibold">24h</th>
-              <th className="px-4 py-3 font-semibold">Score</th>
-              <th className="px-4 py-3 font-semibold">Régime</th>
-              <th className="px-4 py-3 font-semibold text-right">Action</th>
-            </tr>
-          </thead>
-
-          <tbody>
-            {assets.map((asset) => (
-              <tr
-                key={`${asset.id}-${asset.symbol}`}
-                className="border-b border-neutral-100 transition-colors hover:bg-neutral-50"
-              >
-                <td className="px-4 py-3 align-middle">
-                  <div className="flex flex-col">
-                    <span className="text-sm font-semibold text-neutral-900">
-                      {asset.symbol}
-                    </span>
-                    <span className="text-xs text-neutral-500">
-                      {asset.name}
-                    </span>
-                  </div>
-                </td>
-
-                <td className="px-4 py-3 align-middle font-medium text-neutral-900">
-                  {formatPrice(asset.price)}
-                </td>
-
-                <td className={`px-4 py-3 align-middle font-medium ${pctTone(asset.chg_24h_pct)}`}>
-                  {formatPct(asset.chg_24h_pct)}
-                </td>
-
-                <td className="px-4 py-3 align-middle">
-                  <span
-                    className={`inline-flex min-w-[52px] justify-center rounded-full px-2.5 py-1 text-xs font-semibold ${scoreTone(asset.confidence_score)}`}
-                  >
-                    {formatScore(asset.confidence_score)}
-                  </span>
-                </td>
-
-                <td className="px-4 py-3 align-middle">
-                  <span
-                    className={`inline-flex rounded-full px-2.5 py-1 text-xs font-medium ${regimeTone(asset.regime)}`}
-                  >
-                    {asset.regime ?? "-"}
-                  </span>
-                </td>
-
-                <td className="px-4 py-3 text-right align-middle">
-                  <a
-                    href={asset.affiliate_url || asset.binance_url}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="inline-flex rounded-lg border border-neutral-300 px-3 py-1.5 text-xs font-semibold text-neutral-900 transition-colors hover:border-neutral-900 hover:bg-neutral-900 hover:text-white"
-                  >
-                    Trade
-                  </a>
-                </td>
-              </tr>
+      {filteredAssets.length === 0 ? (
+        <EmptyState>Aucun actif ne correspond aux filtres actuels.</EmptyState>
+      ) : (
+        <>
+          <div className="z-list">
+            {filteredAssets.map((asset) => (
+              <MobileAssetCard
+                key={resolveAssetKey(asset)}
+                asset={asset}
+                quote={quote}
+              />
             ))}
-          </tbody>
-        </table>
-      </div>
-    </section>
+          </div>
+
+          <DesktopTable assets={filteredAssets} quote={quote} />
+        </>
+      )}
+    </div>
   );
 }

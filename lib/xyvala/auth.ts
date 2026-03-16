@@ -5,10 +5,13 @@ import {
   findApiKeyRecord,
   mapRecordTypeToAuthType,
   type ApiKeyRecord,
+  type ApiKeyType,
 } from "@/lib/xyvala/api-keys";
 import type { ApiPlan } from "@/lib/xyvala/usage";
 
-export type ApiKeyType = "internal" | "public_demo" | "legacy";
+export type ApiAccessPolicy = "public_or_key" | "key_required" | "internal_only";
+
+export type ApiKeySource = "header" | "query" | "public";
 
 export type ApiKeyAuthSuccess = {
   ok: true;
@@ -16,8 +19,9 @@ export type ApiKeyAuthSuccess = {
   keyType: ApiKeyType;
   plan: ApiPlan;
   label: string;
-  keySource: "header" | "query";
-  record: ApiKeyRecord;
+  keySource: ApiKeySource;
+  record: ApiKeyRecord | null;
+  policy: ApiAccessPolicy;
 };
 
 export type ApiKeyAuthFailure = {
@@ -28,8 +32,9 @@ export type ApiKeyAuthFailure = {
   label: null;
   keySource: null;
   record: null;
-  error: "missing_api_key" | "invalid_api_key";
-  status: 401;
+  policy: ApiAccessPolicy;
+  error: "missing_api_key" | "invalid_api_key" | "forbidden_api_key_type";
+  status: 401 | 403;
 };
 
 export type ApiKeyAuthResult = ApiKeyAuthSuccess | ApiKeyAuthFailure;
@@ -71,56 +76,104 @@ function getProvidedKey(req: NextRequest): {
   return { key: "", source: null };
 }
 
+function buildPublicDemoAuth(policy: ApiAccessPolicy): ApiKeyAuthSuccess {
+  return {
+    ok: true,
+    key: "public_demo",
+    keyType: "public_demo",
+    plan: "demo",
+    label: "Public Demo",
+    keySource: "public",
+    record: null,
+    policy,
+  };
+}
+
+function buildAuthFailure(
+  policy: ApiAccessPolicy,
+  error: ApiKeyAuthFailure["error"],
+  status: ApiKeyAuthFailure["status"]
+): ApiKeyAuthFailure {
+  return {
+    ok: false,
+    key: null,
+    keyType: null,
+    plan: null,
+    label: null,
+    keySource: null,
+    record: null,
+    policy,
+    error,
+    status,
+  };
+}
+
+function isAllowedKeyType(
+  keyType: ApiKeyType,
+  policy: ApiAccessPolicy
+): boolean {
+  if (policy === "public_or_key") {
+    return keyType === "internal" || keyType === "client" || keyType === "legacy";
+  }
+
+  if (policy === "key_required") {
+    return keyType === "internal" || keyType === "client" || keyType === "legacy";
+  }
+
+  if (policy === "internal_only") {
+    return keyType === "internal";
+  }
+
+  return false;
+}
+
 export function validateApiKey(req: NextRequest): ApiKeyAuthResult {
+  return validateApiKeyWithPolicy(req, "public_or_key");
+}
+
+export function validateApiKeyWithPolicy(
+  req: NextRequest,
+  policy: ApiAccessPolicy = "public_or_key"
+): ApiKeyAuthResult {
   const provided = getProvidedKey(req);
 
   if (!provided.key || !provided.source) {
-    return {
-      ok: false,
-      key: null,
-      keyType: null,
-      plan: null,
-      label: null,
-      keySource: null,
-      record: null,
-      error: "missing_api_key",
-      status: 401,
-    };
+    if (policy === "public_or_key") {
+      return buildPublicDemoAuth(policy);
+    }
+
+    return buildAuthFailure(policy, "missing_api_key", 401);
   }
 
   const record = findApiKeyRecord(provided.key);
 
   if (!record || !record.enabled) {
-    return {
-      ok: false,
-      key: null,
-      keyType: null,
-      plan: null,
-      label: null,
-      keySource: null,
-      record: null,
-      error: "invalid_api_key",
-      status: 401,
-    };
+    return buildAuthFailure(policy, "invalid_api_key", 401);
+  }
+
+  const keyType = mapRecordTypeToAuthType(record.type);
+
+  if (!isAllowedKeyType(keyType, policy)) {
+    return buildAuthFailure(policy, "forbidden_api_key_type", 403);
   }
 
   return {
     ok: true,
     key: record.key,
-    keyType: mapRecordTypeToAuthType(record.type),
+    keyType,
     plan: record.plan,
     label: record.label,
     keySource: provided.source,
     record,
+    policy,
   };
 }
 
-/**
- * Alias officiel possible pour garder la compatibilité
- * avec les routes déjà migrées sur enforceApiPolicy().
- */
-export function enforceApiPolicy(req: NextRequest): ApiKeyAuthResult {
-  return validateApiKey(req);
+export function enforceApiPolicy(
+  req: NextRequest,
+  policy: ApiAccessPolicy = "public_or_key"
+): ApiKeyAuthResult {
+  return validateApiKeyWithPolicy(req, policy);
 }
 
 export function buildApiKeyErrorResponse(
@@ -148,10 +201,14 @@ export function applyApiAuthHeaders(
 ): NextResponse {
   response.headers.set("cache-control", "no-store");
   response.headers.set("x-xyvala-auth", "ok");
-  response.headers.set("x-xyvala-key-present", "true");
+  response.headers.set(
+    "x-xyvala-key-present",
+    auth.keyType === "public_demo" ? "false" : "true"
+  );
   response.headers.set("x-xyvala-key-type", auth.keyType);
   response.headers.set("x-xyvala-plan", auth.plan);
   response.headers.set("x-xyvala-key-source", auth.keySource);
+  response.headers.set("x-xyvala-auth-policy", auth.policy);
 
   return response;
 }

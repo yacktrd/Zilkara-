@@ -1,14 +1,15 @@
-// lib/xyvala/services/scan-service.ts 
+// lib/xyvala/services/scan-service.ts
+
 
 import {
   getFromCache,
-  scanKey,
-  setToCache,
   isScanSnapshot,
+  scanKey,
   type Quote,
-  type ScanAsset,
   type ScanSnapshot,
 } from "@/lib/xyvala/snapshot";
+import { normalizeSnapshotData as normalizeLegacySnapshotData } from "@/lib/xyvala/adapters/snapshot-adapter";
+import type { ScanAsset, Regime } from "@/lib/xyvala/contracts/scan-contract";
 
 const XYVALA_VERSION = "v1";
 
@@ -78,8 +79,12 @@ function safeLower(value: unknown): string {
   return safeStr(value).toLowerCase();
 }
 
-function safeNum(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
+function safeNumber(value: unknown, fallback = 0): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function safeOptionalNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function clamp(n: number, min: number, max: number): number {
@@ -93,12 +98,18 @@ function uniqueWarnings(...groups: Array<string[] | undefined | null>): string[]
 
 function normalizeQuote(value: unknown): Quote {
   const quote = safeLower(value);
+
   if (quote === "eur") return "eur";
   if (quote === "usdt") return "usdt";
+
   return DEFAULT_QUOTE;
 }
 
-function normalizeSort(value: unknown): { sortKey: SortKey; sortLabel: string; order: SortOrder } {
+function normalizeSort(value: unknown): {
+  sortKey: SortKey;
+  sortLabel: string;
+  order: SortOrder;
+} {
   const s = safeLower(value);
 
   if (s === "price" || s === "price_desc") {
@@ -113,7 +124,11 @@ function normalizeSort(value: unknown): { sortKey: SortKey; sortLabel: string; o
     return { sortKey: "score", sortLabel: "score_asc", order: "asc" };
   }
 
-  return { sortKey: "score", sortLabel: DEFAULT_SORT, order: "desc" };
+  return {
+    sortKey: "score",
+    sortLabel: DEFAULT_SORT,
+    order: "desc",
+  };
 }
 
 function parseLimit(value: unknown): number {
@@ -125,12 +140,23 @@ function parseLimit(value: unknown): number {
         : DEFAULT_LIMIT;
 
   if (!Number.isFinite(n)) return DEFAULT_LIMIT;
+
   return clamp(Math.trunc(n), 1, MAX_LIMIT);
 }
 
 function normalizeSearch(value: unknown): string | null {
   const q = safeStr(value).toLowerCase();
   return q || null;
+}
+
+function normalizeRegime(value: unknown): Regime {
+  const regime = safeStr(value).toUpperCase();
+
+  if (regime === "STABLE") return "STABLE";
+  if (regime === "TRANSITION") return "TRANSITION";
+  if (regime === "VOLATILE") return "VOLATILE";
+
+  return "TRANSITION";
 }
 
 function buildCanonicalSnapshotKey(quote: Quote): string {
@@ -163,6 +189,7 @@ function buildScanServiceCacheKey(input: {
 
 function getScanMemCache(key: string, ttlMs: number): ScanServiceResult | null {
   const entry = mem.get(key);
+
   if (!entry) return null;
 
   if (nowMs() - entry.ts > ttlMs) {
@@ -188,24 +215,39 @@ function buildBinanceUrl(symbol: string, quote: Quote): string {
 
 function buildAffiliateUrl(binanceUrl: string): string {
   const ref = safeStr(process.env.BINANCE_REF);
+
   if (!ref) return binanceUrl;
+
   return `${binanceUrl}?ref=${encodeURIComponent(ref)}`;
 }
 
 function toScanServiceItem(asset: ScanAsset, quote: Quote): ScanServiceItem {
   const symbol = safeStr(asset.symbol) || "UNKNOWN";
-  const fallbackBinanceUrl = buildBinanceUrl(symbol, quote);
-  const binanceUrl = safeStr(asset.binance_url) || fallbackBinanceUrl;
-  const affiliateUrl = safeStr(asset.affiliate_url) || buildAffiliateUrl(binanceUrl);
+  const binanceUrl = safeStr(asset.binance_url) || buildBinanceUrl(symbol, quote);
 
   return {
     ...asset,
     id: safeStr(asset.id) || symbol.toLowerCase(),
     symbol,
     name: safeStr(asset.name) || symbol,
+    price: safeNumber(asset.price, 0),
+    chg_24h_pct: safeNumber(asset.chg_24h_pct, 0),
+    confidence_score: safeNumber(asset.confidence_score, 0),
+    regime: normalizeRegime(asset.regime),
+    market_cap: safeOptionalNumber(asset.market_cap),
+    volume_24h: safeOptionalNumber(asset.volume_24h),
     binance_url: binanceUrl,
-    affiliate_url: affiliateUrl,
+    affiliate_url: buildAffiliateUrl(binanceUrl),
   };
+}
+
+function normalizeSnapshotItems(snapshot: ScanSnapshot, quote: Quote): ScanServiceItem[] {
+  if (!Array.isArray(snapshot.data) || snapshot.data.length === 0) {
+    return [];
+  }
+
+  const normalizedAssets = normalizeLegacySnapshotData(snapshot.data);
+  return normalizedAssets.map((asset) => toScanServiceItem(asset, quote));
 }
 
 function applySearch(list: ScanServiceItem[], q: string | null): ScanServiceItem[] {
@@ -220,12 +262,12 @@ function applySearch(list: ScanServiceItem[], q: string | null): ScanServiceItem
   });
 }
 
-function getSortValue(asset: ScanServiceItem, sortKey: SortKey): number | null {
+function getSortValue(asset: ScanServiceItem, sortKey: SortKey): number {
   if (sortKey === "price") {
-    return safeNum(asset.price);
+    return safeNumber(asset.price, 0);
   }
 
-  return safeNum(asset.confidence_score);
+  return safeNumber(asset.confidence_score, 0);
 }
 
 function sortItems(items: ScanServiceItem[], sortKey: SortKey, order: SortOrder): void {
@@ -235,17 +277,12 @@ function sortItems(items: ScanServiceItem[], sortKey: SortKey, order: SortOrder)
     const aValue = getSortValue(a, sortKey);
     const bValue = getSortValue(b, sortKey);
 
-    const aHas = aValue !== null;
-    const bHas = bValue !== null;
-
-    if (aHas !== bHas) return aHas ? -1 : 1;
-
-    if (aHas && bHas && aValue !== bValue) {
-      return ((aValue as number) - (bValue as number)) * direction;
+    if (aValue !== bValue) {
+      return (aValue - bValue) * direction;
     }
 
-    const aScore = safeNum(a.confidence_score) ?? -Infinity;
-    const bScore = safeNum(b.confidence_score) ?? -Infinity;
+    const aScore = safeNumber(a.confidence_score, 0);
+    const bScore = safeNumber(b.confidence_score, 0);
 
     if (aScore !== bScore) {
       return bScore - aScore;
@@ -255,9 +292,34 @@ function sortItems(items: ScanServiceItem[], sortKey: SortKey, order: SortOrder)
   });
 }
 
+function buildFallbackAsset(input: {
+  id: string;
+  symbol: string;
+  name: string;
+  price: number;
+  chg_24h_pct: number;
+  confidence_score: number;
+  regime: Regime;
+}): ScanAsset {
+  return {
+    id: input.id,
+    symbol: input.symbol,
+    name: input.name,
+    price: input.price,
+    chg_24h_pct: input.chg_24h_pct,
+    confidence_score: input.confidence_score,
+    score_delta: null,
+    score_trend: null,
+    regime: input.regime,
+    market_cap: undefined,
+    volume_24h: undefined,
+    binance_url: "",
+  };
+}
+
 function fallbackAssets(quote: Quote): ScanServiceItem[] {
-  const base: Array<Partial<ScanAsset> & Pick<ScanAsset, "id" | "symbol" | "name">> = [
-    {
+  const base: ScanAsset[] = [
+    buildFallbackAsset({
       id: "btc",
       symbol: "BTC",
       name: "Bitcoin",
@@ -265,26 +327,8 @@ function fallbackAssets(quote: Quote): ScanServiceItem[] {
       chg_24h_pct: 0.3,
       confidence_score: 98,
       regime: "TRANSITION",
-    },
-    {
-      id: "eth",
-      symbol: "ETH",
-      name: "Ethereum",
-      price: 3200,
-      chg_24h_pct: 0.7,
-      confidence_score: 91,
-      regime: "TRANSITION",
-    },
-    {
-      id: "sol",
-      symbol: "SOL",
-      name: "Solana",
-      price: 145,
-      chg_24h_pct: 1.1,
-      confidence_score: 84,
-      regime: "VOLATILE",
-    },
-    {
+    }),
+    buildFallbackAsset({
       id: "usdt",
       symbol: "USDT",
       name: "Tether",
@@ -292,34 +336,32 @@ function fallbackAssets(quote: Quote): ScanServiceItem[] {
       chg_24h_pct: 0.01,
       confidence_score: 95,
       regime: "STABLE",
-    },
+    }),
+    buildFallbackAsset({
+      id: "eth",
+      symbol: "ETH",
+      name: "Ethereum",
+      price: 3200,
+      chg_24h_pct: 0.7,
+      confidence_score: 91,
+      regime: "TRANSITION",
+    }),
+    buildFallbackAsset({
+      id: "sol",
+      symbol: "SOL",
+      name: "Solana",
+      price: 145,
+      chg_24h_pct: 1.1,
+      confidence_score: 84,
+      regime: "VOLATILE",
+    }),
   ];
 
-  return base.map((asset) =>
-    toScanServiceItem(
-      {
-        id: asset.id,
-        symbol: asset.symbol,
-        name: asset.name,
-        price: asset.price ?? null,
-        chg_24h_pct: asset.chg_24h_pct ?? null,
-        confidence_score: asset.confidence_score ?? null,
-        regime: asset.regime ?? null,
-        binance_url: "",
-        affiliate_url: "",
-        market_cap: null,
-        volume_24h: null,
-        score_delta: null,
-        score_trend: null,
-      },
-      quote
-    )
-  );
+  return base.map((asset) => toScanServiceItem(asset, quote));
 }
 
 function buildResult(
-  input: Partial<ScanServiceResult> &
-    Pick<ScanServiceResult, "ts" | "quote">
+  input: Partial<ScanServiceResult> & Pick<ScanServiceResult, "ts" | "quote">
 ): ScanServiceResult {
   return {
     ok: Boolean(input.ok),
@@ -331,7 +373,7 @@ function buildResult(
     count: input.count ?? 0,
     data: input.data ?? [],
     error: input.error ?? null,
-    warnings: input.warnings ?? [],
+    warnings: uniqueWarnings(input.warnings),
     meta: {
       q: input.meta?.q ?? null,
       sort: input.meta?.sort ?? DEFAULT_SORT,
@@ -350,6 +392,8 @@ export async function getScanService(
   const q = normalizeSearch(input.q);
   const noStore = input.noStore === true;
 
+  const canonicalSnapshotKey = buildCanonicalSnapshotKey(quote);
+
   const cacheKey = buildScanServiceCacheKey({
     quote,
     sort: sortLabel,
@@ -359,6 +403,7 @@ export async function getScanService(
 
   if (!noStore) {
     const cached = getScanMemCache(cacheKey, SCAN_CACHE_TTL_MS);
+
     if (cached) {
       return buildResult({
         ...cached,
@@ -369,37 +414,42 @@ export async function getScanService(
     }
   }
 
+  let source: ScanServiceResult["source"] = "scan_snapshot";
+  let items: ScanServiceItem[] = [];
   const warnings: string[] = [];
-  const canonicalSnapshotKey = buildCanonicalSnapshotKey(quote);
-
-  let snapshot: ScanSnapshot | null = null;
 
   try {
-    const cachedSnapshot = getFromCache<ScanSnapshot>(canonicalSnapshotKey, SNAPSHOT_TTL_MS);
+    const cachedSnapshot = getFromCache<ScanSnapshot>(
+      canonicalSnapshotKey,
+      SNAPSHOT_TTL_MS
+    );
+
     if (cachedSnapshot && isScanSnapshot(cachedSnapshot)) {
-      snapshot = cachedSnapshot;
+      items = normalizeSnapshotItems(cachedSnapshot, quote);
+
+      if (items.length === 0) {
+        source = "fallback";
+        warnings.push("scan_snapshot_empty", "scan_fallback_used");
+        items = fallbackAssets(quote);
+      }
     } else if (cachedSnapshot) {
-      warnings.push("scan_snapshot_invalid");
+      source = "fallback";
+      warnings.push("scan_snapshot_invalid", "scan_fallback_used");
+      items = fallbackAssets(quote);
     } else {
-      warnings.push("scan_snapshot_missing");
+      source = "fallback";
+      warnings.push("scan_snapshot_missing", "scan_fallback_used");
+      items = fallbackAssets(quote);
     }
   } catch (error) {
+    source = "fallback";
     warnings.push(
       error instanceof Error && error.message
         ? `scan_snapshot_read_failed:${error.message}`
-        : "scan_snapshot_read_failed"
+        : "scan_snapshot_read_failed",
+      "scan_fallback_used"
     );
-  }
-
-  let source: ScanServiceResult["source"] = "scan_snapshot";
-  let items: ScanServiceItem[] = [];
-
-  if (!snapshot || !Array.isArray(snapshot.data) || snapshot.data.length === 0) {
-    source = "fallback";
-    warnings.push("scan_fallback_used");
     items = fallbackAssets(quote);
-  } else {
-    items = snapshot.data.map((asset) => toScanServiceItem(asset, quote));
   }
 
   const searched = applySearch(items, q);
@@ -413,7 +463,7 @@ export async function getScanService(
     source,
     market: DEFAULT_MARKET,
     quote,
-    count: sliced.length,
+    count: searched.length,
     data: sliced,
     error: null,
     warnings,
@@ -426,12 +476,6 @@ export async function getScanService(
 
   if (!noStore) {
     setScanMemCache(cacheKey, result);
-
-    try {
-      setToCache(`xyvala:scan:service:${XYVALA_VERSION}:quote=${quote}:sort=${sortLabel}:limit=${limit}:q=${q ?? ""}`, result);
-    } catch (error) {
-      void error;
-    }
   }
 
   return result;
