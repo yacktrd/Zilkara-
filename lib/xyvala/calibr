@@ -1,0 +1,408 @@
+/* ============================================================================
+ * FILE: lib/xyvala/calibration/decision-calibration-state.ts
+ * ----------------------------------------------------------------------------
+ * TITLE
+ * - Xyvala active decision calibration state
+ *
+ * PARENT FILES
+ * - lib/xyvala/calibration/calibration-contracts.ts
+ *
+ * ROLE
+ * - hold the active calibration state derived from observed decision distribution
+ * - expose deterministic get / set / clear accessors
+ * - provide a readable calibration state for internal audit and preview routes
+ * - adapt adaptive decision distribution policy into readable calibration state
+ * - preserve strict separation between calibration truth and analytical truth
+ *
+ * DIRECTIVES
+ * - no provider parsing here
+ * - no route logic here
+ * - no UI logic here
+ * - no RFS recomputation here
+ * - no MCI recomputation here
+ * - no threshold derivation here
+ * - no distribution calculation here
+ * - persistence/state/adaptation only
+ * - contracts imported from calibration-contracts.ts
+ *
+ * INVARIANTS
+ * - one active state at a time
+ * - last_updated_ts is required
+ * - targets.distribution is always materialized
+ * - getter never mutates internal state
+ * - same input state = same stored state shape
+ * - adaptive policy is adapted without mutating the original policy
+ * ========================================================================== */
+
+import type {
+  ActiveDecisionCalibrationState,
+  AdaptiveDecisionDistributionPolicy,
+  CalibrationPolicySource,
+  CalibrationRegime,
+  DecisionCalibrationReadableState,
+  DecisionDistribution,
+  DecisionDistributionPolicy,
+  DecisionDistributionStats,
+  RegimeDistributionStats,
+} from "@/lib/xyvala/calibration/calibration-contracts";
+
+/* ============================================================================
+ * 1. CONFIG
+ * ========================================================================== */
+
+const TARGET_DISTRIBUTION: DecisionDistribution = {
+  allow: 15,
+  watch: 70,
+  block: 15,
+};
+
+const DISTRIBUTION_TOLERANCE = 20;
+
+/* ============================================================================
+ * 2. SAFE HELPERS
+ * ========================================================================== */
+
+function safeNumber(value: unknown, fallback = 0): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : fallback;
+}
+
+function cloneDistribution(
+  distribution?: DecisionDistribution,
+): DecisionDistribution {
+  return {
+    allow: safeNumber(distribution?.allow, TARGET_DISTRIBUTION.allow),
+    watch: safeNumber(distribution?.watch, TARGET_DISTRIBUTION.watch),
+    block: safeNumber(distribution?.block, TARGET_DISTRIBUTION.block),
+  };
+}
+
+function clonePolicy(
+  policy: DecisionDistributionPolicy,
+): DecisionDistributionPolicy {
+  return {
+    allow: safeNumber(policy.allow),
+    block: safeNumber(policy.block),
+    risk: safeNumber(policy.risk),
+    support: safeNumber(policy.support),
+  };
+}
+
+function uniqueWarnings(warnings: string[] = []): string[] {
+  return [
+    ...new Set(
+      warnings.filter(
+        (warning): warning is string =>
+          typeof warning === "string" && warning.trim().length > 0,
+      ),
+    ),
+  ];
+}
+
+function isDistributionOutsideTolerance(
+  distribution?: DecisionDistribution,
+): boolean {
+  const safeDistribution = cloneDistribution(distribution);
+
+  return (
+    Math.abs(safeDistribution.allow - TARGET_DISTRIBUTION.allow) >
+      DISTRIBUTION_TOLERANCE ||
+    Math.abs(safeDistribution.watch - TARGET_DISTRIBUTION.watch) >
+      DISTRIBUTION_TOLERANCE ||
+    Math.abs(safeDistribution.block - TARGET_DISTRIBUTION.block) >
+      DISTRIBUTION_TOLERANCE
+  );
+}
+
+/* ============================================================================
+ * 3. ADAPTIVE POLICY ADAPTERS
+ * ========================================================================== */
+
+function mapAdaptivePolicySource(
+  source: AdaptiveDecisionDistributionPolicy["source"],
+): CalibrationPolicySource {
+  return source === "adaptive" ? "calibrated" : "fallback";
+}
+
+function mapStatsToDistribution(
+  stats?: DecisionDistributionStats,
+): DecisionDistribution {
+  return {
+    allow: safeNumber(stats?.allow_pct),
+    watch: safeNumber(stats?.watch_pct),
+    block: safeNumber(stats?.block_pct),
+  };
+}
+
+function mapRegimeStatsToDistribution(
+  stats?: RegimeDistributionStats,
+): Record<CalibrationRegime, DecisionDistribution> {
+  return {
+    STABLE: mapStatsToDistribution(stats?.STABLE),
+    TRANSITION: mapStatsToDistribution(stats?.TRANSITION),
+    VOLATILE: mapStatsToDistribution(stats?.VOLATILE),
+  };
+}
+
+function mapAdaptiveThresholdsToPolicy(
+  policy: AdaptiveDecisionDistributionPolicy,
+): DecisionDistributionPolicy {
+  return {
+    allow: safeNumber(policy.thresholds.stable_allow_raw_min),
+    block: safeNumber(policy.thresholds.global_block_raw_min),
+    risk: safeNumber(policy.thresholds.global_block_raw_min),
+    support: safeNumber(policy.thresholds.stable_allow_raw_min),
+  };
+}
+
+/* ============================================================================
+ * 4. READABLE STATE BUILDERS
+ * ========================================================================== */
+
+export function buildDecisionCalibrationState(input: {
+  policy: DecisionDistributionPolicy;
+  policy_source: CalibrationPolicySource;
+  sample_size: number;
+  effective_sample_size: number;
+  observed_distribution: DecisionDistribution;
+  per_regime_distribution?: Record<CalibrationRegime, DecisionDistribution>;
+  warnings?: string[];
+}): DecisionCalibrationReadableState {
+  const perRegime = input.per_regime_distribution;
+
+  return {
+    thresholds: clonePolicy(input.policy),
+
+    summary: {
+      source: input.policy_source,
+      sample_size: safeNumber(input.sample_size),
+      effective_sample_size: safeNumber(input.effective_sample_size),
+    },
+
+    targets: {
+      distribution: cloneDistribution(TARGET_DISTRIBUTION),
+    },
+
+    observed_distribution: cloneDistribution(input.observed_distribution),
+
+    per_regime_distribution: perRegime
+      ? {
+          STABLE: cloneDistribution(perRegime.STABLE),
+          TRANSITION: cloneDistribution(perRegime.TRANSITION),
+          VOLATILE: cloneDistribution(perRegime.VOLATILE),
+        }
+      : undefined,
+
+    flags: {
+      fallback_active: input.policy_source === "fallback",
+
+      global_outside_tolerance: isDistributionOutsideTolerance(
+        input.observed_distribution,
+      ),
+
+      stable_outside_tolerance: isDistributionOutsideTolerance(
+        perRegime?.STABLE,
+      ),
+
+      transition_outside_tolerance: isDistributionOutsideTolerance(
+        perRegime?.TRANSITION,
+      ),
+
+      volatile_outside_tolerance: isDistributionOutsideTolerance(
+        perRegime?.VOLATILE,
+      ),
+    },
+
+    warnings: uniqueWarnings(input.warnings ?? []),
+  };
+}
+
+export function buildDecisionCalibrationStateFromAdaptivePolicy(
+  policy: AdaptiveDecisionDistributionPolicy,
+): DecisionCalibrationReadableState {
+  return buildDecisionCalibrationState({
+    policy: mapAdaptiveThresholdsToPolicy(policy),
+    policy_source: mapAdaptivePolicySource(policy.source),
+    sample_size: safeNumber(policy.sample_size),
+    effective_sample_size: safeNumber(policy.effective_sample_size),
+    observed_distribution: mapStatsToDistribution(
+      policy.observed_distribution.global,
+    ),
+    per_regime_distribution: mapRegimeStatsToDistribution(
+      policy.observed_distribution.by_regime,
+    ),
+    warnings: uniqueWarnings(policy.warnings ?? []),
+  });
+}
+
+/* ============================================================================
+ * 5. ACTIVE STATE HOLDER
+ * ========================================================================== */
+
+let activeDecisionCalibrationState: ActiveDecisionCalibrationState | null = null;
+
+export function getCalibrationState(): ActiveDecisionCalibrationState | null {
+  if (!activeDecisionCalibrationState) return null;
+
+  const state = activeDecisionCalibrationState.state;
+
+  return {
+    policy: clonePolicy(activeDecisionCalibrationState.policy),
+
+    state: {
+      thresholds: clonePolicy(state.thresholds),
+
+      summary: {
+        ...state.summary,
+      },
+
+      targets: {
+        distribution: cloneDistribution(state.targets.distribution),
+        ...(state.targets.global ? { global: state.targets.global } : {}),
+        ...(state.targets.by_regime
+          ? { by_regime: state.targets.by_regime }
+          : {}),
+      },
+
+      ...(state.observed_distribution
+        ? { observed_distribution: cloneDistribution(state.observed_distribution as DecisionDistribution) }
+        : {}),
+
+      ...(state.per_regime_distribution
+        ? {
+            per_regime_distribution: {
+              STABLE: cloneDistribution(
+                (state.per_regime_distribution as Record<
+                  CalibrationRegime,
+                  DecisionDistribution
+                >).STABLE,
+              ),
+              TRANSITION: cloneDistribution(
+                (state.per_regime_distribution as Record<
+                  CalibrationRegime,
+                  DecisionDistribution
+                >).TRANSITION,
+              ),
+              VOLATILE: cloneDistribution(
+                (state.per_regime_distribution as Record<
+                  CalibrationRegime,
+                  DecisionDistribution
+                >).VOLATILE,
+              ),
+            },
+          }
+        : {}),
+
+      flags: {
+        ...state.flags,
+      },
+
+      warnings: uniqueWarnings(state.warnings),
+    },
+
+    last_updated_ts: activeDecisionCalibrationState.last_updated_ts,
+  };
+}
+
+export function setCalibrationState(
+  next: ActiveDecisionCalibrationState,
+): ActiveDecisionCalibrationState {
+  activeDecisionCalibrationState = {
+    policy: clonePolicy(next.policy),
+
+    state: {
+      thresholds: clonePolicy(next.state.thresholds),
+
+      summary: {
+        ...next.state.summary,
+      },
+
+      targets: {
+        distribution: cloneDistribution(next.state.targets.distribution),
+        ...(next.state.targets.global
+          ? { global: next.state.targets.global }
+          : {}),
+        ...(next.state.targets.by_regime
+          ? { by_regime: next.state.targets.by_regime }
+          : {}),
+      },
+
+      ...(next.state.observed_distribution
+        ? {
+            observed_distribution: cloneDistribution(
+              next.state.observed_distribution as DecisionDistribution,
+            ),
+          }
+        : {}),
+
+      ...(next.state.per_regime_distribution
+        ? {
+            per_regime_distribution: {
+              STABLE: cloneDistribution(
+                (next.state.per_regime_distribution as Record<
+                  CalibrationRegime,
+                  DecisionDistribution
+                >).STABLE,
+              ),
+              TRANSITION: cloneDistribution(
+                (next.state.per_regime_distribution as Record<
+                  CalibrationRegime,
+                  DecisionDistribution
+                >).TRANSITION,
+              ),
+              VOLATILE: cloneDistribution(
+                (next.state.per_regime_distribution as Record<
+                  CalibrationRegime,
+                  DecisionDistribution
+                >).VOLATILE,
+              ),
+            },
+          }
+        : {}),
+
+      flags: {
+        ...next.state.flags,
+      },
+
+      warnings: uniqueWarnings(next.state.warnings),
+    },
+
+    last_updated_ts: next.last_updated_ts,
+  };
+
+  const stored = getCalibrationState();
+
+  if (!stored) {
+    throw new Error("CALIBRATION_STATE_WRITE_FAILED");
+  }
+
+  return stored;
+}
+
+export function clearCalibrationState(): void {
+  activeDecisionCalibrationState = null;
+}
+
+/* ============================================================================
+ * 6. TYPE RE-EXPORTS
+ * ----------------------------------------------------------------------------
+ * ROLE
+ * - expose only the minimal public calibration state contracts
+ * - avoid leaking internal adaptive or orchestration types
+ * - preserve a stable and predictable external contract surface
+ * ========================================================================== */
+
+export type {
+  ActiveDecisionCalibrationState,
+  DecisionCalibrationReadableState,
+  DecisionDistributionPolicy,
+};
+
+/* ============================================================================
+ * NOTES
+ * ----------------------------------------------------------------------------
+ * - DO NOT export AdaptiveDecisionDistributionPolicy here
+ * - DO NOT export internal scoring / pressure / comparator types
+ * - This file remains the public entry point for calibration state consumption
+ * ========================================================================== */

@@ -362,7 +362,7 @@ export async function GET(req: NextRequest) {
       key: auth.key,
       keyType: auth.keyType,
       endpoint: "/api/stats",
-      planOverride: auth.plan,
+      plan: auth.plan,
     });
   } catch (error) {
     usageWarnings = uniqueWarnings([

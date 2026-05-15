@@ -1,88 +1,127 @@
-// lib/stability.ts
+/*
+ * FILE: lib/stability.ts
+ *
+ * ROLE
+ * - compute lightweight public stability helpers
+ * - keep legacy UI ranking helpers aligned with public ScanAsset usage
+ *
+ * DIRECTIVES
+ * - public helper only
+ * - no RFS recomputation
+ * - no MCI recomputation
+ * - no private decision exposure
+ * - no opportunity logic
+ * - no calibration logic
+ * - deterministic output only
+ * - same input => same output
+ */
+
 import { clamp } from "./utils";
-import type { Regime, Timeframe } from "./types";
+
+import type { CalibrationRegime } from "@/lib/xyvala/calibration/calibration-contracts";
+
+export type Timeframe = "24H" | "7D" | "30D";
+
+export type Regime = CalibrationRegime;
+
+/* ============================================================================
+ * 1. REGIME HELPER
+ * ========================================================================== */
 
 export function regimeFromChg24(chg24Pct: number): Regime {
-  const a = Math.abs(chg24Pct);
-  if (a <= 3) return "STABLE";
-  if (a <= 8) return "TRANSITION";
+  const absoluteChange = Math.abs(chg24Pct);
+
+  if (absoluteChange <= 3) {
+    return "STABLE";
+  }
+
+  if (absoluteChange <= 8) {
+    return "TRANSITION";
+  }
+
   return "VOLATILE";
 }
 
-// Normalisations simples, robustes, testables
-function normAbsPct(absPct: number, cap: number) {
-  // 0 => 0, cap => 1
+/* ============================================================================
+ * 2. NORMALIZATION HELPERS
+ * ========================================================================== */
+
+function normalizeAbsolutePercent(absPct: number, cap: number): number {
+  if (!Number.isFinite(absPct) || !Number.isFinite(cap) || cap <= 0) {
+    return 0;
+  }
+
   return clamp(absPct / cap, 0, 1);
 }
-function normLog10(v: number | undefined, low: number, high: number) {
-  // log10 scale -> 0..1
-  if (!v || v <= 0) return 0.5; // neutral if missing
-  const x = Math.log10(v);
-  return clamp((x - low) / (high - low), 0, 1);
+
+function normalizeLog10(
+  value: number | null | undefined,
+  low: number,
+  high: number,
+): number {
+  if (
+    typeof value !== "number" ||
+    !Number.isFinite(value) ||
+    value <= 0 ||
+    high <= low
+  ) {
+    return 0.5;
+  }
+
+  const scaled = Math.log10(value);
+
+  return clamp((scaled - low) / (high - low), 0, 1);
 }
 
-/**
- * Stability index (0..100) — “quality of movement”
- * Uses only what we reliably have in CoinGecko markets endpoint:
- * - chg_24h_pct
- * - market_cap
- * - volume_24h
- *
- * Timeframe adaptation (V1):
- * - 24H is real
- * - 7D/30D are “weight adaptations” to avoid breaking UI/flow.
- *   (Later: replace by candle-based engine per TF)
- */
+/* ============================================================================
+ * 3. STABILITY INDEX
+ * ========================================================================== */
+
 export function computeStabilityIndex(input: {
   timeframe: Timeframe;
   chg24Pct: number;
-  marketCap?: number;
-  volume24h?: number;
-}) {
-  const absChg = Math.abs(input.chg24Pct);
+  marketCap?: number | null;
+  volume24h?: number | null;
+}): number {
+  const absoluteChange = Math.abs(input.chg24Pct);
 
-  // volatility proxy: smaller abs change => more stable
-  const vol = normAbsPct(absChg, 10);      // 0..1
-  const invVol = 1 - vol;                  // 1..0
+  const volatility = normalizeAbsolutePercent(absoluteChange, 10);
+  const inverseVolatility = 1 - volatility;
 
-  // liquidity proxies (more = more stable execution conditions)
-  const mc = normLog10(input.marketCap, 8, 12);     // ~1e8..1e12
-  const vv = normLog10(input.volume24h, 7, 11);     // ~1e7..1e11
+  const marketCapScore = normalizeLog10(input.marketCap, 8, 12);
+  const volumeScore = normalizeLog10(input.volume24h, 7, 11);
 
-  // Timeframe weights (V1 adaptation)
-  // 24H: balanced
-  // 7D: penalize volatility a bit more, rely slightly more on liquidity
-  // 30D: emphasize liquidity more (slow regime)
-  const w =
+  const weights =
     input.timeframe === "24H"
-      ? { invVol: 0.60, mc: 0.25, vv: 0.15 }
+      ? { inverseVolatility: 0.6, marketCap: 0.25, volume: 0.15 }
       : input.timeframe === "7D"
-      ? { invVol: 0.65, mc: 0.22, vv: 0.13 }
-      : { invVol: 0.55, mc: 0.30, vv: 0.15 };
+        ? { inverseVolatility: 0.65, marketCap: 0.22, volume: 0.13 }
+        : { inverseVolatility: 0.55, marketCap: 0.3, volume: 0.15 };
 
-  const raw01 = w.invVol * invVol + w.mc * mc + w.vv * vv;
-  const score = Math.round(100 * clamp(raw01, 0, 1));
+  const rawScore =
+    weights.inverseVolatility * inverseVolatility +
+    weights.marketCap * marketCapScore +
+    weights.volume * volumeScore;
 
-  return score; // 0..100
+  return clamp(Math.round(rawScore * 100), 0, 100);
 }
 
-/**
- * Rank score used for sorting (0..100)
- * In V1, we use stability as the primary driver.
- * You can extend later with “shock”, “breaks”, “drift”, etc.
- */
+/* ============================================================================
+ * 4. PUBLIC RANK SCORE
+ * ========================================================================== */
+
 export function computeRankScore(input: {
   stabilityIndex: number;
   regime: Regime;
   timeframe: Timeframe;
-}) {
-  // Regime modifier: volatile regimes slightly penalized for “discipline-first” ranking
-  const regimeMod =
-    input.regime === "STABLE" ? 1.0 : input.regime === "TRANSITION" ? 0.90 : 0.78;
+}): number {
+  const regimeModifier =
+    input.regime === "STABLE" ? 1 : input.regime === "TRANSITION" ? 0.9 : 0.78;
 
-  // TF modifier: keep ranking consistent (small effects only)
-  const tfMod = input.timeframe === "24H" ? 1.0 : input.timeframe === "7D" ? 0.98 : 0.96;
+  const timeframeModifier =
+    input.timeframe === "24H" ? 1 : input.timeframe === "7D" ? 0.98 : 0.96;
 
-  const raw = input.stabilityIndex * regimeMod * tfMod;
-  return clamp(Math.round(raw), 0, 100);
+  const rawScore = input.stabilityIndex * regimeModifier * timeframeModifier;
+
+  return clamp(Math.round(rawScore), 0, 100);
 }

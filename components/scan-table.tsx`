@@ -1,0 +1,1255 @@
+
+"use client";
+
+/* ==========================================================================
+   XYVALA — components/scan-table.tsx
+   --------------------------------------------------------------------------
+   ROLE
+   - render normalized scanner data only
+   - preserve Xyvala public semantics
+   - keep UI logic separate from CSS
+   - expose readable RFS / MCI outputs without revealing internals
+   - distinguish missing / invalid / empty upstream states instead of masking them
+   - keep a single UI source of truth: visibleData
+   - derive Top 3 from visibleData only
+
+   OFFICIAL UI VOCABULARY
+   - rank
+   - logos
+   - assets
+   - 24H
+   - Chart 7D
+   - 7D
+   - 7D Vol
+   - stability
+   - opportunity
+   - regime
+   - decision
+   - trade
+
+   FILE SECTIONS
+   1. shared ui tokens
+   2. types
+   3. safe helpers
+   4. normalization
+   5. sorting core
+   6. formatters
+   7. sparkline
+   8. shared modules
+   9. compact top opportunities
+   10. desktop premium table
+   11. mobile cards
+   12. state blocks
+   13. main component
+   ========================================================================== */
+
+import React, { useDeferredValue, useMemo, useState } from "react";
+
+/* ==========================================================================
+   1. SHARED UI TOKENS
+   ========================================================================== */
+
+const UI = {
+  getPctClass(value: number): "pos" | "neg" | "neutral" {
+    if (value > 0) return "pos";
+    if (value < 0) return "neg";
+    return "neutral";
+  },
+
+  getDecisionClass(value: Decision): "allow" | "watch" | "block" {
+    if (value === "ALLOW") return "allow";
+    if (value === "BLOCK") return "block";
+    return "watch";
+  },
+
+  getDecisionRank(value: Decision): number {
+    if (value === "ALLOW") return 3;
+    if (value === "WATCH") return 2;
+    return 1;
+  },
+
+  getRegimeClass(value: Regime): "regimeStable" | "regimeTransition" | "regimeVolatile" {
+    if (value === "STABLE") return "regimeStable";
+    if (value === "TRANSITION") return "regimeTransition";
+    return "regimeVolatile";
+  },
+
+  getStabilityLabel(stability: number): "LOW" | "MEDIUM" | "HIGH" {
+    if (stability >= 70) return "HIGH";
+    if (stability >= 40) return "MEDIUM";
+    return "LOW";
+  },
+
+  getTradeButtonClass(disabled: boolean): string {
+    return disabled ? "tradeDisabled" : "tradeBtn";
+  },
+} as const;
+
+/* ==========================================================================
+   2. TYPES
+   ========================================================================== */
+
+type Quote = "EUR" | "USD" | "USDT";
+type Regime = "STABLE" | "TRANSITION" | "VOLATILE";
+type Decision = "ALLOW" | "WATCH" | "BLOCK";
+
+type SortPreset =
+  | "price_desc"
+  | "price_asc"
+  | "pct24h_desc"
+  | "pct24h_asc"
+  | "chart7d_desc"
+  | "chart7d_asc"
+  | "stability_desc"
+  | "stability_asc"
+  | "opportunity_desc"
+  | "opportunity_asc"
+  | "decision_desc"
+  | "decision_asc";
+
+type ScanAssetInput = {
+  id?: unknown;
+  symbol?: unknown;
+  name?: unknown;
+  rank?: unknown;
+
+  price?: unknown;
+  pct24h?: unknown;
+  pct7dDerived?: unknown;
+
+  stability?: unknown;
+  opportunity?: unknown;
+
+  regime?: unknown;
+  decision?: unknown;
+
+  chart7d?: unknown;
+
+  logoUrl?: unknown;
+  fallbackLogo?: unknown;
+
+  href?: unknown;
+  rating?: unknown;
+
+  /* API aliases */
+  chg_24h_pct?: unknown;
+  chg_7d_pct?: unknown;
+  stability_score?: unknown;
+  opportunity_score?: unknown;
+  sparkline_7d?: unknown;
+  sparkline?: unknown;
+  logo_url?: unknown;
+  image?: unknown;
+  affiliate_url?: unknown;
+  binance_url?: unknown;
+};
+
+type NormalizedAsset = {
+  key: string;
+  id: string;
+
+  rank: number | null;
+
+  symbol: string;
+  name: string;
+
+  price: number;
+  pct24h: number;
+  pct7dDerived: number;
+  volatility7d: number;
+
+  stability: number;
+  opportunity: number;
+
+  regime: Regime;
+  decision: Decision;
+
+  chart7d: number[] | null;
+
+  logoUrl: string | null;
+  fallbackLogo: string;
+
+  href: string | null;
+  rating: string | null;
+};
+
+type Props = {
+  assets?: ScanAssetInput[] | null;
+  quote?: Quote | string;
+  sort?: string;
+  limit?: number;
+};
+
+/* ==========================================================================
+   3. SAFE HELPERS
+   ========================================================================== */
+
+function safeString(value: unknown, fallback = ""): string {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : fallback;
+}
+
+function safeNumber(value: unknown, fallback = 0): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function safeNullableNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function safeArrayNumbers(value: unknown): number[] | null {
+  if (!Array.isArray(value)) return null;
+
+  const numbers = value.filter(
+    (item): item is number => typeof item === "number" && Number.isFinite(item),
+  );
+
+  return numbers.length >= 2 ? numbers : null;
+}
+
+function isAssetsArray(value: unknown): value is ScanAssetInput[] {
+  return Array.isArray(value);
+}
+
+function clampScore(value: unknown): number {
+  const numeric = safeNumber(value, 0);
+  return Math.max(0, Math.min(100, Math.round(numeric)));
+}
+
+function buildFallbackLogo(symbol: string): string {
+  return symbol.slice(0, 1).toUpperCase() || "?";
+}
+
+function compute7dFromChart(points: number[] | null): number | null {
+  if (!points || points.length < 2) return null;
+
+  const first = points[0];
+  const last = points[points.length - 1];
+
+  if (!Number.isFinite(first) || !Number.isFinite(last) || first === 0) return null;
+
+  return ((last - first) / Math.abs(first)) * 100;
+}
+
+function compute7dVolatility(points: number[] | null): number | null {
+  if (!points || points.length < 3) return null;
+
+  const returns: number[] = [];
+
+  for (let index = 1; index < points.length; index += 1) {
+    const previous = points[index - 1];
+    const current = points[index];
+
+    if (!Number.isFinite(previous) || !Number.isFinite(current) || previous === 0) {
+      continue;
+    }
+
+    returns.push(((current - previous) / previous) * 100);
+  }
+
+  if (returns.length < 2) return null;
+
+  const mean = returns.reduce((sum, value) => sum + value, 0) / returns.length;
+  const variance =
+    returns.reduce((sum, value) => sum + (value - mean) ** 2, 0) / returns.length;
+
+  return Math.sqrt(variance);
+}
+
+/* ==========================================================================
+   4. NORMALIZATION
+   ========================================================================== */
+
+function normalizeQuote(value?: string): Quote {
+  const normalized = safeString(value, "EUR").toUpperCase();
+
+  if (normalized === "USD") return "USD";
+  if (normalized === "USDT") return "USDT";
+  return "EUR";
+}
+
+function normalizeLimit(value: number | undefined, fallback: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  return Math.max(1, Math.floor(value));
+}
+
+function normalizeRegime(value: unknown): Regime {
+  const normalized = safeString(value, "TRANSITION").toUpperCase();
+
+  if (normalized === "STABLE") return "STABLE";
+  if (normalized === "VOLATILE") return "VOLATILE";
+  return "TRANSITION";
+}
+
+function normalizeDecision(value: unknown): Decision {
+  const normalized = safeString(value, "WATCH").toUpperCase();
+
+  if (normalized === "ALLOW") return "ALLOW";
+  if (normalized === "BLOCK") return "BLOCK";
+  return "WATCH";
+}
+
+function normalizeSortPreset(value?: string): SortPreset {
+  switch (safeString(value, "opportunity_desc")) {
+    case "price_desc":
+    case "price_asc":
+    case "pct24h_desc":
+    case "pct24h_asc":
+    case "chart7d_desc":
+    case "chart7d_asc":
+    case "stability_desc":
+    case "stability_asc":
+    case "opportunity_desc":
+    case "opportunity_asc":
+    case "decision_desc":
+    case "decision_asc":
+      return value as SortPreset;
+    default:
+      return "opportunity_desc";
+  }
+}
+
+function normalizeChart(value: unknown): number[] | null {
+  const data = safeArrayNumbers(value);
+  if (!data) return null;
+
+  return data.slice(-40);
+}
+
+function normalizeAsset(input: ScanAssetInput): NormalizedAsset {
+  const symbol = safeString(input.symbol, "UNKNOWN").toUpperCase();
+  const name = safeString(input.name, symbol);
+
+  const chart7d =
+    normalizeChart(input.chart7d) ??
+    normalizeChart(input.sparkline_7d) ??
+    normalizeChart(input.sparkline);
+
+  const pct7dDerived =
+    safeNullableNumber(input.pct7dDerived) ??
+    safeNullableNumber(input.chg_7d_pct) ??
+    compute7dFromChart(chart7d) ??
+    0;
+
+  const volatility7d = compute7dVolatility(chart7d) ?? 0;
+
+  return {
+    key: safeString(input.id, symbol),
+    id: safeString(input.id, symbol),
+
+    rank: safeNullableNumber(input.rank),
+
+    symbol,
+    name,
+
+    price: safeNumber(input.price, 0),
+    pct24h: safeNumber(input.pct24h ?? input.chg_24h_pct, 0),
+    pct7dDerived: safeNumber(pct7dDerived, 0),
+    volatility7d: safeNumber(volatility7d, 0),
+
+    stability: clampScore(input.stability ?? input.stability_score),
+    opportunity: clampScore(input.opportunity ?? input.opportunity_score),
+
+    regime: normalizeRegime(input.regime),
+    decision: normalizeDecision(input.decision),
+
+    chart7d,
+
+    logoUrl:
+      safeString(input.logoUrl) ||
+      safeString(input.logo_url) ||
+      safeString(input.image) ||
+      null,
+
+    fallbackLogo: safeString(input.fallbackLogo, buildFallbackLogo(symbol)),
+
+    href:
+      safeString(input.href) ||
+      safeString(input.affiliate_url) ||
+      safeString(input.binance_url) ||
+      null,
+
+    rating: safeString(input.rating) || null,
+  };
+}
+
+/* ==========================================================================
+   5. SORTING CORE
+   ========================================================================== */
+
+function getSortValue(asset: NormalizedAsset, preset: SortPreset): number {
+  switch (preset) {
+    case "price_desc":
+    case "price_asc":
+      return asset.price;
+
+    case "pct24h_desc":
+    case "pct24h_asc":
+      return asset.pct24h;
+
+    case "chart7d_desc":
+    case "chart7d_asc":
+      return asset.pct7dDerived;
+
+    case "stability_desc":
+    case "stability_asc":
+      return asset.stability;
+
+    case "opportunity_desc":
+    case "opportunity_asc":
+      return asset.opportunity;
+
+    case "decision_desc":
+    case "decision_asc":
+      return UI.getDecisionRank(asset.decision);
+
+    default:
+      return asset.opportunity;
+  }
+}
+
+
+function compareTopOpportunities(left: NormalizedAsset, right: NormalizedAsset): number {
+  if (right.opportunity !== left.opportunity) {
+    return right.opportunity - left.opportunity;
+  }
+
+  if (UI.getDecisionRank(right.decision) !== UI.getDecisionRank(left.decision)) {
+    return UI.getDecisionRank(right.decision) - UI.getDecisionRank(left.decision);
+  }
+
+  if (right.stability !== left.stability) {
+    return right.stability - left.stability;
+  }
+
+  const leftRank = left.rank ?? Number.POSITIVE_INFINITY;
+  const rightRank = right.rank ?? Number.POSITIVE_INFINITY;
+
+  if (leftRank !== rightRank) {
+    return leftRank - rightRank;
+  }
+
+  return left.symbol.localeCompare(right.symbol);
+}
+
+/* ==========================================================================
+   6. FORMATTERS
+   ========================================================================== */
+
+function formatPrice(value: number, quote: Quote): string {
+  if (!Number.isFinite(value)) return "-";
+
+  if (quote === "EUR") {
+    return new Intl.NumberFormat("fr-FR", {
+      style: "currency",
+      currency: "EUR",
+      maximumFractionDigits: value >= 1000 ? 0 : value >= 1 ? 2 : 6,
+    }).format(value);
+  }
+
+  if (quote === "USD") {
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: "USD",
+      maximumFractionDigits: value >= 1000 ? 0 : value >= 1 ? 2 : 6,
+    }).format(value);
+  }
+
+  const decimals = value >= 1000 ? 0 : value >= 1 ? 2 : 6;
+
+  return `${value.toLocaleString("en-US", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: decimals,
+  })} ${quote}`;
+}
+
+function formatPct(value: number): string {
+  if (!Number.isFinite(value)) return "-";
+  return `${value > 0 ? "+" : ""}${value.toFixed(2)}%`;
+}
+
+function formatVolatility(value: number): string {
+  if (!Number.isFinite(value)) return "-";
+  return `${value.toFixed(2)}%`;
+}
+
+/* ==========================================================================
+   7. SPARKLINE
+   ========================================================================== */
+
+function buildSparklinePath(
+  points: number[],
+  width: number,
+  height: number,
+  paddingX = 4,
+  paddingY = 3,
+): string {
+  if (points.length < 2) return "";
+
+  const base = points[0] || 1;
+  const normalized = points.map((value) => ((value - base) / base) * 100);
+
+  const min = Math.min(...normalized);
+  const max = Math.max(...normalized);
+  const range = max - min || 1;
+
+  const drawWidth = Math.max(width - paddingX * 2, 1);
+  const drawHeight = Math.max(height - paddingY * 2, 1);
+
+  return normalized
+    .map((value, index) => {
+      const x = paddingX + (index / Math.max(normalized.length - 1, 1)) * drawWidth;
+      const y = paddingY + ((max - value) / range) * drawHeight;
+      return `${index === 0 ? "M" : "L"} ${x.toFixed(2)} ${y.toFixed(2)}`;
+    })
+    .join(" ");
+}
+
+function resolveChartTone(data: number[] | null, pct24h: number): "up" | "down" | "flat" {
+  if (data && data.length > 1) {
+    const first = data[0];
+    const last = data[data.length - 1];
+
+    if (last > first) return "up";
+    if (last < first) return "down";
+  }
+
+  if (pct24h > 0) return "up";
+  if (pct24h < 0) return "down";
+  return "flat";
+}
+
+function ChartCell({
+  data,
+  pct24h,
+}: {
+  data: number[] | null;
+  pct24h: number;
+}) {
+  if (!data || data.length < 2) {
+    return <div className="sparkCell sparkFallback">—</div>;
+  }
+
+  const width = 130;
+  const height = 40;
+  const path = buildSparklinePath(data, width, height);
+  const tone = resolveChartTone(data, pct24h);
+  const toneClass =
+    tone === "up" ? "sparkUp" : tone === "down" ? "sparkDown" : "sparkFlat";
+
+  return (
+    <div className="sparkCell" aria-label="7 day chart">
+      <svg
+        className={`sparkSvg ${toneClass}`}
+        width={width}
+        height={height}
+        viewBox={`0 0 ${width} ${height}`}
+        preserveAspectRatio="none"
+        role="img"
+        aria-hidden="true"
+      >
+        <path d={path} className="sparkPath" />
+      </svg>
+    </div>
+  );
+}
+
+/* ==========================================================================
+   8. SHARED MODULES
+   ========================================================================== */
+
+function passes7dPatternFilter(asset: NormalizedAsset): boolean {
+  const prices = asset.chart7d;
+
+  if (!Array.isArray(prices) || prices.length < 12) {
+    return false;
+  }
+
+  let directionChanges = 0;
+  let previousDirection = 0;
+  let significantMoves = 0;
+
+  for (let i = 1; i < prices.length; i++) {
+    const prev = prices[i - 1];
+    const current = prices[i];
+
+    if (!Number.isFinite(prev) || !Number.isFinite(current) || prev <= 0) {
+      return false;
+    }
+
+    const pct = ((current - prev) / prev) * 100;
+
+    // bruit ignoré
+    if (Math.abs(pct) < 0.35) {
+      continue;
+    }
+
+    significantMoves++;
+
+    const direction = pct > 0 ? 1 : -1;
+
+    if (previousDirection !== 0 && direction !== previousDirection) {
+      directionChanges++;
+    }
+
+    previousDirection = direction;
+  }
+
+  if (significantMoves < 4) {
+    return false;
+  }
+
+  const instabilityRate = directionChanges / significantMoves;
+
+  return instabilityRate <= 0.55;
+}
+
+
+function getTopOpportunitiesFromVisibleData(
+  data: NormalizedAsset[],
+): NormalizedAsset[] {
+  return [...data]
+    .sort((a, b) => {
+      const aDecision = UI.getDecisionRank(a.decision);
+      const bDecision = UI.getDecisionRank(b.decision);
+
+      const aRank =
+        typeof a.rank === "number" && Number.isFinite(a.rank)
+          ? a.rank
+          : Number.POSITIVE_INFINITY;
+
+      const bRank =
+        typeof b.rank === "number" && Number.isFinite(b.rank)
+          ? b.rank
+          : Number.POSITIVE_INFINITY;
+
+      const aScore =
+        aDecision * 100000 +
+        a.opportunity * 1000 +
+        a.stability * 100 -
+        Math.min(aRank, 999999);
+
+      const bScore =
+        bDecision * 100000 +
+        b.opportunity * 1000 +
+        b.stability * 100 -
+        Math.min(bRank, 999999);
+
+      if (aScore !== bScore) {
+  return bScore - aScore;
+}
+
+if (a.stability !== b.stability) {
+  return b.stability - a.stability;
+}
+
+if (aRank !== bRank) {
+  return aRank - bRank;
+}   
+
+      return a.symbol.localeCompare(b.symbol);
+    })
+    .slice(0, 3);
+}
+
+function AssetLogo({
+  symbol,
+  logoUrl,
+  fallback,
+}: {
+  symbol: string;
+  logoUrl: string | null;
+  fallback: string;
+}) {
+  const [imgFailed, setImgFailed] = React.useState(false);
+
+  if (imgFailed || !logoUrl) {
+    return <div className="assetLogoFallback">{fallback}</div>;
+  }
+
+  return (
+    <img
+      src={logoUrl}
+      alt={`${symbol} logo`}
+      className="assetLogoImg"
+      loading="lazy"
+      onError={() => {
+        setImgFailed(true);
+      }}
+    />
+  );
+}
+
+function TradeButton({ href }: { href: string | null }) {
+  if (!href) {
+    return (
+      <span className={UI.getTradeButtonClass(true)} aria-disabled="true">
+        Trade
+      </span>
+    );
+  }
+
+  return (
+    <a
+      className={UI.getTradeButtonClass(false)}
+      href={href}
+      target="_blank"
+      rel="noreferrer noopener"
+    >
+      Trade
+    </a>
+  );
+}
+
+function SearchModule({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  return (
+    <div className="toolbarSearch">
+      <input
+        type="search"
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        placeholder="BTC, ETH, SOL..."
+        autoComplete="off"
+        aria-label="Search assets"
+      />
+    </div>
+  );
+}
+
+function SortChip({
+  label,
+  active,
+  direction,
+  onDesc,
+  onAsc,
+}: {
+  label: string;
+  active: boolean;
+  direction: "desc" | "asc" | null;
+  onDesc: () => void;
+  onAsc: () => void;
+}) {
+  return (
+    <div className={`sortChip ${active ? "active" : ""}`}>
+      <span className="sortChipLabel">{label}</span>
+
+      <button
+        type="button"
+        className={direction === "desc" ? "isSelected" : ""}
+        onClick={onDesc}
+        aria-label={`${label} descending`}
+      >
+        ↓
+      </button>
+
+      <button
+        type="button"
+        className={direction === "asc" ? "isSelected" : ""}
+        onClick={onAsc}
+        aria-label={`${label} ascending`}
+      >
+        ↑
+      </button>
+    </div>
+  );
+}
+
+function SortModule({
+  value,
+  onChange,
+}: {
+  value: SortPreset;
+  onChange: (v: SortPreset) => void;
+}) {
+  const priceDirection =
+    value === "price_desc" ? "desc" : value === "price_asc" ? "asc" : null;
+
+  const pct24hDirection =
+    value === "pct24h_desc" ? "desc" : value === "pct24h_asc" ? "asc" : null;
+
+  const chart7dDirection =
+    value === "chart7d_desc" ? "desc" : value === "chart7d_asc" ? "asc" : null;
+
+  const stabilityDirection =
+    value === "stability_desc" ? "desc" : value === "stability_asc" ? "asc" : null;
+
+  const opportunityDirection =
+    value === "opportunity_desc" ? "desc" : value === "opportunity_asc" ? "asc" : null;
+
+  const decisionDirection =
+    value === "decision_desc" ? "desc" : value === "decision_asc" ? "asc" : null;
+
+  return (
+    <div className="toolbarSortGroups" aria-label="Sorting controls">
+      <div className="toolbarSortPair">
+        <SortChip
+          label="Price"
+          active={priceDirection !== null}
+          direction={priceDirection}
+          onDesc={() => onChange("price_desc")}
+          onAsc={() => onChange("price_asc")}
+        />
+
+        <SortChip
+          label="24H"
+          active={pct24hDirection !== null}
+          direction={pct24hDirection}
+          onDesc={() => onChange("pct24h_desc")}
+          onAsc={() => onChange("pct24h_asc")}
+        />
+      </div>
+
+      <div className="toolbarSortPair">
+        <SortChip
+          label="Chart 7D"
+          active={chart7dDirection !== null}
+          direction={chart7dDirection}
+          onDesc={() => onChange("chart7d_desc")}
+          onAsc={() => onChange("chart7d_asc")}
+        />
+
+        <SortChip
+          label="Stability"
+          active={stabilityDirection !== null}
+          direction={stabilityDirection}
+          onDesc={() => onChange("stability_desc")}
+          onAsc={() => onChange("stability_asc")}
+        />
+      </div>
+
+      <div className="toolbarSortPair">
+        <SortChip
+          label="Opportunity"
+          active={opportunityDirection !== null}
+          direction={opportunityDirection}
+          onDesc={() => onChange("opportunity_desc")}
+          onAsc={() => onChange("opportunity_asc")}
+        />
+
+        <SortChip
+          label="Decision"
+          active={decisionDirection !== null}
+          direction={decisionDirection}
+          onDesc={() => onChange("decision_desc")}
+          onAsc={() => onChange("decision_asc")}
+        />
+      </div>
+    </div>
+  );
+}
+
+function ToolbarModule({
+  query,
+  setQuery,
+  sort,
+  setSort,
+}: {
+  query: string;
+  setQuery: (value: string) => void;
+  sort: SortPreset;
+  setSort: (value: SortPreset) => void;
+}) {
+  return (
+    <div className="toolbar" role="group" aria-label="Search and sort">
+      <SearchModule value={query} onChange={setQuery} />
+      <SortModule value={sort} onChange={setSort} />
+    </div>
+  );
+}
+
+/* ==========================================================================
+   9. COMPACT TOP OPPORTUNITIES
+   ========================================================================== */
+
+function TopOpportunitiesCompact({
+  data,
+  quote,
+}: {
+  data: NormalizedAsset[];
+  quote: Quote;
+}) {
+  const topData = useMemo(() => {
+    return getTopOpportunitiesFromVisibleData(data);
+  }, [data]);
+
+  if (topData.length === 0) return null;
+
+    return (
+  <section className="topOpportunitiesCompact">
+    <div className="topOpportunitiesCompactHeader">
+      <h2>Top Opportunities</h2>
+      <p>Ranked by opportunity, stability and decision quality</p>
+    </div>
+
+    <div className="desktopOnly">
+  <DesktopTable data={topData} quote={quote} />
+</div>
+
+<div className="mobileOnly">
+  <MobileCards data={topData} quote={quote} />
+</div>
+
+</section>
+);
+}
+    
+
+/* ==========================================================================
+   10. DESKTOP PREMIUM TABLE
+   ========================================================================== */
+
+function DesktopTable({
+  data,
+  quote,
+}: {
+  data: NormalizedAsset[];
+  quote: Quote;
+}) {
+  return (
+        <div className="tableWrap">
+      <table className="zTable">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Asset</th>
+            <th>Price</th>
+            <th>24H</th>
+            <th>Chart 7D</th>
+            <th>7D</th>
+            <th>Stability</th>
+            <th>Opportunity</th>
+            <th>Regime</th>
+            <th>Decision</th>
+            <th>Trade</th>
+          </tr>
+        </thead>
+
+        <tbody>
+          {data.map((asset, index) => {
+            const pct24hClass = UI.getPctClass(asset.pct24h);
+            const pct7dClass = UI.getPctClass(asset.pct7dDerived);
+            const regimeClass = UI.getRegimeClass(asset.regime);
+            const decisionClass = UI.getDecisionClass(asset.decision);
+
+            return (
+              <tr key={asset.key} className="tableRow">
+                <td className="mono">{index + 1}</td>
+                <td>
+                  <div className="assetCell">
+                    <div className="assetLogo">
+                      <AssetLogo
+                        symbol={asset.symbol}
+                        logoUrl={asset.logoUrl}
+                        fallback={asset.fallbackLogo}
+                      />
+                    </div>
+
+                    <div className="assetMeta">
+                      <div className="assetSymbol">{asset.symbol}</div>
+                      <div className="assetName">{asset.name}</div>
+                    </div>
+                  </div>
+                </td>
+
+                <td className="mono">{formatPrice(asset.price, quote)}</td>
+
+                <td className={`mono ${pct24hClass}`}>{formatPct(asset.pct24h)}</td>
+
+                <td>
+                  <ChartCell data={asset.chart7d} pct24h={asset.pct24h} />
+                </td>
+
+                <td className={`mono ${pct7dClass}`}>{formatPct(asset.pct7dDerived)}</td>
+
+                <td>
+                  <div className="stabilityCell">
+                    <div className="stabilityBar" aria-hidden="true">
+                      <div
+                        className="stabilityFill"
+                        style={{ width: `${asset.stability}%` }}
+                      />
+                    </div>
+                    <span className="stabilityLabel">
+                      {UI.getStabilityLabel(asset.stability)}
+                    </span>
+                  </div>
+                </td>
+
+                <td>
+                  <div className="opportunityCell">
+                    <span className={`opportunityBadge ${decisionClass}`}>
+                      {asset.opportunity}
+                    </span>
+                  </div>
+                </td>
+
+                <td className={regimeClass}>{asset.regime}</td>
+
+                <td className={decisionClass}>{asset.decision}</td>
+
+                <td className="tradeCell">
+                  <TradeButton href={asset.href} />
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/* ==========================================================================
+   11. MOBILE CARDS
+   ========================================================================== */
+
+function MobileCards({
+  data,
+  quote,
+}: {
+  data: NormalizedAsset[];
+  quote: Quote;
+}) {
+  return (
+    <div className="mobileList">
+      {data.map((asset, index) => {
+        const pct24hClass = UI.getPctClass(asset.pct24h);
+        const pct7dClass = UI.getPctClass(asset.pct7dDerived);
+        const regimeClass = UI.getRegimeClass(asset.regime);
+        const decisionClass = UI.getDecisionClass(asset.decision);
+
+        return (
+          <article key={asset.key} className="mobileCard">
+            <div className="mobileCardHeader">
+              <div className="mobileCardRank">
+                #{typeof asset.rank === "number" ? asset.rank : index + 1}
+              </div>
+
+              <div className={`mobileDecisionBadge ${decisionClass}`}>
+                {asset.decision}
+              </div>
+            </div>
+
+            <div className="mobileCardBody">
+              <div className="mobileAssetBlock">
+                <div className="mobileCardAsset">
+                  <div className="assetLogo">
+                    <AssetLogo
+                      symbol={asset.symbol}
+                      logoUrl={asset.logoUrl}
+                      fallback={asset.fallbackLogo}
+                    />
+                  </div>
+
+                  <div className="mobileCardAssetMeta">
+                    <div className="mobileCardSymbol">{asset.symbol}</div>
+                    <div className="mobileCardName">{asset.name}</div>
+                  </div>
+                </div>
+
+                <div className="mobilePriceBlock">
+                  <div className="mobilePriceValue mono">
+                    {formatPrice(asset.price, quote)}
+                  </div>
+                </div>
+
+                <div className="mobileAssetChanges">
+                  <div className="mobileMetricRow">
+                    <span className="mobileMetricLabel">24H</span>
+                    <strong className={`mobileMetricValue mono ${pct24hClass}`}>
+                      {formatPct(asset.pct24h)}
+                    </strong>
+                  </div>
+
+                  <div className="mobileMetricRow">
+                    <span className="mobileMetricLabel">7D</span>
+                    <strong className={`mobileMetricValue mono ${pct7dClass}`}>
+                      {formatPct(asset.pct7dDerived)}
+                    </strong>
+                  </div>
+
+                  <div className="mobileMetricRow">
+                    <span className="mobileMetricLabel">7D Vol</span>
+                    <strong className="mobileMetricValue mono">
+                      {formatVolatility(asset.volatility7d)}
+                    </strong>
+                  </div>
+                </div>
+              </div>
+
+              <div className="mobileStructureBlock">
+                <div className="mobileOpportunityBlock">
+                  <div className="mobileOpportunityLabel">Opportunity</div>
+                  <div className={`mobileOpportunityValue mono ${decisionClass}`}>
+                    {asset.opportunity}
+                  </div>
+                </div>
+
+                <div className="mobileStructureMetrics">
+                  <div className="mobileMetricRow">
+                    <span className="mobileMetricLabel">Stability</span>
+                    <strong className="mobileMetricValue">
+                      {UI.getStabilityLabel(asset.stability)}
+                    </strong>
+                  </div>
+
+                  <div className="mobileMetricRow">
+                    <span className="mobileMetricLabel">Regime</span>
+                    <strong className={`mobileMetricValue ${regimeClass}`}>
+                      {asset.regime}
+                    </strong>
+                  </div>
+                </div>
+              </div>
+
+              <div className="mobileChartBlock">
+                <div className="mobileChartShell">
+                  <div className="mobileChartLabel">Chart 7D</div>
+                  <ChartCell data={asset.chart7d} pct24h={asset.pct24h} />
+                </div>
+              </div>
+            </div>
+
+            <div className="mobileCardFoot">
+              <TradeButton href={asset.href} />
+            </div>
+          </article>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ==========================================================================
+   12. STATE BLOCKS
+   ========================================================================== */
+
+function StateBlock({
+  title,
+  message,
+}: {
+  title: string;
+  message: string;
+}) {
+    <section className="topOpportunitiesCompact">return (
+    <section className="section">
+      <div className="emptyState" role="status" aria-live="polite">
+        <strong>{title}</strong>
+        <div>{message}</div>
+      </div>
+    </section>
+  );
+}
+
+/* ==========================================================================
+   13. MAIN COMPONENT
+   ========================================================================== */
+
+export default function ScanTable({
+  assets,
+  quote = "EUR",
+  sort,
+  limit,
+}: Props) {
+  const [query, setQuery] = useState("");
+  const [sortPreset, setSortPreset] = useState<SortPreset>(normalizeSortPreset(sort));
+
+  const deferredQuery = useDeferredValue(query);
+  const normalizedQuote = normalizeQuote(quote);
+
+  const assetsMissing = assets == null;
+  const assetsInvalid = !assetsMissing && !isAssetsArray(assets);
+  const sourceAssets = isAssetsArray(assets) ? assets : null;
+
+  if (assetsMissing) {
+      <section className="topOpportunitiesCompact">  <section className="topOpportunitiesCompact">return (
+      <StateBlock
+        title="Data source unavailable."
+        message="The assets source is missing or not ready yet."
+      />
+    );
+  }
+
+  if (assetsInvalid || sourceAssets === null) {
+    return (
+      <StateBlock
+        title="Invalid assets payload."
+        message="The upstream contract did not return a valid assets array."
+      />
+    );
+  }
+
+  if (sourceAssets.length === 0) {
+    return (
+      <StateBlock
+        title="No assets available."
+        message="The source returned a valid array, but the current universe is empty."
+      />
+    );
+  }
+
+  const normalizedLimit =
+    typeof limit === "number" && Number.isFinite(limit)
+      ? normalizeLimit(limit, sourceAssets.length)
+      : sourceAssets.length;
+
+    const visibleData = useMemo(() => {
+  const normalizedQuery = deferredQuery.trim().toLowerCase();
+  const normalizedAssets = sourceAssets.map(normalizeAsset);
+
+
+
+  const sortedAssets = [...normalizedAssets].sort((a, b) => {
+  const aPrice = Number.isFinite(a.price) ? a.price : 0;
+  const bPrice = Number.isFinite(b.price) ? b.price : 0;
+
+  if (aPrice !== bPrice) {
+    return bPrice - aPrice;
+  }
+
+  return a.symbol.localeCompare(b.symbol);
+});
+
+  console.log("PROPS LIMIT:", limit);
+  console.log("LIMIT DEBUG:", limit, normalizedLimit, sourceAssets.length);
+
+  return sortedAssets.slice(0, normalizedLimit);
+},[sourceAssets, deferredQuery, normalizedLimit, sortPreset]);
+
+
+  return (
+    <section className="section">
+      <div className="tableHeader">
+        <a href="/" className="brandLink" aria-label="Go to home">
+          <div className="titleBlock">
+            <h2 className="productTitle">Xyvala</h2>
+          </div>
+        </a>
+
+        <div className="headerCenter">
+          <ToolbarModule
+            query={query}
+            setQuery={setQuery}
+            sort={sortPreset}
+            setSort={setSortPreset}
+          />
+        </div>
+      </div>
+
+      <TopOpportunitiesCompact data={visibleData} quote={normalizedQuote} />
+
+           <DesktopTable data={topData}  <div className="desktopOnly">
+        <DesktopTable data={visibleData} quote={normalizedQuote} />
+      </div>
+
+      <div className="mobileOnly">
+        <MobileCards data={visibleData} quote={normalizedQuote} />
+      </div>
+    </section>
+  );
+}

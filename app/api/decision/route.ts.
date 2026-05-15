@@ -1,0 +1,559 @@
+import { NextRequest, NextResponse } from "next/server";
+import {
+  enforceApiPolicy,
+  applyApiAuthHeaders,
+  buildApiKeyErrorResponse,
+} from "@/lib/xyvala/auth";
+import { trackUsage, applyQuotaHeaders } from "@/lib/xyvala/usage";
+import {
+  scanKey,
+  zonesKey,
+  decisionKey,
+  getFromCache,
+  setToCache,
+  type ScanSnapshot,
+  type Quote,
+} from "@/lib/xyvala/snapshot";
+import type { Regime } from "@/lib/xyvala/contracts/scan-contract";
+import { createMemoryRecord } from "@/lib/xyvala/memory";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+const XYVALA_VERSION = "v1";
+const TTL_MS = 45_000;
+const ENDPOINT = "/api/decision";
+const DEFAULT_QUOTE: Quote = "usd";
+
+type RfsAction = "ALLOW" | "WATCH" | "BLOCK";
+type ExecutionMode = "none" | "progressive" | "confirmation" | "reduced";
+
+type BestZone = {
+  price: number;
+  occurrence_score: number;
+  convergence_score: number;
+  correlation_score: number;
+} | null;
+
+type ZonesLikeResponse = {
+  ok?: boolean;
+  best_zone?: BestZone;
+  context?: {
+    market_regime?: Regime;
+  } | null;
+};
+
+type DecisionResponse = {
+  ok: boolean;
+  ts: string;
+  version: string;
+  symbol: string;
+  tf: string;
+  best_zone: BestZone;
+  context: {
+    market_regime: Regime;
+  };
+  rfs_decision: {
+    action: RfsAction;
+    reason_codes: string[];
+    execution_mode: ExecutionMode;
+  };
+  memory: {
+    record_id: string | null;
+    status: "created" | "skipped";
+  };
+  source: "compute" | "cache";
+  error: string | null;
+  meta: {
+    scan_cache_key: string;
+    zones_cache_key: string;
+    decision_cache_key: string;
+    cache: "hit" | "miss";
+    warnings: string[];
+  };
+};
+
+type AuthResult = ReturnType<typeof enforceApiPolicy>;
+type AuthSuccess = Extract<AuthResult, { ok: true }>;
+type UsageResult = ReturnType<typeof trackUsage> | null;
+
+const NOW_ISO = () => new Date().toISOString();
+
+/* -------------------------------------------------------------------------- */
+/* Utils */
+/* -------------------------------------------------------------------------- */
+
+function safeStr(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const s = v.trim();
+  return s.length > 0 ? s : null;
+}
+
+function safeNum(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+function sanitizeSymbol(input: string): string {
+  return input.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 20);
+}
+
+function normalizeTf(tf: string | null): string {
+  const value = (tf ?? "AUTO").trim().toUpperCase();
+
+  if (
+    value === "1H" ||
+    value === "4H" ||
+    value === "1D" ||
+    value === "1W" ||
+    value === "AUTO"
+  ) {
+    return value;
+  }
+
+  return "AUTO";
+}
+
+function uniqueWarnings(
+  ...groups: Array<string[] | undefined | null>
+): string[] {
+  const merged = groups.flatMap((group) => (Array.isArray(group) ? group : []));
+  return [
+    ...new Set(
+      merged.filter(
+        (item): item is string =>
+          typeof item === "string" && item.trim().length > 0
+      )
+    ),
+  ];
+}
+
+function normalizeRegime(v: unknown): Regime {
+  const s = safeStr(v)?.toUpperCase();
+
+  if (s === "STABLE" || s === "TRANSITION" || s === "VOLATILE") {
+    return s;
+  }
+
+  return "TRANSITION";
+}
+
+function hasUsableBestZone(value: unknown): value is Exclude<BestZone, null> {
+  if (!value || typeof value !== "object") return false;
+
+  const record = value as Record<string, unknown>;
+
+  return (
+    safeNum(record.price) !== null &&
+    safeNum(record.occurrence_score) !== null &&
+    safeNum(record.convergence_score) !== null &&
+    safeNum(record.correlation_score) !== null
+  );
+}
+
+function normalizeBestZone(value: unknown): BestZone {
+  if (!hasUsableBestZone(value)) return null;
+
+  const record = value as Record<string, unknown>;
+
+  return {
+    price: Number(record.price),
+    occurrence_score: Number(record.occurrence_score),
+    convergence_score: Number(record.convergence_score),
+    correlation_score: Number(record.correlation_score),
+  };
+}
+
+function buildResponse(
+  input: Partial<DecisionResponse> &
+    Pick<DecisionResponse, "ts" | "symbol" | "tf">
+): DecisionResponse {
+  return {
+    ok: Boolean(input.ok),
+    ts: input.ts,
+    version: input.version ?? XYVALA_VERSION,
+    symbol: input.symbol,
+    tf: input.tf,
+    best_zone: input.best_zone ?? null,
+    context: {
+      market_regime: input.context?.market_regime ?? "TRANSITION",
+    },
+    rfs_decision: {
+      action: input.rfs_decision?.action ?? "WATCH",
+      reason_codes: input.rfs_decision?.reason_codes ?? [],
+      execution_mode: input.rfs_decision?.execution_mode ?? "none",
+    },
+    memory: {
+      record_id: input.memory?.record_id ?? null,
+      status: input.memory?.status ?? "skipped",
+    },
+    source: input.source ?? "compute",
+    error: input.error ?? null,
+    meta: {
+      scan_cache_key: input.meta?.scan_cache_key ?? "",
+      zones_cache_key: input.meta?.zones_cache_key ?? "",
+      decision_cache_key: input.meta?.decision_cache_key ?? "",
+      cache: input.meta?.cache ?? "miss",
+      warnings: input.meta?.warnings ?? [],
+    },
+  };
+}
+
+function rfsDecide(input: {
+  market_regime: Regime;
+  best_zone: BestZone;
+}): {
+  action: RfsAction;
+  reason_codes: string[];
+  execution_mode: ExecutionMode;
+} {
+  const { market_regime, best_zone } = input;
+
+  if (!best_zone) {
+    return {
+      action: "WATCH",
+      reason_codes: ["NO_ZONE"],
+      execution_mode: "none",
+    };
+  }
+
+  const score = best_zone.correlation_score;
+
+  if (market_regime === "VOLATILE") {
+    if (score >= 80) {
+      return {
+        action: "WATCH",
+        reason_codes: ["REGIME_VOLATILE", "ZONE_HIGH"],
+        execution_mode: "reduced",
+      };
+    }
+
+    return {
+      action: "BLOCK",
+      reason_codes: ["REGIME_VOLATILE", "ZONE_NOT_STRONG"],
+      execution_mode: "none",
+    };
+  }
+
+  if (market_regime === "STABLE") {
+    if (score >= 80) {
+      return {
+        action: "ALLOW",
+        reason_codes: ["REGIME_STABLE", "ZONE_HIGH"],
+        execution_mode: "progressive",
+      };
+    }
+
+    if (score >= 60) {
+      return {
+        action: "WATCH",
+        reason_codes: ["REGIME_STABLE", "ZONE_MID"],
+        execution_mode: "confirmation",
+      };
+    }
+
+    return {
+      action: "WATCH",
+      reason_codes: ["REGIME_STABLE", "ZONE_LOW"],
+      execution_mode: "none",
+    };
+  }
+
+  if (score >= 80) {
+    return {
+      action: "ALLOW",
+      reason_codes: ["REGIME_TRANSITION", "ZONE_HIGH"],
+      execution_mode: "confirmation",
+    };
+  }
+
+  if (score >= 60) {
+    return {
+      action: "WATCH",
+      reason_codes: ["REGIME_TRANSITION", "ZONE_MID"],
+      execution_mode: "confirmation",
+    };
+  }
+
+  return {
+    action: "WATCH",
+    reason_codes: ["REGIME_TRANSITION", "ZONE_LOW"],
+    execution_mode: "reduced",
+  };
+}
+
+function respond(
+  payload: DecisionResponse,
+  status: number,
+  auth: AuthSuccess,
+  usage: UsageResult
+): NextResponse<DecisionResponse> {
+  let response = NextResponse.json<DecisionResponse>(payload, {
+    status,
+    headers: {
+      "cache-control": "no-store",
+      "x-xyvala-version": XYVALA_VERSION,
+      "x-xyvala-cache": payload.meta.cache,
+      "x-xyvala-endpoint": ENDPOINT,
+    },
+  });
+
+  response = applyApiAuthHeaders(response, auth);
+
+  if (usage) {
+    response = applyQuotaHeaders(response, usage);
+  }
+
+  return response;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Handler */
+/* -------------------------------------------------------------------------- */
+
+export async function GET(req: NextRequest) {
+  const ts = NOW_ISO();
+  const routeWarnings: string[] = [];
+
+  const auth: AuthResult = enforceApiPolicy(req);
+
+  if (!auth.ok) {
+    return buildApiKeyErrorResponse(auth.error, auth.status);
+  }
+
+  let usage: UsageResult = null;
+
+  try {
+    usage = trackUsage({
+      key: auth.key,
+      keyType: auth.keyType,
+      endpoint: ENDPOINT,
+      plan: auth.plan,
+    });
+  } catch {
+    routeWarnings.push("usage_tracking_failed");
+  }
+
+  try {
+    const sp = req.nextUrl.searchParams;
+
+    const symbol = sanitizeSymbol(safeStr(sp.get("symbol")) ?? "");
+    const tf = normalizeTf(sp.get("tf"));
+
+    if (!symbol) {
+      const res = buildResponse({
+        ok: false,
+        ts,
+        symbol: "",
+        tf,
+        error: "missing_symbol",
+        rfs_decision: {
+          action: "BLOCK",
+          reason_codes: ["MISSING_SYMBOL"],
+          execution_mode: "none",
+        },
+        meta: {
+          scan_cache_key: "",
+          zones_cache_key: "",
+          decision_cache_key: "",
+          cache: "miss",
+          warnings: uniqueWarnings(routeWarnings),
+        },
+      });
+
+      return respond(res, 400, auth, usage);
+    }
+
+    const scan_cache_key = scanKey({
+      version: XYVALA_VERSION,
+      market: "crypto",
+      quote: DEFAULT_QUOTE,
+      sort: "stability",
+      order: "desc",
+      limit: 250,
+      q: null,
+    });
+
+    const snapshot = getFromCache<ScanSnapshot>(scan_cache_key, TTL_MS);
+
+    if (!snapshot) {
+      const res = buildResponse({
+        ok: false,
+        ts,
+        symbol,
+        tf,
+        error: "scan_snapshot_missing",
+        rfs_decision: {
+          action: "WATCH",
+          reason_codes: ["SCAN_SNAPSHOT_MISSING"],
+          execution_mode: "none",
+        },
+        meta: {
+          scan_cache_key,
+          zones_cache_key: "",
+          decision_cache_key: "",
+          cache: "miss",
+          warnings: uniqueWarnings(routeWarnings, ["scan_snapshot_missing"]),
+        },
+      });
+
+      return respond(res, 503, auth, usage);
+    }
+
+    const tfForZones = tf === "AUTO" ? "1H,4H,1D" : tf;
+
+    const zones_cache_key = zonesKey({
+      version: XYVALA_VERSION,
+      scan_cache_key,
+      symbol,
+      tf: tfForZones,
+    });
+
+    const decision_cache_key = decisionKey({
+      version: XYVALA_VERSION,
+      zones_cache_key,
+      symbol,
+      tf,
+    });
+
+    const cached = getFromCache<DecisionResponse>(decision_cache_key, TTL_MS);
+
+    if (cached && cached.ok === true) {
+      const res = buildResponse({
+        ...cached,
+        ts,
+        source: "cache",
+        meta: {
+          ...cached.meta,
+          cache: "hit",
+          warnings: uniqueWarnings(cached.meta?.warnings, routeWarnings),
+        },
+      });
+
+      return respond(res, 200, auth, usage);
+    }
+
+    if (cached && cached.ok !== true) {
+      routeWarnings.push("stale_decision_cache_ignored");
+    }
+
+    const zonesResp = getFromCache<ZonesLikeResponse>(zones_cache_key, TTL_MS);
+
+    if (!zonesResp || zonesResp.ok !== true) {
+      const res = buildResponse({
+        ok: false,
+        ts,
+        symbol,
+        tf,
+        error: "zones_snapshot_missing",
+        rfs_decision: {
+          action: "WATCH",
+          reason_codes: ["ZONES_SNAPSHOT_MISSING"],
+          execution_mode: "none",
+        },
+        meta: {
+          scan_cache_key,
+          zones_cache_key,
+          decision_cache_key,
+          cache: "miss",
+          warnings: uniqueWarnings(routeWarnings, ["zones_snapshot_missing"]),
+        },
+      });
+
+      return respond(res, 503, auth, usage);
+    }
+
+    const best_zone = normalizeBestZone(zonesResp.best_zone);
+    const market_regime = normalizeRegime(
+      zonesResp.context?.market_regime ??
+        snapshot.context?.market_regime ??
+        "TRANSITION"
+    );
+
+    const rfs_decision = rfsDecide({
+      market_regime,
+      best_zone,
+    });
+
+    let memoryRecordId: string | null = null;
+    let memoryStatus: "created" | "skipped" = "skipped";
+
+    try {
+      const record = await createMemoryRecord({
+        ts,
+        symbol,
+        tf,
+        snapshot_hash: null,
+        market_regime,
+        best_zone_price: best_zone?.price ?? null,
+        zone_score: best_zone?.correlation_score ?? null,
+        action: rfs_decision.action,
+        execution_mode: rfs_decision.execution_mode,
+      });
+
+      if (record?.id) {
+        memoryRecordId = record.id;
+        memoryStatus = "created";
+      } else {
+        routeWarnings.push("memory_record_missing_id");
+      }
+    } catch {
+      routeWarnings.push("memory_write_failed");
+    }
+
+    const responsePayload = buildResponse({
+      ok: true,
+      ts,
+      symbol,
+      tf,
+      best_zone,
+      context: {
+        market_regime,
+      },
+      rfs_decision,
+      memory: {
+        record_id: memoryRecordId,
+        status: memoryStatus,
+      },
+      source: "compute",
+      error: null,
+      meta: {
+        scan_cache_key,
+        zones_cache_key,
+        decision_cache_key,
+        cache: "miss",
+        warnings: uniqueWarnings(routeWarnings),
+      },
+    });
+
+    setToCache(decision_cache_key, responsePayload);
+
+    return respond(responsePayload, 200, auth, usage);
+  } catch (error: unknown) {
+    const message =
+      error instanceof Error && error.message
+        ? error.message
+        : "unknown_error";
+
+    const res = buildResponse({
+      ok: false,
+      ts,
+      symbol: "",
+      tf: "AUTO",
+      error: message,
+      rfs_decision: {
+        action: "BLOCK",
+        reason_codes: ["ROUTE_EXCEPTION"],
+        execution_mode: "none",
+      },
+      meta: {
+        scan_cache_key: "",
+        zones_cache_key: "",
+        decision_cache_key: "",
+        cache: "miss",
+        warnings: ["route_exception"],
+      },
+    });
+
+    return respond(res, 500, auth, usage);
+  }
+}

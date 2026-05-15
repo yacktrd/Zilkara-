@@ -1,0 +1,194 @@
+
+
+/*
+FILE: route.ts
+
+PARENTS:
+- lib/xyvala/snapshot.ts
+- lib/xyvala/contracts/scan-contract.ts
+- lib/xyvala/server-client.ts
+- lib/xyvala/json.ts
+
+SECTIONS:
+1. Imports
+2. Config
+3. Types
+4. Safe helpers
+5. Route handler
+
+DIRECTIVES:
+- Rebuild canonical snapshot from /api/scan
+- Must stay aligned with current ScanAsset contract
+- No legacy fields allowed
+- Keep rebuild deterministic and minimal
+- Keep EUR-compatible quote handling
+*/
+
+import { NextResponse } from "next/server";
+import {
+  normalizeScanSnapshot,
+  scanKey,
+  setToCache,
+  XYVALA_SNAPSHOT_VERSION,
+  type Quote,
+} from "@/lib/xyvala/snapshot";
+import type { ScanAsset } from "@/lib/xyvala/contracts/scan-contract";
+import { xyvalaServerFetch } from "@/lib/xyvala/server-client";
+import type { JsonRecord, JsonValue } from "@/lib/xyvala/json";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
+/* =========================
+   2. CONFIG
+========================= */
+
+const DEFAULT_MARKET = "crypto" as const;
+const DEFAULT_QUOTE: Quote = "eur";
+const DEFAULT_SORT = "stability" as const;
+const DEFAULT_ORDER = "desc" as const;
+const DEFAULT_LIMIT = 250;
+const SNAPSHOT_TTL_MS = 60_000;
+
+/* =========================
+   3. TYPES
+========================= */
+
+type RebuildScanResponse = JsonRecord & {
+  ok?: boolean;
+  ts?: string;
+  version?: string;
+  source?: "scan" | "fallback" | "cache" | string;
+  market?: "crypto" | string;
+  quote?: "eur" | "usd" | "usdt" | string;
+  count?: number;
+  data?: JsonValue[];
+  context?: JsonValue;
+  meta?: JsonValue;
+  error?: string | null;
+};
+
+/* =========================
+   4. SAFE HELPERS
+========================= */
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function safeQuote(value: unknown): Quote {
+  return value === "usd" || value === "usdt" || value === "eur"
+    ? value
+    : DEFAULT_QUOTE;
+}
+
+/* =========================
+   5. ROUTE HANDLER
+========================= */
+
+export async function GET(req: Request) {
+  try {
+    const url = new URL(req.url);
+    const quote = safeQuote(url.searchParams.get("quote"));
+
+    const rebuilt = await xyvalaServerFetch<RebuildScanResponse>("/api/scan", {
+      searchParams: {
+        quote,
+        sort: DEFAULT_SORT,
+        order: DEFAULT_ORDER,
+        limit: DEFAULT_LIMIT,
+        noStore: 1,
+      },
+      timeoutMs: 12_000,
+    });
+
+    if (!rebuilt.ok || !rebuilt.data) {
+      return NextResponse.json(
+        {
+          ok: false,
+          ts: nowIso(),
+          error: rebuilt.error ?? "rebuild_fetch_failed",
+          warnings: rebuilt.warnings ?? [],
+        },
+        {
+          status: 502,
+          headers: {
+            "cache-control": "no-store",
+            "x-xyvala-version": XYVALA_SNAPSHOT_VERSION,
+            "x-xyvala-endpoint": "/api/rebuild",
+          },
+        },
+      );
+    }
+
+    const snapshot = normalizeScanSnapshot(rebuilt.data);
+
+    if (!snapshot) {
+      return NextResponse.json(
+        {
+          ok: false,
+          ts: nowIso(),
+          error: "rebuild_snapshot_invalid",
+        },
+        {
+          status: 500,
+          headers: {
+            "cache-control": "no-store",
+            "x-xyvala-version": XYVALA_SNAPSHOT_VERSION,
+            "x-xyvala-endpoint": "/api/rebuild",
+          },
+        },
+      );
+    }
+
+    const key = scanKey({
+      version: XYVALA_SNAPSHOT_VERSION,
+      market: DEFAULT_MARKET,
+      quote,
+      sort: DEFAULT_SORT,
+      order: DEFAULT_ORDER,
+      limit: DEFAULT_LIMIT,
+      q: null,
+    });
+
+    await setToCache(key, snapshot, SNAPSHOT_TTL_MS);
+
+    return NextResponse.json(
+      {
+        ok: true,
+        ts: nowIso(),
+        key,
+        count: snapshot.data.length,
+        source: snapshot.source,
+        quote: snapshot.quote,
+        data_preview: snapshot.data.slice(0, 5) as ScanAsset[],
+      },
+      {
+        status: 200,
+        headers: {
+          "cache-control": "no-store",
+          "x-xyvala-version": XYVALA_SNAPSHOT_VERSION,
+          "x-xyvala-endpoint": "/api/rebuild",
+        },
+      },
+    );
+  } catch (error) {
+    return NextResponse.json(
+      {
+        ok: false,
+        ts: nowIso(),
+        error:
+          error instanceof Error ? error.message : "rebuild_unknown_error",
+      },
+      {
+        status: 500,
+        headers: {
+          "cache-control": "no-store",
+          "x-xyvala-version": XYVALA_SNAPSHOT_VERSION,
+          "x-xyvala-endpoint": "/api/rebuild",
+        },
+      },
+    );
+  }
+}

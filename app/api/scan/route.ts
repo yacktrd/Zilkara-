@@ -1,402 +1,473 @@
-// app/api/scan/route.ts
+/* ============================================================================
+ * FILE: app/api/scan/route.ts
+ * ----------------------------------------------------------------------------
+ * TITLE
+ * - Xyvala public canonical scan endpoint
+ *
+ * ROLE
+ * - expose public ScanAsset payloads only
+ * - read canonical scan snapshot from cache-core
+ * - preserve deterministic filtering and public sorting
+ *
+ * DIRECTIVES
+ * - FR / EU compatible public output
+ * - EUR is the default quote
+ * - no RFS recomputation
+ * - no MCI recomputation
+ * - no regime exposure
+ * - no decision exposure
+ * - no opportunity exposure
+ * - no stability score exposure
+ * - no broker / affiliate exposure
+ * - snapshot remains the source of truth
+ * ========================================================================== */
 
 import { NextRequest, NextResponse } from "next/server";
+
+import { getFromCache, scanKey } from "@/lib/xyvala/cache/cache-core";
+
 import {
-  enforceApiPolicy,
-  applyApiAuthHeaders,
-  buildApiKeyErrorResponse,
-} from "@/lib/xyvala/auth";
-import {
-  trackUsage,
-  applyQuotaHeaders,
-} from "@/lib/xyvala/usage";
-import {
-  getScanService,
-  type ScanServiceResult,
-  type ScanServiceItem,
-} from "@/lib/xyvala/services/scan-service";
-import {
-  resolveAccessScope,
-  applyScanCompartment,
-  buildAccessMeta,
-} from "@/lib/xyvala/access";
-import type { AccessMeta } from "@/lib/xyvala/access";
-import type { Quote } from "@/lib/xyvala/snapshot";
-import type { Regime, ScanAsset } from "@/lib/xyvala/contracts/scan-contract";
+  isScanSnapshot,
+  XYVALA_SNAPSHOT_VERSION,
+  type Market,
+  type Quote,
+  type ScanSnapshot,
+} from "@/lib/xyvala/snapshot";
+
+import type { ScanAsset } from "@/lib/xyvala/contracts/scan-contract";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
-const XYVALA_VERSION = "v1";
-const DEFAULT_QUOTE: Quote = "usd";
+/* ============================================================================
+ * 1. TYPES
+ * ========================================================================== */
 
-type SortKey = "score" | "price";
+type SortKey =
+  | "rank"
+  | "price"
+  | "market_cap"
+  | "volume_24h"
+  | "change_24h"
+  | "change_7d";
+
 type SortOrder = "asc" | "desc";
 
-type AuthResult = ReturnType<typeof enforceApiPolicy>;
-type AuthSuccess = Extract<AuthResult, { ok: true }>;
-type UsageResult = ReturnType<typeof trackUsage> | null;
+type Currency = "EUR" | "USD" | "USDT";
 
-type ScanResponse = {
+type ScanRouteContext = {
+  asset_count: number;
+  priced_asset_count: number;
+  market_cap_available_count: number;
+  volume_available_count: number;
+};
+
+type ScanRouteResponse = {
   ok: boolean;
   ts: string;
   version: string;
-  source: "scan" | "fallback" | "cache";
-  market: "crypto";
+  source: "scan" | "fallback";
+  market: Market;
   quote: Quote;
   count: number;
+  total: number;
   data: ScanAsset[];
-  context: {
-    market_regime: Regime;
-    stable_ratio: number;
-    transition_ratio: number;
-    volatile_ratio: number;
-  };
+  context: ScanRouteContext;
+  warnings: string[];
   meta: {
-    limit: number;
-    applied_limit: number;
+    q: string | null;
     sort: SortKey;
     order: SortOrder;
-    q: string | null;
-    cache: "hit" | "miss" | "no-store";
-    warnings: string[];
-    access: AccessMeta;
+    limit: number | null;
+    region: "EU";
+    currency: Currency;
   };
   error: string | null;
 };
 
-const nowIso = () => new Date().toISOString();
+/* ============================================================================
+ * 2. CONSTANTS
+ * ========================================================================== */
 
-function safeStr(value: unknown): string {
+const DEFAULT_MARKET: Market = "crypto";
+const DEFAULT_QUOTE: Quote = "eur";
+const DEFAULT_SORT: SortKey = "rank";
+const DEFAULT_ORDER: SortOrder = "asc";
+const MAX_LIMIT = 250;
+const DEFAULT_LIMIT = MAX_LIMIT;
+
+const SNAPSHOT_TTL_MS = 60_000;
+
+/* ============================================================================
+ * 3. SAFE HELPERS
+ * ========================================================================== */
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function safeString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function safeNullableNumber(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
+function safeLower(value: unknown): string {
+  return safeString(value).toLowerCase();
 }
 
-function safeNullableString(value: unknown): string | null {
-  return typeof value === "string" && value.trim().length > 0
-    ? value.trim()
-    : null;
+function safeNumber(value: unknown, fallback = -1): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
-function normalizeQuote(value: string | null): Quote {
-  const q = safeStr(value).toLowerCase();
-  if (q === "eur") return "eur";
-  if (q === "usdt") return "usdt";
-  return DEFAULT_QUOTE;
+function safeRank(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : Number.POSITIVE_INFINITY;
 }
 
-function normalizeSort(value: string | null): {
-  sort: SortKey;
-  order: SortOrder;
-  sortLabel: string;
-} {
-  const s = safeStr(value).toLowerCase();
-
-  if (s === "price") {
-    return { sort: "price", order: "desc", sortLabel: "price_desc" };
-  }
-
-  if (s === "price_desc") {
-    return { sort: "price", order: "desc", sortLabel: "price_desc" };
-  }
-
-  if (s === "price_asc") {
-    return { sort: "price", order: "asc", sortLabel: "price_asc" };
-  }
-
-  if (s === "score_asc") {
-    return { sort: "score", order: "asc", sortLabel: "score_asc" };
-  }
-
-  return { sort: "score", order: "desc", sortLabel: "score_desc" };
+function clamp(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.max(min, Math.min(max, value));
 }
 
-function parseLimit(value: string | null): number {
-  const parsed = Number(value);
-
-  if (!Number.isFinite(parsed)) return 100;
-
-  return Math.max(1, Math.min(250, Math.trunc(parsed)));
-}
-
-function parseBool(value: string | null): boolean {
-  const s = safeStr(value).toLowerCase();
-  return s === "1" || s === "true" || s === "yes" || s === "on";
-}
-
-function uniqueWarnings(...groups: Array<string[] | undefined | null>): string[] {
-  const merged = groups.flatMap((group) => (Array.isArray(group) ? group : []));
+function uniqueWarnings(
+  ...groups: Array<string[] | undefined | null>
+): string[] {
   return [
     ...new Set(
-      merged.filter((item) => typeof item === "string" && item.trim().length > 0)
+      groups
+        .flatMap((group) => (Array.isArray(group) ? group : []))
+        .filter(
+          (item): item is string =>
+            typeof item === "string" && item.trim().length > 0,
+        ),
     ),
   ];
 }
 
-function toApiAsset(item: ScanServiceItem): ScanAsset {
-  return {
-    id: item.id,
-    symbol: item.symbol,
-    name: item.name,
-    price: item.price,
-    chg_24h_pct: item.chg_24h_pct,
-    confidence_score: item.confidence_score,
-    score_delta: safeNullableNumber(item.score_delta),
-    score_trend: safeNullableString(item.score_trend),
-    regime: item.regime,
-    market_cap: item.market_cap,
-    volume_24h: item.volume_24h,
-    binance_url: item.binance_url,
-  };
+/* ============================================================================
+ * 4. INPUT NORMALIZATION
+ * ========================================================================== */
+
+function normalizeQuote(value: string | null): Quote {
+  const quote = safeLower(value);
+
+  if (quote === "usd") return "usd";
+  if (quote === "usdt") return "usdt";
+
+  return DEFAULT_QUOTE;
 }
 
-function computeContext(data: ScanAsset[]) {
-  const total = data.length || 1;
+function normalizeSearch(value: string | null): string | null {
+  const q = safeLower(value);
+  return q.length > 0 ? q : null;
+}
 
-  let stable = 0;
-  let transition = 0;
-  let volatile = 0;
+function normalizeSort(value: string | null): SortKey {
+  const sort = safeLower(value);
+
+  if (sort === "price") return "price";
+  if (sort === "market_cap") return "market_cap";
+  if (sort === "volume_24h") return "volume_24h";
+  if (sort === "volume") return "volume_24h";
+  if (sort === "change_24h") return "change_24h";
+  if (sort === "chg_24h") return "change_24h";
+  if (sort === "change_7d") return "change_7d";
+  if (sort === "chg_7d") return "change_7d";
+
+  return DEFAULT_SORT;
+}
+
+function normalizeOrder(value: string | null): SortOrder {
+  return safeLower(value) === "desc" ? "desc" : DEFAULT_ORDER;
+}
+
+function normalizeLimit(value: string | null): number | null {
+  if (value === null || value.trim() === "") return DEFAULT_LIMIT;
+
+  const parsed = Number(value);
+
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return DEFAULT_LIMIT;
+  }
+
+  return clamp(Math.trunc(parsed), 1, MAX_LIMIT);
+}
+
+function parseBool(value: string | null): boolean {
+  const normalized = safeLower(value);
+
+  return (
+    normalized === "1" ||
+    normalized === "true" ||
+    normalized === "yes" ||
+    normalized === "on"
+  );
+}
+
+function quoteToCurrency(quote: Quote): Currency {
+  if (quote === "usd") return "USD";
+  if (quote === "usdt") return "USDT";
+
+  return "EUR";
+}
+
+/* ============================================================================
+ * 5. CONTEXT HELPERS
+ * ========================================================================== */
+
+function computeContext(data: ScanAsset[]): ScanRouteContext {
+  let pricedAssetCount = 0;
+  let marketCapAvailableCount = 0;
+  let volumeAvailableCount = 0;
 
   for (const asset of data) {
-    const regime = safeStr(asset.regime).toUpperCase();
+    if (typeof asset.price === "number" && Number.isFinite(asset.price)) {
+      pricedAssetCount += 1;
+    }
 
-    if (regime === "STABLE") stable += 1;
-    else if (regime === "TRANSITION") transition += 1;
-    else if (regime === "VOLATILE") volatile += 1;
-  }
+    if (
+      typeof asset.market_cap === "number" &&
+      Number.isFinite(asset.market_cap)
+    ) {
+      marketCapAvailableCount += 1;
+    }
 
-  const stable_ratio = stable / total;
-  const transition_ratio = transition / total;
-  const volatile_ratio = volatile / total;
-
-  let market_regime: Regime = "TRANSITION";
-  const max = Math.max(stable_ratio, transition_ratio, volatile_ratio);
-
-  if (max === stable_ratio) {
-    market_regime = "STABLE";
-  } else if (max === volatile_ratio) {
-    market_regime = "VOLATILE";
+    if (
+      typeof asset.volume_24h === "number" &&
+      Number.isFinite(asset.volume_24h)
+    ) {
+      volumeAvailableCount += 1;
+    }
   }
 
   return {
-    market_regime,
-    stable_ratio,
-    transition_ratio,
-    volatile_ratio,
+    asset_count: data.length,
+    priced_asset_count: pricedAssetCount,
+    market_cap_available_count: marketCapAvailableCount,
+    volume_available_count: volumeAvailableCount,
   };
 }
 
-function toApiSource(source: ScanServiceResult["source"]): "scan" | "fallback" | "cache" {
-  if (source === "scan_cache") return "cache";
-  if (source === "fallback") return "fallback";
-  return "scan";
+/* ============================================================================
+ * 6. SORT HELPERS
+ * ========================================================================== */
+
+function sortValue(asset: ScanAsset, sort: SortKey): number {
+  if (sort === "price") return safeNumber(asset.price);
+  if (sort === "market_cap") return safeNumber(asset.market_cap);
+  if (sort === "volume_24h") return safeNumber(asset.volume_24h);
+  if (sort === "change_24h") return safeNumber(asset.chg_24h_pct);
+  if (sort === "change_7d") return safeNumber(asset.chg_7d_pct);
+
+  return safeRank(asset.rank);
 }
 
-function toApiCache(
-  source: ScanServiceResult["source"],
-  noStore: boolean
-): "hit" | "miss" | "no-store" {
-  if (noStore) return "no-store";
-  return source === "scan_cache" ? "hit" : "miss";
+function tieBreak(left: ScanAsset, right: ScanAsset): number {
+  const rankDelta = safeRank(left.rank) - safeRank(right.rank);
+
+  if (rankDelta !== 0) {
+    return rankDelta;
+  }
+
+  const marketCapDelta =
+    safeNumber(right.market_cap) - safeNumber(left.market_cap);
+
+  if (marketCapDelta !== 0) {
+    return marketCapDelta;
+  }
+
+  const volumeDelta =
+    safeNumber(right.volume_24h) - safeNumber(left.volume_24h);
+
+  if (volumeDelta !== 0) {
+    return volumeDelta;
+  }
+
+  return left.symbol.localeCompare(right.symbol);
 }
+
+function sortAssets(
+  data: ScanAsset[],
+  sort: SortKey,
+  order: SortOrder,
+): ScanAsset[] {
+  return [...data].sort((left, right) => {
+    const leftValue = sortValue(left, sort);
+    const rightValue = sortValue(right, sort);
+
+    if (leftValue !== rightValue) {
+      return order === "asc"
+        ? leftValue - rightValue
+        : rightValue - leftValue;
+    }
+
+    return tieBreak(left, right);
+  });
+}
+
+/* ============================================================================
+ * 7. RESPONSE HELPERS
+ * ========================================================================== */
 
 function buildResponse(input: {
-  ts: string;
+  ok: boolean;
+  source: "scan" | "fallback";
   quote: Quote;
+  q: string | null;
   sort: SortKey;
   order: SortOrder;
-  requestedLimit: number;
-  appliedLimit: number;
-  q: string | null;
-  noStore: boolean;
-  service: ScanServiceResult;
-  access: AccessMeta;
-  usageWarnings?: string[];
-}): ScanResponse {
-  const compartmentedData = applyScanCompartment(
-    input.service.data.map(toApiAsset),
-    {
-      compartment: input.access.compartment,
-      visiblePercent: input.access.visiblePercent,
-      maxAssets: input.access.maxAssets,
-      showScoreDelta:
-        input.access.compartment === "trader_60" ||
-        input.access.compartment === "full_100",
-      showScoreTrend:
-        input.access.compartment !== "public_10",
-      showMarketContext:
-        input.access.compartment !== "public_10",
-      showAdvancedStats:
-        input.access.compartment === "trader_60" ||
-        input.access.compartment === "full_100",
-      showHistory:
-        input.access.compartment === "trader_60" ||
-        input.access.compartment === "full_100",
-      showDecision: input.access.compartment === "full_100",
-      showAdmin: input.access.compartment === "full_100",
-    }
-  );
-
-  const context = computeContext(compartmentedData);
+  limit: number | null;
+  data: ScanAsset[];
+  warnings: string[];
+  error: string | null;
+}): ScanRouteResponse {
+  const count = input.data.length;
 
   return {
-    ok: input.service.ok,
-    ts: input.ts,
-    version: XYVALA_VERSION,
-    source: toApiSource(input.service.source),
-    market: "crypto",
+    ok: input.ok,
+    ts: nowIso(),
+    version: XYVALA_SNAPSHOT_VERSION,
+    source: input.source,
+    market: DEFAULT_MARKET,
     quote: input.quote,
-    count: compartmentedData.length,
-    data: compartmentedData,
-    context,
+    count,
+    total: count,
+    data: input.data,
+    context: computeContext(input.data),
+    warnings: input.warnings,
     meta: {
-      limit: input.requestedLimit,
-      applied_limit: input.appliedLimit,
+      q: input.q,
       sort: input.sort,
       order: input.order,
-      q: input.q,
-      cache: toApiCache(input.service.source, input.noStore),
-      warnings: uniqueWarnings(input.service.warnings, input.usageWarnings),
-      access: input.access,
+      limit: input.limit,
+      region: "EU",
+      currency: quoteToCurrency(input.quote),
     },
-    error: input.service.error,
+    error: input.error,
   };
 }
 
-function respond(
-  payload: ScanResponse,
-  status: number,
-  auth: AuthSuccess,
-  usage: UsageResult
-) {
-  let res: NextResponse = NextResponse.json(payload, {
-    status,
-    headers: {
-      "cache-control": "no-store",
-      "x-xyvala-version": XYVALA_VERSION,
-      "x-xyvala-cache": payload.meta.cache,
-      "x-xyvala-access-compartment": payload.meta.access.compartment,
-      "x-xyvala-visible-percent": String(payload.meta.access.visiblePercent),
-    },
-  });
-
-  res = applyApiAuthHeaders(res, auth);
-
-  if (usage) {
-    res = applyQuotaHeaders(res, usage);
-  }
-
-  return res;
-}
+/* ============================================================================
+ * 8. ROUTE HANDLER
+ * ========================================================================== */
 
 export async function GET(req: NextRequest) {
-  const ts = nowIso();
-  const auth = enforceApiPolicy(req);
+  const searchParams = req.nextUrl.searchParams;
 
-  if (!auth.ok) {
-    return buildApiKeyErrorResponse(auth.error, auth.status);
-  }
-
-  const accessScope = resolveAccessScope(auth);
-  const accessMeta = buildAccessMeta(accessScope);
-
-  let usage: UsageResult = null;
-  let usageWarnings: string[] = [];
+  const quote = normalizeQuote(searchParams.get("quote"));
+  const q = normalizeSearch(searchParams.get("q"));
+  const sort = normalizeSort(searchParams.get("sort"));
+  const order = normalizeOrder(searchParams.get("order"));
+  const limit = normalizeLimit(searchParams.get("limit"));
+  const noStore = parseBool(searchParams.get("noStore"));
 
   try {
-    usage = trackUsage({
-      key: auth.key,
-      keyType: auth.keyType,
-      endpoint: "/api/scan",
-      planOverride: auth.plan,
-    });
-  } catch (error) {
-    usageWarnings = uniqueWarnings([
-      error instanceof Error && error.message
-        ? `usage_track_failed:${error.message}`
-        : "usage_track_failed",
-    ]);
-  }
-
-  try {
-    const sp = req.nextUrl.searchParams;
-
-    const quote = normalizeQuote(sp.get("quote"));
-    const { sort, order, sortLabel } = normalizeSort(sp.get("sort"));
-    const requestedLimit = parseLimit(sp.get("limit"));
-    const q = safeStr(sp.get("q")).toLowerCase() || null;
-    const noStore = parseBool(sp.get("noStore"));
-
-    const appliedLimit = Math.min(requestedLimit, accessScope.maxAssets);
-
-    const service = await getScanService({
+    const snapshotKey = scanKey({
+      version: XYVALA_SNAPSHOT_VERSION,
+      market: DEFAULT_MARKET,
       quote,
-      sort: sortLabel,
-      limit: appliedLimit,
-      q,
-      noStore,
+      sort: DEFAULT_SORT,
+      order: DEFAULT_ORDER,
+      limit: MAX_LIMIT,
+      q: null,
     });
+
+    const snapshot = noStore
+      ? null
+      : await getFromCache<ScanSnapshot>(snapshotKey, SNAPSHOT_TTL_MS);
+
+    if (!snapshot || !isScanSnapshot(snapshot)) {
+      const payload = buildResponse({
+        ok: false,
+        source: "fallback",
+        quote,
+        q,
+        sort,
+        order,
+        limit,
+        data: [],
+        warnings: uniqueWarnings(["scan_snapshot_unavailable"]),
+        error: "scan_snapshot_unavailable",
+      });
+
+      return NextResponse.json(payload, {
+        status: 503,
+        headers: {
+          "cache-control": "no-store",
+          "x-xyvala-version": XYVALA_SNAPSHOT_VERSION,
+          "x-xyvala-endpoint": "/api/scan",
+          "x-xyvala-nostore": noStore ? "1" : "0",
+        },
+      });
+    }
+
+    let data = [...snapshot.data];
+    const warnings = uniqueWarnings(snapshot.meta?.warnings);
+
+    if (q) {
+      data = data.filter((asset) => {
+        const symbol = safeLower(asset.symbol);
+        const name = safeLower(asset.name);
+        const id = safeLower(asset.id);
+
+        return symbol.includes(q) || name.includes(q) || id.includes(q);
+      });
+    }
+
+    data = sortAssets(data, sort, order);
+
+    if (limit !== null) {
+      data = data.slice(0, limit);
+    }
 
     const payload = buildResponse({
-      ts,
+      ok: true,
+      source: "scan",
       quote,
+      q,
       sort,
       order,
-      requestedLimit,
-      appliedLimit,
-      q,
-      noStore,
-      service,
-      access: accessMeta,
-      usageWarnings,
+      limit,
+      data,
+      warnings,
+      error: null,
     });
 
-    const status = payload.ok ? 200 : 503;
-
-    return respond(payload, status, auth, usage);
+    return NextResponse.json(payload, {
+      status: 200,
+      headers: {
+        "cache-control": "no-store",
+        "x-xyvala-version": XYVALA_SNAPSHOT_VERSION,
+        "x-xyvala-endpoint": "/api/scan",
+        "x-xyvala-nostore": noStore ? "1" : "0",
+      },
+    });
   } catch (error) {
-    const payload: ScanResponse = {
+    const payload = buildResponse({
       ok: false,
-      ts,
-      version: XYVALA_VERSION,
       source: "fallback",
-      market: "crypto",
-      quote: DEFAULT_QUOTE,
-      count: 0,
+      quote,
+      q,
+      sort,
+      order,
+      limit,
       data: [],
-      context: {
-        market_regime: "TRANSITION",
-        stable_ratio: 0,
-        transition_ratio: 0,
-        volatile_ratio: 0,
-      },
-      meta: {
-        limit: 0,
-        applied_limit: 0,
-        sort: "score",
-        order: "desc",
-        q: null,
-        cache: "no-store",
-        warnings: uniqueWarnings(
-          usageWarnings,
-          [
-            error instanceof Error && error.message
-              ? `route_exception:${error.message}`
-              : "route_exception",
-          ]
-        ),
-        access: accessMeta,
-      },
+      warnings: uniqueWarnings(["scan_route_error"]),
       error:
         error instanceof Error && error.message
           ? error.message
-          : "unknown_error",
-    };
+          : "scan_route_unknown_error",
+    });
 
-    return respond(payload, 500, auth, usage);
+    return NextResponse.json(payload, {
+      status: 500,
+      headers: {
+        "cache-control": "no-store",
+        "x-xyvala-version": XYVALA_SNAPSHOT_VERSION,
+        "x-xyvala-endpoint": "/api/scan",
+        "x-xyvala-nostore": noStore ? "1" : "0",
+      },
+    });
   }
 }

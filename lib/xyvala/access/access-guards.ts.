@@ -1,0 +1,133 @@
+
+
+/*
+FILE: access-guards.ts
+
+PARENTS:
+- lib/xyvala/contracts/scan-contract.ts
+
+SECTIONS:
+1. Types
+2. Safe helpers
+3. Access mappers
+4. Access guards
+
+DIRECTIVES:
+- Keep guards aligned with current ScanAsset contract
+- No legacy fields allowed
+- Stability is the primary structural filter
+- Opportunity is the secondary decision filter
+- Decision remains the explicit action output
+- No business-engine recomputation here
+*/
+
+import type { Decision, Regime, ScanAsset } from "@/lib/xyvala/contracts/scan-contract";
+
+/* =========================
+   1. TYPES
+========================= */
+
+export type AssetAccessView = {
+  symbol: string;
+  rank: number | null;
+  stability_score: number | null;
+  opportunity_score: number | null;
+  regime: Regime | null;
+  decision: Decision | null;
+};
+
+export type AssetAccessPolicy = {
+  is_visible: boolean;
+  is_stable_enough: boolean;
+  is_actionable: boolean;
+  can_trade: boolean;
+  reason: string;
+};
+
+/* =========================
+   2. SAFE HELPERS
+========================= */
+
+function safeFiniteNumberOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/* =========================
+   3. ACCESS MAPPERS
+========================= */
+
+export function toAssetAccessView(asset: ScanAsset): AssetAccessView {
+  return {
+    symbol: asset.symbol,
+    rank: asset.rank ?? null,
+    stability_score: safeFiniteNumberOrNull(asset.stability_score),
+    opportunity_score: safeFiniteNumberOrNull(asset.opportunity_score),
+    regime: asset.regime ?? null,
+    decision: asset.decision ?? null,
+  };
+}
+
+/* =========================
+   4. ACCESS GUARDS
+========================= */
+
+export function isAssetVisible(asset: ScanAsset): boolean {
+  return Boolean(asset.symbol && asset.name);
+}
+
+export function isAssetStableEnough(asset: ScanAsset): boolean {
+  return (asset.stability_score ?? 0) >= 50;
+}
+
+export function isAssetActionable(asset: ScanAsset): boolean {
+  return (
+    asset.decision === "ALLOW" ||
+    asset.decision === "WATCH" ||
+    ((asset.opportunity_score ?? 0) >= 50 && (asset.stability_score ?? 0) >= 55)
+  );
+}
+
+export function canTradeAsset(asset: ScanAsset): boolean {
+  if (asset.decision === "ALLOW") {
+    return true;
+  }
+
+  if (
+    asset.regime !== "VOLATILE" &&
+    (asset.stability_score ?? 0) >= 60 &&
+    (asset.opportunity_score ?? 0) >= 55
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+export function evaluateAssetAccessPolicy(asset: ScanAsset): AssetAccessPolicy {
+  const is_visible = isAssetVisible(asset);
+  const is_stable_enough = isAssetStableEnough(asset);
+  const is_actionable = isAssetActionable(asset);
+  const can_trade = canTradeAsset(asset);
+
+  let reason = "blocked";
+
+  if (!is_visible) {
+    reason = "hidden";
+  } else if (can_trade) {
+    reason = "tradable";
+  } else if (is_actionable) {
+    reason = "watch";
+  } else if (is_stable_enough) {
+    reason = "stable_but_not_actionable";
+  } else {
+    reason = "unstable";
+  }
+
+  return {
+    is_visible,
+    is_stable_enough,
+    is_actionable,
+    can_trade,
+    reason,
+  };
+}

@@ -145,7 +145,10 @@ function maybeGc() {
   const toDelete = Math.min(entries.length - MAX_RECORDS, GC_BATCH);
 
   for (let i = 0; i < toDelete; i++) {
-    const [id, entry] = entries[i];
+    const current = entries[i];
+if (!current) continue;
+
+    const [id, entry] = current;
     mem.delete(id);
 
     const symbol = entry.value.symbol;

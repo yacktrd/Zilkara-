@@ -1,482 +1,276 @@
-// lib/xyvala/services/scan-service.ts
+/* ============================================================================
+ * FILE: lib/xyvala/services/scan-service.ts
+ * ----------------------------------------------------------------------------
+ * TITLE
+ * - Xyvala public scan service
+ *
+ * ROLE
+ * - orchestrate public scan asset loading
+ * - use real observable market seeds when available
+ * - preserve deterministic fallback when upstream source is unavailable
+ * - expose public ScanAsset only through private-to-public transformer
+ *
+ * DIRECTIVES
+ * - service orchestration only
+ * - no UI logic
+ * - no API logic
+ * - no RFS recomputation here
+ * - no MCI recomputation here
+ * - no public/private leakage
+ * - no broker / affiliate exposure
+ * - EUR default quote
+ * - real market source first
+ * - fallback only when source is empty or invalid
+ * ========================================================================== */
 
+import type { Quote } from "@/lib/xyvala/snapshot";
+import type { ScanAsset } from "@/lib/xyvala/contracts/scan-contract";
+
+import { buildPrivateScanAsset } from "@/lib/xyvala/factories/scan-asset-factory";
+import { buildScanEngineResult } from "@/lib/xyvala/scan-engine";
+import { getMarketAssets } from "@/lib/xyvala/sources/market-source";
+import { privateScanAssetsToPublicScanAssets } from "@/lib/xyvala/transformers/scan-private-to-public-transformer";
 
 import {
-  getFromCache,
-  isScanSnapshot,
-  scanKey,
-  type Quote,
-  type ScanSnapshot,
-} from "@/lib/xyvala/snapshot";
-import { normalizeSnapshotData as normalizeLegacySnapshotData } from "@/lib/xyvala/adapters/snapshot-adapter";
-import type { ScanAsset, Regime } from "@/lib/xyvala/contracts/scan-contract";
+  normalizeScanQuery,
+  queryScanItems,
+  type ScanSortKey,
+  type ScanSortOrder,
+} from "@/lib/xyvala/services/scan-query";
 
-const XYVALA_VERSION = "v1";
-
-const DEFAULT_MARKET = "crypto";
-const DEFAULT_QUOTE: Quote = "usd";
-const DEFAULT_SORT = "score_desc";
-const DEFAULT_LIMIT = 100;
-
-const SNAPSHOT_TTL_MS = 45_000;
-const SCAN_CACHE_TTL_MS = 15_000;
-const CANONICAL_LIMIT = 250;
-const MAX_LIMIT = 250;
-
-type SortKey = "score" | "price";
-type SortOrder = "asc" | "desc";
-
-export type ScanServiceInput = {
+export type GetScanInput = {
   quote?: Quote | string | null;
-  sort?: string | null;
-  limit?: number | string | null;
   q?: string | null;
+  sort?: ScanSortKey | string | null;
+  order?: ScanSortOrder | string | null;
+  limit?: number | string | null;
   noStore?: boolean;
-};
-
-export type ScanServiceItem = ScanAsset & {
-  affiliate_url: string;
 };
 
 export type ScanServiceResult = {
   ok: boolean;
-  ts: string;
-  version: string;
-  source: "scan_cache" | "scan_snapshot" | "fallback";
-  market: string;
-  quote: Quote;
-  count: number;
-  data: ScanServiceItem[];
-  error: string | null;
+  source: "scan" | "fallback";
+  data: ScanAsset[];
   warnings: string[];
-  meta: {
-    q: string | null;
-    sort: string;
-    limit: number;
-  };
+  error: string | null;
 };
 
-type ScanCacheEntry = {
-  ts: number;
-  value: ScanServiceResult;
+type AssetSeed = {
+  id: string;
+  symbol: string;
+  name: string;
+  rank: number | null;
+  logo_url: string | null;
+  price: number;
+  chg_24h_pct: number;
+  chg_7d_pct: number | null;
+  market_cap: number | null;
+  volume_24h: number | null;
+  sparkline_7d: number[];
 };
 
-const mem = new Map<string, ScanCacheEntry>();
+const DEFAULT_QUOTE: Quote = "eur";
 
-function nowIso(): string {
-  return new Date().toISOString();
-}
-
-function nowMs(): number {
-  return Date.now();
-}
-
-function safeStr(value: unknown): string {
+function safeString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function safeLower(value: unknown): string {
-  return safeStr(value).toLowerCase();
-}
-
-function safeNumber(value: unknown, fallback = 0): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
-}
-
-function safeOptionalNumber(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-
-function clamp(n: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, n));
-}
-
-function uniqueWarnings(...groups: Array<string[] | undefined | null>): string[] {
-  const merged = groups.flatMap((group) => (Array.isArray(group) ? group : []));
-  return [...new Set(merged.filter((item) => typeof item === "string" && item.trim().length > 0))];
-}
-
 function normalizeQuote(value: unknown): Quote {
-  const quote = safeLower(value);
+  const quote = safeString(value).toLowerCase();
 
-  if (quote === "eur") return "eur";
+  if (quote === "usd") return "usd";
   if (quote === "usdt") return "usdt";
 
   return DEFAULT_QUOTE;
 }
 
-function normalizeSort(value: unknown): {
-  sortKey: SortKey;
-  sortLabel: string;
-  order: SortOrder;
-} {
-  const s = safeLower(value);
-
-  if (s === "price" || s === "price_desc") {
-    return { sortKey: "price", sortLabel: "price_desc", order: "desc" };
-  }
-
-  if (s === "price_asc") {
-    return { sortKey: "price", sortLabel: "price_asc", order: "asc" };
-  }
-
-  if (s === "score_asc") {
-    return { sortKey: "score", sortLabel: "score_asc", order: "asc" };
-  }
-
-  return {
-    sortKey: "score",
-    sortLabel: DEFAULT_SORT,
-    order: "desc",
-  };
-}
-
-function parseLimit(value: unknown): number {
-  const n =
-    typeof value === "number"
-      ? value
-      : typeof value === "string"
-        ? Number(value)
-        : DEFAULT_LIMIT;
-
-  if (!Number.isFinite(n)) return DEFAULT_LIMIT;
-
-  return clamp(Math.trunc(n), 1, MAX_LIMIT);
-}
-
-function normalizeSearch(value: unknown): string | null {
-  const q = safeStr(value).toLowerCase();
-  return q || null;
-}
-
-function normalizeRegime(value: unknown): Regime {
-  const regime = safeStr(value).toUpperCase();
-
-  if (regime === "STABLE") return "STABLE";
-  if (regime === "TRANSITION") return "TRANSITION";
-  if (regime === "VOLATILE") return "VOLATILE";
-
-  return "TRANSITION";
-}
-
-function buildCanonicalSnapshotKey(quote: Quote): string {
-  return scanKey({
-    version: XYVALA_VERSION,
-    market: DEFAULT_MARKET,
-    quote,
-    sort: "score",
-    order: "desc",
-    limit: CANONICAL_LIMIT,
-    q: null,
-  });
-}
-
-function buildScanServiceCacheKey(input: {
-  quote: Quote;
-  sort: string;
-  limit: number;
-  q: string | null;
-}): string {
+function uniqueWarnings(
+  ...groups: Array<string[] | undefined | null>
+): string[] {
   return [
-    "xyvala:scan-service",
-    XYVALA_VERSION,
-    `quote=${input.quote}`,
-    `sort=${input.sort}`,
-    `limit=${input.limit}`,
-    `q=${input.q ?? ""}`,
-  ].join(":");
+    ...new Set(
+      groups
+        .flatMap((group) => (Array.isArray(group) ? group : []))
+        .filter(
+          (item): item is string =>
+            typeof item === "string" && item.trim().length > 0,
+        ),
+    ),
+  ];
 }
 
-function getScanMemCache(key: string, ttlMs: number): ScanServiceResult | null {
-  const entry = mem.get(key);
-
-  if (!entry) return null;
-
-  if (nowMs() - entry.ts > ttlMs) {
-    mem.delete(key);
-    return null;
-  }
-
-  return entry.value;
-}
-
-function setScanMemCache(key: string, value: ScanServiceResult): void {
-  mem.set(key, {
-    ts: nowMs(),
-    value,
-  });
-}
-
-function buildBinanceUrl(symbol: string, quote: Quote): string {
-  const normalizedQuote = quote === "usd" ? "usdt" : quote;
-  const pair = `${symbol.toUpperCase()}${normalizedQuote.toUpperCase()}`;
-  return `https://www.binance.com/en/trade/${encodeURIComponent(pair)}`;
-}
-
-function buildAffiliateUrl(binanceUrl: string): string {
-  const ref = safeStr(process.env.BINANCE_REF);
-
-  if (!ref) return binanceUrl;
-
-  return `${binanceUrl}?ref=${encodeURIComponent(ref)}`;
-}
-
-function toScanServiceItem(asset: ScanAsset, quote: Quote): ScanServiceItem {
-  const symbol = safeStr(asset.symbol) || "UNKNOWN";
-  const binanceUrl = safeStr(asset.binance_url) || buildBinanceUrl(symbol, quote);
-
-  return {
-    ...asset,
-    id: safeStr(asset.id) || symbol.toLowerCase(),
-    symbol,
-    name: safeStr(asset.name) || symbol,
-    price: safeNumber(asset.price, 0),
-    chg_24h_pct: safeNumber(asset.chg_24h_pct, 0),
-    confidence_score: safeNumber(asset.confidence_score, 0),
-    regime: normalizeRegime(asset.regime),
-    market_cap: safeOptionalNumber(asset.market_cap),
-    volume_24h: safeOptionalNumber(asset.volume_24h),
-    binance_url: binanceUrl,
-    affiliate_url: buildAffiliateUrl(binanceUrl),
-  };
-}
-
-function normalizeSnapshotItems(snapshot: ScanSnapshot, quote: Quote): ScanServiceItem[] {
-  if (!Array.isArray(snapshot.data) || snapshot.data.length === 0) {
-    return [];
-  }
-
-  const normalizedAssets = normalizeLegacySnapshotData(snapshot.data);
-  return normalizedAssets.map((asset) => toScanServiceItem(asset, quote));
-}
-
-function applySearch(list: ScanServiceItem[], q: string | null): ScanServiceItem[] {
-  if (!q) return list;
-
-  return list.filter((asset) => {
-    const symbol = safeLower(asset.symbol);
-    const name = safeLower(asset.name);
-    const id = safeLower(asset.id);
-
-    return symbol.includes(q) || name.includes(q) || id.includes(q);
-  });
-}
-
-function getSortValue(asset: ScanServiceItem, sortKey: SortKey): number {
-  if (sortKey === "price") {
-    return safeNumber(asset.price, 0);
-  }
-
-  return safeNumber(asset.confidence_score, 0);
-}
-
-function sortItems(items: ScanServiceItem[], sortKey: SortKey, order: SortOrder): void {
-  const direction = order === "asc" ? 1 : -1;
-
-  items.sort((a, b) => {
-    const aValue = getSortValue(a, sortKey);
-    const bValue = getSortValue(b, sortKey);
-
-    if (aValue !== bValue) {
-      return (aValue - bValue) * direction;
-    }
-
-    const aScore = safeNumber(a.confidence_score, 0);
-    const bScore = safeNumber(b.confidence_score, 0);
-
-    if (aScore !== bScore) {
-      return bScore - aScore;
-    }
-
-    return a.symbol.localeCompare(b.symbol);
-  });
-}
-
-function buildFallbackAsset(input: {
-  id: string;
-  symbol: string;
-  name: string;
-  price: number;
-  chg_24h_pct: number;
-  confidence_score: number;
-  regime: Regime;
-}): ScanAsset {
-  return {
-    id: input.id,
-    symbol: input.symbol,
-    name: input.name,
-    price: input.price,
-    chg_24h_pct: input.chg_24h_pct,
-    confidence_score: input.confidence_score,
-    score_delta: null,
-    score_trend: null,
-    regime: input.regime,
-    market_cap: undefined,
-    volume_24h: undefined,
-    binance_url: "",
-  };
-}
-
-function fallbackAssets(quote: Quote): ScanServiceItem[] {
-  const base: ScanAsset[] = [
-    buildFallbackAsset({
+function getFallbackSeeds(): AssetSeed[] {
+  return [
+    {
       id: "btc",
       symbol: "BTC",
       name: "Bitcoin",
-      price: 64000,
-      chg_24h_pct: 0.3,
-      confidence_score: 98,
-      regime: "TRANSITION",
-    }),
-    buildFallbackAsset({
-      id: "usdt",
-      symbol: "USDT",
-      name: "Tether",
-      price: 1,
-      chg_24h_pct: 0.01,
-      confidence_score: 95,
-      regime: "STABLE",
-    }),
-    buildFallbackAsset({
+      rank: 1,
+      logo_url: null,
+      price: 64200,
+      chg_24h_pct: 1.2,
+      chg_7d_pct: null,
+      market_cap: 1_260_000_000_000,
+      volume_24h: 31_000_000_000,
+      sparkline_7d: [61800, 62200, 62850, 63100, 63600, 63900, 64200],
+    },
+    {
       id: "eth",
       symbol: "ETH",
       name: "Ethereum",
-      price: 3200,
+      rank: 2,
+      logo_url: null,
+      price: 3180,
       chg_24h_pct: 0.7,
-      confidence_score: 91,
-      regime: "TRANSITION",
-    }),
-    buildFallbackAsset({
+      chg_7d_pct: null,
+      market_cap: 382_000_000_000,
+      volume_24h: 14_800_000_000,
+      sparkline_7d: [3050, 3070, 3095, 3110, 3140, 3165, 3180],
+    },
+    {
+      id: "bnb",
+      symbol: "BNB",
+      name: "BNB",
+      rank: 3,
+      logo_url: null,
+      price: 590,
+      chg_24h_pct: 0.3,
+      chg_7d_pct: null,
+      market_cap: 86_000_000_000,
+      volume_24h: 1_900_000_000,
+      sparkline_7d: [571, 575, 578, 581, 585, 588, 590],
+    },
+    {
       id: "sol",
       symbol: "SOL",
       name: "Solana",
-      price: 145,
-      chg_24h_pct: 1.1,
-      confidence_score: 84,
-      regime: "VOLATILE",
-    }),
+      rank: 4,
+      logo_url: null,
+      price: 142,
+      chg_24h_pct: -0.6,
+      chg_7d_pct: null,
+      market_cap: 69_000_000_000,
+      volume_24h: 3_200_000_000,
+      sparkline_7d: [148, 147, 145, 144, 143, 142.5, 142],
+    },
+    {
+      id: "xrp",
+      symbol: "XRP",
+      name: "XRP",
+      rank: 5,
+      logo_url: null,
+      price: 0.61,
+      chg_24h_pct: 0.1,
+      chg_7d_pct: null,
+      market_cap: 35_000_000_000,
+      volume_24h: 1_600_000_000,
+      sparkline_7d: [0.59, 0.595, 0.6, 0.598, 0.602, 0.607, 0.61],
+    },
   ];
-
-  return base.map((asset) => toScanServiceItem(asset, quote));
 }
 
-function buildResult(
-  input: Partial<ScanServiceResult> & Pick<ScanServiceResult, "ts" | "quote">
-): ScanServiceResult {
-  return {
-    ok: Boolean(input.ok),
-    ts: input.ts,
-    version: input.version ?? XYVALA_VERSION,
-    source: input.source ?? "fallback",
-    market: input.market ?? DEFAULT_MARKET,
-    quote: input.quote,
-    count: input.count ?? 0,
-    data: input.data ?? [],
-    error: input.error ?? null,
-    warnings: uniqueWarnings(input.warnings),
-    meta: {
-      q: input.meta?.q ?? null,
-      sort: input.meta?.sort ?? DEFAULT_SORT,
-      limit: input.meta?.limit ?? DEFAULT_LIMIT,
-    },
-  };
+function buildPrivateAssets(input: {
+  seeds: AssetSeed[];
+  quote: Quote;
+  source: "scan" | "fallback";
+  warning: string;
+}) {
+  const generatedAt = new Date().toISOString();
+
+  return input.seeds.map((seed) =>
+    buildPrivateScanAsset({
+      ...seed,
+      quote: input.quote,
+      source: input.source,
+      analytical_version: "scan-service-v1",
+      generated_at: generatedAt,
+      warnings: [input.warning],
+    }),
+  );
+}
+
+async function loadRealSeeds(quote: Quote): Promise<AssetSeed[]> {
+  const seeds = await getMarketAssets(quote);
+
+  return seeds.map((seed) => ({
+    id: seed.id,
+    symbol: seed.symbol,
+    name: seed.name,
+    rank: seed.rank,
+    logo_url: seed.logo_url,
+    price: seed.price,
+    chg_24h_pct: seed.chg_24h_pct,
+    chg_7d_pct: seed.chg_7d_pct,
+    market_cap: seed.market_cap,
+    volume_24h: seed.volume_24h,
+    sparkline_7d: seed.sparkline_7d,
+  }));
+}
+
+export async function getScan(
+  input: GetScanInput = {},
+): Promise<ScanServiceResult> {
+  const quote = normalizeQuote(input.quote);
+
+  const query = normalizeScanQuery({
+    q: input.q,
+    sort: input.sort,
+    order: input.order,
+    limit: input.limit,
+    cursor: 0,
+  });
+
+  try {
+    const realSeeds = await loadRealSeeds(quote);
+    const hasRealSeeds = realSeeds.length > 0;
+
+    const seeds = hasRealSeeds ? realSeeds : getFallbackSeeds();
+    const source: "scan" | "fallback" = hasRealSeeds ? "scan" : "fallback";
+
+    const privateAssets = buildPrivateAssets({
+      seeds,
+      quote,
+      source,
+      warning: hasRealSeeds
+        ? "scan_service_real_market_source"
+        : "scan_service_fallback_seed",
+    });
+
+    const engine = buildScanEngineResult({
+      data: privateAssets,
+      key: "stability",
+      order: "desc",
+    });
+
+    const publicAssets = privateScanAssetsToPublicScanAssets(engine.data);
+    const queried = queryScanItems(publicAssets, query);
+
+    return {
+      ok: true,
+      source,
+      data: queried.data,
+      warnings: uniqueWarnings(
+        hasRealSeeds ? ["scan_service_real_market_dataset"] : ["scan_service_fallback_dataset"],
+        engine.market_context.warnings,
+      ),
+      error: null,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      source: "fallback",
+      data: [],
+      warnings: uniqueWarnings(["scan_service_failed"]),
+      error:
+        error instanceof Error && error.message
+          ? error.message
+          : "scan_service_unknown_error",
+    };
+  }
 }
 
 export async function getScanService(
-  input: ScanServiceInput = {}
+  input: GetScanInput = {},
 ): Promise<ScanServiceResult> {
-  const ts = nowIso();
-  const quote = normalizeQuote(input.quote);
-  const { sortKey, sortLabel, order } = normalizeSort(input.sort);
-  const limit = parseLimit(input.limit);
-  const q = normalizeSearch(input.q);
-  const noStore = input.noStore === true;
-
-  const canonicalSnapshotKey = buildCanonicalSnapshotKey(quote);
-
-  const cacheKey = buildScanServiceCacheKey({
-    quote,
-    sort: sortLabel,
-    limit,
-    q,
-  });
-
-  if (!noStore) {
-    const cached = getScanMemCache(cacheKey, SCAN_CACHE_TTL_MS);
-
-    if (cached) {
-      return buildResult({
-        ...cached,
-        ts,
-        source: "scan_cache",
-        quote,
-      });
-    }
-  }
-
-  let source: ScanServiceResult["source"] = "scan_snapshot";
-  let items: ScanServiceItem[] = [];
-  const warnings: string[] = [];
-
-  try {
-    const cachedSnapshot = getFromCache<ScanSnapshot>(
-      canonicalSnapshotKey,
-      SNAPSHOT_TTL_MS
-    );
-
-    if (cachedSnapshot && isScanSnapshot(cachedSnapshot)) {
-      items = normalizeSnapshotItems(cachedSnapshot, quote);
-
-      if (items.length === 0) {
-        source = "fallback";
-        warnings.push("scan_snapshot_empty", "scan_fallback_used");
-        items = fallbackAssets(quote);
-      }
-    } else if (cachedSnapshot) {
-      source = "fallback";
-      warnings.push("scan_snapshot_invalid", "scan_fallback_used");
-      items = fallbackAssets(quote);
-    } else {
-      source = "fallback";
-      warnings.push("scan_snapshot_missing", "scan_fallback_used");
-      items = fallbackAssets(quote);
-    }
-  } catch (error) {
-    source = "fallback";
-    warnings.push(
-      error instanceof Error && error.message
-        ? `scan_snapshot_read_failed:${error.message}`
-        : "scan_snapshot_read_failed",
-      "scan_fallback_used"
-    );
-    items = fallbackAssets(quote);
-  }
-
-  const searched = applySearch(items, q);
-  sortItems(searched, sortKey, order);
-
-  const sliced = searched.slice(0, limit);
-
-  const result = buildResult({
-    ok: true,
-    ts,
-    source,
-    market: DEFAULT_MARKET,
-    quote,
-    count: searched.length,
-    data: sliced,
-    error: null,
-    warnings,
-    meta: {
-      q,
-      sort: sortLabel,
-      limit,
-    },
-  });
-
-  if (!noStore) {
-    setScanMemCache(cacheKey, result);
-  }
-
-  return result;
+  return getScan(input);
 }

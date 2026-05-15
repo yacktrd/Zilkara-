@@ -223,7 +223,7 @@ export async function GET(req: NextRequest) {
       key: auth.key,
       keyType: auth.keyType,
       endpoint: "/api/account/quota",
-      planOverride: auth.plan,
+      plan: auth.plan,
     });
   } catch (error) {
     warnings = uniqueWarnings([

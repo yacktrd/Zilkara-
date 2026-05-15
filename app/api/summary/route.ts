@@ -1,546 +1,343 @@
-// app/api/summary/route.ts
+/* ============================================================================
+ * FILE: app/api/summary/route.ts
+ * ----------------------------------------------------------------------------
+ * TITLE
+ * - Xyvala public summary route
+ *
+ * ROLE
+ * - expose a public descriptive market summary
+ * - stay aligned with the public ScanAsset contract
+ * - prevent private analytical, regime, decision and opportunity leakage
+ *
+ * DIRECTIVES
+ * - public API only
+ * - EUR default quote
+ * - no decision exposure
+ * - no regime exposure
+ * - no opportunity exposure
+ * - no stability score exposure
+ * - no broker / affiliate exposure
+ * - no RFS recomputation
+ * - no MCI recomputation
+ * - descriptive market data only
+ * - null means explicitly unavailable
+ * ========================================================================== */
 
 import { NextRequest, NextResponse } from "next/server";
-import { Redis } from "@upstash/redis";
+
+import { getScan } from "@/lib/xyvala/services/scan-service";
+
+import type { ScanAsset } from "@/lib/xyvala/contracts/scan-contract";
+
 import {
-  validateApiKey,
-  buildApiKeyErrorResponse,
-  applyApiAuthHeaders,
-} from "@/lib/xyvala/auth";
-import { trackUsage, applyQuotaHeaders } from "@/lib/xyvala/usage";
-import { getXyvalaScan } from "@/lib/xyvala/scan";
+  XYVALA_SNAPSHOT_VERSION,
+  type Quote,
+} from "@/lib/xyvala/snapshot";
 
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
-export const revalidate = 0;
+/* ============================================================================
+ * 1. TYPES
+ * ========================================================================== */
 
-const XYVALA_VERSION = "v1";
-const SUMMARY_ROUTE = "/api/summary";
-
-const SUMMARY_CACHE_TTL_MS = 15_000;
-const SUMMARY_CACHE_TTL_SECONDS = Math.ceil(SUMMARY_CACHE_TTL_MS / 1000);
-
-const SUBREQUEST_TIMEOUT_MS = 3_500;
-
-const SCAN_LIMIT = 100;
-const SCAN_QUOTE = "usd";
-const SCAN_SORT = "score_desc";
-
-type JsonRecord = Record<string, unknown>;
-type NullableRecord = JsonRecord | null;
-type UnknownArray = unknown[];
-
-type SummaryWarningCode =
-  | "scan_failed"
-  | "state_failed"
-  | "opportunities_failed"
-  | "kv_read_failed"
-  | "kv_write_failed"
-  | "summary_failed";
+type SummaryTopAsset = {
+  rank: number | null;
+  symbol: string;
+  name: string;
+  price: number | null;
+  chg_24h_pct: number | null;
+  chg_7d_pct: number | null;
+  market_cap: number | null;
+  volume_24h: number | null;
+};
 
 type SummaryResponse = {
   ok: boolean;
   ts: string;
   version: string;
-  state: NullableRecord;
-  opportunities: UnknownArray;
-  scan_meta: {
-    source?: string;
-    quote?: string;
-    assets: number;
+  market: "crypto";
+  quote: Quote;
+  source: "scan" | "fallback";
+  count: number;
+  summary: {
+    avg_price: number | null;
+    avg_chg_24h_pct: number | null;
+    avg_chg_7d_pct: number | null;
+    total_market_cap: number | null;
+    total_volume_24h: number | null;
+    top_ranked_assets: SummaryTopAsset[];
+    top_market_cap_assets: SummaryTopAsset[];
+    top_volume_assets: SummaryTopAsset[];
+  };
+  meta: {
+    region: "EU";
+    currency: "EUR" | "USD" | "USDT";
+    q: string | null;
+    limit: number;
+    warnings: string[];
   };
   error: string | null;
-  degraded?: boolean;
-  warnings?: SummaryWarningCode[];
-  cache?: {
-    status: "hit" | "miss";
-    layer: "kv" | "memory" | "none";
-    ttl_ms: number;
+};
+
+/* ============================================================================
+ * 2. CONSTANTS
+ * ========================================================================== */
+
+const DEFAULT_QUOTE: Quote = "eur";
+const DEFAULT_LIMIT = 100;
+const MAX_LIMIT = 250;
+
+/* ============================================================================
+ * 3. SAFE HELPERS
+ * ========================================================================== */
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function safeLower(value: unknown): string {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
+function safeNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function round2(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.round(value * 100) / 100;
+}
+
+function mean(values: number[]): number | null {
+  if (values.length === 0) return null;
+
+  return round2(values.reduce((sum, value) => sum + value, 0) / values.length);
+}
+
+function sum(values: number[]): number | null {
+  if (values.length === 0) return null;
+
+  return round2(values.reduce((total, value) => total + value, 0));
+}
+
+function normalizeQuote(value: string | null): Quote {
+  const quote = safeLower(value);
+
+  if (quote === "usd") return "usd";
+  if (quote === "usdt") return "usdt";
+
+  return DEFAULT_QUOTE;
+}
+
+function normalizeLimit(value: string | null): number {
+  const parsed = Number(value);
+
+  if (!Number.isFinite(parsed)) {
+    return DEFAULT_LIMIT;
+  }
+
+  return Math.max(1, Math.min(MAX_LIMIT, Math.trunc(parsed)));
+}
+
+function normalizeSearch(value: string | null): string | null {
+  const q = safeLower(value);
+
+  return q.length > 0 ? q : null;
+}
+
+function parseBool(value: string | null): boolean {
+  const normalized = safeLower(value);
+
+  return (
+    normalized === "1" ||
+    normalized === "true" ||
+    normalized === "yes" ||
+    normalized === "on"
+  );
+}
+
+function quoteToCurrency(quote: Quote): "EUR" | "USD" | "USDT" {
+  if (quote === "usd") return "USD";
+  if (quote === "usdt") return "USDT";
+
+  return "EUR";
+}
+
+/* ============================================================================
+ * 4. SUMMARY HELPERS
+ * ========================================================================== */
+
+function mapTopAsset(asset: ScanAsset): SummaryTopAsset {
+  return {
+    rank: asset.rank ?? null,
+    symbol: asset.symbol,
+    name: asset.name,
+    price: asset.price ?? null,
+    chg_24h_pct: asset.chg_24h_pct ?? null,
+    chg_7d_pct: asset.chg_7d_pct ?? null,
+    market_cap: asset.market_cap ?? null,
+    volume_24h: asset.volume_24h ?? null,
   };
-};
-
-type ScanResultLike = {
-  source?: string;
-  quote?: string;
-  data?: unknown[];
-} | null;
-
-type CachedEntry<T> = {
-  value: T;
-  expiresAt: number;
-};
-
-type MemoryCacheStore = Map<string, CachedEntry<SummaryResponse>>;
-
-type AuthResult = ReturnType<typeof validateApiKey>;
-type AuthSuccess = Extract<AuthResult, { ok: true }>;
-type UsageResult = ReturnType<typeof trackUsage> | null;
-
-type FetchJsonResult = {
-  ok: boolean;
-  status: number;
-  json: unknown;
-  warning?: SummaryWarningCode;
-};
-
-declare global {
-  // eslint-disable-next-line no-var
-  var __xyvalaSummaryCache__: MemoryCacheStore | undefined;
 }
 
-const nowIso = () => new Date().toISOString();
+function sortByRank(data: ScanAsset[]): ScanAsset[] {
+  return [...data].sort((a, b) => {
+    const aRank = a.rank ?? Number.POSITIVE_INFINITY;
+    const bRank = b.rank ?? Number.POSITIVE_INFINITY;
 
-function getMemoryCache(): MemoryCacheStore {
-  if (!globalThis.__xyvalaSummaryCache__) {
-    globalThis.__xyvalaSummaryCache__ = new Map<string, CachedEntry<SummaryResponse>>();
-  }
-
-  return globalThis.__xyvalaSummaryCache__;
-}
-
-function pruneMemoryCacheIfNeeded(): void {
-  const cache = getMemoryCache();
-
-  if (cache.size < 100) return;
-
-  const firstKey = cache.keys().next().value;
-  if (typeof firstKey === "string") {
-    cache.delete(firstKey);
-  }
-}
-
-function getMemoryCachedSummary(key: string): SummaryResponse | null {
-  const cache = getMemoryCache();
-  const hit = cache.get(key);
-
-  if (!hit) return null;
-
-  if (Date.now() >= hit.expiresAt) {
-    cache.delete(key);
-    return null;
-  }
-
-  return hit.value;
-}
-
-function setMemoryCachedSummary(key: string, value: SummaryResponse, ttlMs: number): void {
-  const cache = getMemoryCache();
-  pruneMemoryCacheIfNeeded();
-  cache.set(key, {
-    value,
-    expiresAt: Date.now() + ttlMs,
-  });
-}
-
-function isRecord(value: unknown): value is JsonRecord {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function normalizeState(value: unknown): NullableRecord {
-  return isRecord(value) ? value : null;
-}
-
-function normalizeOpportunities(value: unknown): UnknownArray {
-  return Array.isArray(value) ? value : [];
-}
-
-function getCacheKey(): string {
-  return `xyvala:summary:${XYVALA_VERSION}:${SCAN_QUOTE}:${SCAN_SORT}:${SCAN_LIMIT}`;
-}
-
-function getRedisClient(): Redis | null {
-  const url = process.env.UPSTASH_REDIS_REST_URL?.trim();
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN?.trim();
-
-  if (!url || !token) return null;
-
-  return new Redis({ url, token });
-}
-
-async function withTimeout<T>(
-  task: (signal: AbortSignal) => Promise<T>,
-  timeoutMs: number,
-  fallback: T
-): Promise<T> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    return await task(controller.signal);
-  } catch {
-    return fallback;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function fetchJson(
-  url: string,
-  apiKey: string,
-  timeoutMs: number
-): Promise<FetchJsonResult> {
-  return withTimeout(
-    async (signal) => {
-      const res = await fetch(url, {
-        method: "GET",
-        headers: {
-          "x-xyvala-key": apiKey,
-        },
-        cache: "no-store",
-        signal,
-      });
-
-      if (!res.ok) {
-        return {
-          ok: false,
-          status: res.status,
-          json: null,
-        };
-      }
-
-      let json: unknown = null;
-
-      try {
-        json = await res.json();
-      } catch {
-        json = null;
-      }
-
-      return {
-        ok: true,
-        status: res.status,
-        json,
-      };
-    },
-    timeoutMs,
-    {
-      ok: false,
-      status: 504,
-      json: null,
+    if (aRank !== bRank) {
+      return aRank - bRank;
     }
-  );
-}
 
-async function fetchState(origin: string, apiKey: string): Promise<{
-  state: NullableRecord;
-  warning?: SummaryWarningCode;
-}> {
-  const result = await fetchJson(`${origin}/api/state`, apiKey, SUBREQUEST_TIMEOUT_MS);
-
-  if (!result.ok || !isRecord(result.json)) {
-    return {
-      state: null,
-      warning: "state_failed",
-    };
-  }
-
-  return {
-    state: normalizeState(result.json.state),
-  };
-}
-
-async function fetchOpportunities(origin: string, apiKey: string): Promise<{
-  opportunities: UnknownArray;
-  warning?: SummaryWarningCode;
-}> {
-  const result = await fetchJson(
-    `${origin}/api/opportunities`,
-    apiKey,
-    SUBREQUEST_TIMEOUT_MS
-  );
-
-  if (!result.ok || !isRecord(result.json)) {
-    return {
-      opportunities: [],
-      warning: "opportunities_failed",
-    };
-  }
-
-  return {
-    opportunities: normalizeOpportunities(result.json.data),
-  };
-}
-
-async function fetchScan(): Promise<{
-  scan: ScanResultLike;
-  warning?: SummaryWarningCode;
-}> {
-  const result = await withTimeout(
-    async () => {
-      const scan = await getXyvalaScan({
-        quote: SCAN_QUOTE,
-        sort: SCAN_SORT,
-        limit: SCAN_LIMIT,
-      });
-
-      return scan ?? null;
-    },
-    SUBREQUEST_TIMEOUT_MS,
-    null as ScanResultLike
-  );
-
-  if (!result) {
-    return {
-      scan: null,
-      warning: "scan_failed",
-    };
-  }
-
-  return {
-    scan: result,
-  };
-}
-
-async function readKvCache(key: string): Promise<{
-  value: SummaryResponse | null;
-  warning?: SummaryWarningCode;
-}> {
-  const redis = getRedisClient();
-  if (!redis) {
-    return { value: null };
-  }
-
-  try {
-    const cached = await redis.get<SummaryResponse>(key);
-    return {
-      value: cached ?? null,
-    };
-  } catch {
-    return {
-      value: null,
-      warning: "kv_read_failed",
-    };
-  }
-}
-
-async function writeKvCache(key: string, value: SummaryResponse): Promise<{
-  ok: boolean;
-  warning?: SummaryWarningCode;
-}> {
-  const redis = getRedisClient();
-  if (!redis) {
-    return { ok: false, warning: "kv_write_failed" };
-  }
-
-  try {
-    await redis.set(key, value, { ex: SUMMARY_CACHE_TTL_SECONDS });
-    return { ok: true };
-  } catch {
-    return { ok: false, warning: "kv_write_failed" };
-  }
-}
-
-function uniqueWarnings(...groups: Array<SummaryWarningCode[] | undefined>): SummaryWarningCode[] {
-  const merged = groups.flatMap((group) => group ?? []);
-  return [...new Set(merged)];
-}
-
-function buildResponseHeaders(params: {
-  cacheStatus: "hit" | "miss";
-  cacheLayer: "kv" | "memory" | "none";
-}) {
-  return {
-    "cache-control": "private, no-store, max-age=0, must-revalidate",
-    "x-xyvala-version": XYVALA_VERSION,
-    "x-xyvala-cache": params.cacheStatus,
-    "x-xyvala-cache-layer": params.cacheLayer,
-  };
-}
-
-function buildSummaryFromParts(params: {
-  ts: string;
-  scan: ScanResultLike;
-  state: NullableRecord;
-  opportunities: UnknownArray;
-  warnings: SummaryWarningCode[];
-  cacheStatus: "hit" | "miss";
-  cacheLayer: "kv" | "memory" | "none";
-}): SummaryResponse {
-  const { ts, scan, state, opportunities, warnings, cacheStatus, cacheLayer } = params;
-
-  const assets = Array.isArray(scan?.data) ? scan.data.length : 0;
-  const allFailed = assets === 0 && state === null && opportunities.length === 0;
-  const degraded = warnings.length > 0 && !allFailed;
-
-  return {
-    ok: !allFailed,
-    ts,
-    version: XYVALA_VERSION,
-    state,
-    opportunities,
-    scan_meta: {
-      source: scan?.source,
-      quote: scan?.quote,
-      assets,
-    },
-    error: allFailed ? "summary_failed" : null,
-    degraded: degraded || undefined,
-    warnings: warnings.length > 0 ? warnings : undefined,
-    cache: {
-      status: cacheStatus,
-      layer: cacheLayer,
-      ttl_ms: SUMMARY_CACHE_TTL_MS,
-    },
-  };
-}
-
-function respond(
-  payload: SummaryResponse,
-  status: number,
-  auth: AuthSuccess,
-  usage: UsageResult
-) {
-  let res: NextResponse = NextResponse.json(payload, {
-    status,
-    headers: buildResponseHeaders({
-      cacheStatus: payload.cache?.status ?? "miss",
-      cacheLayer: payload.cache?.layer ?? "none",
-    }),
+    return a.symbol.localeCompare(b.symbol);
   });
+}
 
-  res = applyApiAuthHeaders(res, auth);
+function sortByMarketCap(data: ScanAsset[]): ScanAsset[] {
+  return [...data].sort((a, b) => {
+    const aMarketCap = a.market_cap ?? -1;
+    const bMarketCap = b.market_cap ?? -1;
 
-  if (usage) {
-    res = applyQuotaHeaders(res, usage);
+    if (aMarketCap !== bMarketCap) {
+      return bMarketCap - aMarketCap;
+    }
+
+    return a.symbol.localeCompare(b.symbol);
+  });
+}
+
+function sortByVolume(data: ScanAsset[]): ScanAsset[] {
+  return [...data].sort((a, b) => {
+    const aVolume = a.volume_24h ?? -1;
+    const bVolume = b.volume_24h ?? -1;
+
+    if (aVolume !== bVolume) {
+      return bVolume - aVolume;
+    }
+
+    return a.symbol.localeCompare(b.symbol);
+  });
+}
+
+function buildSummary(data: ScanAsset[]): SummaryResponse["summary"] {
+  const priceValues: number[] = [];
+  const change24hValues: number[] = [];
+  const change7dValues: number[] = [];
+  const marketCapValues: number[] = [];
+  const volume24hValues: number[] = [];
+
+  for (const asset of data) {
+    const price = safeNumber(asset.price);
+    const change24h = safeNumber(asset.chg_24h_pct);
+    const change7d = safeNumber(asset.chg_7d_pct);
+    const marketCap = safeNumber(asset.market_cap);
+    const volume24h = safeNumber(asset.volume_24h);
+
+    if (price !== null) priceValues.push(price);
+    if (change24h !== null) change24hValues.push(change24h);
+    if (change7d !== null) change7dValues.push(change7d);
+    if (marketCap !== null) marketCapValues.push(marketCap);
+    if (volume24h !== null) volume24hValues.push(volume24h);
   }
 
-  return res;
+  return {
+    avg_price: mean(priceValues),
+    avg_chg_24h_pct: mean(change24hValues),
+    avg_chg_7d_pct: mean(change7dValues),
+    total_market_cap: sum(marketCapValues),
+    total_volume_24h: sum(volume24hValues),
+    top_ranked_assets: sortByRank(data).slice(0, 5).map(mapTopAsset),
+    top_market_cap_assets: sortByMarketCap(data).slice(0, 5).map(mapTopAsset),
+    top_volume_assets: sortByVolume(data).slice(0, 5).map(mapTopAsset),
+  };
 }
+
+/* ============================================================================
+ * 5. ROUTE HANDLER
+ * ========================================================================== */
 
 export async function GET(req: NextRequest) {
-  const auth = validateApiKey(req);
+  const searchParams = req.nextUrl.searchParams;
 
-  if (!auth.ok) {
-    return buildApiKeyErrorResponse(auth.error, auth.status);
-  }
-
-  let usage: UsageResult = null;
-
-  try {
-    usage = trackUsage({
-      key: auth.key,
-      keyType: auth.keyType,
-      endpoint: SUMMARY_ROUTE,
-      planOverride: "plan" in auth ? auth.plan : undefined,
-    });
-  } catch {
-    // non bloquant
-  }
-
-  const cacheKey = getCacheKey();
-
-  const kvCachedResult = await readKvCache(cacheKey);
-  if (kvCachedResult.value) {
-    const payload: SummaryResponse = {
-      ...kvCachedResult.value,
-      cache: {
-        status: "hit",
-        layer: "kv",
-        ttl_ms: SUMMARY_CACHE_TTL_MS,
-      },
-      warnings: uniqueWarnings(
-        kvCachedResult.value.warnings,
-        kvCachedResult.warning ? [kvCachedResult.warning] : undefined
-      ),
-    };
-
-    return respond(payload, payload.ok ? 200 : 503, auth, usage);
-  }
-
-  const memoryCached = getMemoryCachedSummary(cacheKey);
-  if (memoryCached) {
-    const payload: SummaryResponse = {
-      ...memoryCached,
-      cache: {
-        status: "hit",
-        layer: "memory",
-        ttl_ms: SUMMARY_CACHE_TTL_MS,
-      },
-      warnings: uniqueWarnings(
-        memoryCached.warnings,
-        kvCachedResult.warning ? [kvCachedResult.warning] : undefined
-      ),
-    };
-
-    return respond(payload, payload.ok ? 200 : 503, auth, usage);
-  }
-
-  const ts = nowIso();
+  const quote = normalizeQuote(searchParams.get("quote"));
+  const q = normalizeSearch(searchParams.get("q"));
+  const limit = normalizeLimit(searchParams.get("limit"));
+  const noStore = parseBool(searchParams.get("noStore"));
 
   try {
-    const origin = new URL(req.url).origin;
-
-    const [scanPart, statePart, opportunitiesPart] = await Promise.all([
-      fetchScan(),
-      fetchState(origin, auth.key),
-      fetchOpportunities(origin, auth.key),
-    ]);
-
-    const warnings = uniqueWarnings(
-      scanPart.warning ? [scanPart.warning] : undefined,
-      statePart.warning ? [statePart.warning] : undefined,
-      opportunitiesPart.warning ? [opportunitiesPart.warning] : undefined,
-      kvCachedResult.warning ? [kvCachedResult.warning] : undefined
-    );
-
-    let payload = buildSummaryFromParts({
-      ts,
-      scan: scanPart.scan,
-      state: statePart.state,
-      opportunities: opportunitiesPart.opportunities,
-      warnings,
-      cacheStatus: "miss",
-      cacheLayer: "none",
+    const service = await getScan({
+      quote,
+      q,
+      sort: "rank",
+      order: "asc",
+      limit,
+      noStore,
     });
 
-    const kvWriteResult = await writeKvCache(cacheKey, payload);
+    const payload: SummaryResponse = {
+      ok: service.ok,
+      ts: nowIso(),
+      version: XYVALA_SNAPSHOT_VERSION,
+      market: "crypto",
+      quote,
+      source: service.source,
+      count: service.data.length,
+      summary: buildSummary(service.data),
+      meta: {
+        region: "EU",
+        currency: quoteToCurrency(quote),
+        q,
+        limit,
+        warnings: service.warnings,
+      },
+      error: service.error,
+    };
 
-    if (kvWriteResult.ok) {
-      payload = {
-        ...payload,
-        cache: {
-          status: "miss",
-          layer: "kv",
-          ttl_ms: SUMMARY_CACHE_TTL_MS,
-        },
-      };
-    } else {
-      setMemoryCachedSummary(cacheKey, payload, SUMMARY_CACHE_TTL_MS);
-
-      payload = {
-        ...payload,
-        warnings: uniqueWarnings(
-          payload.warnings,
-          kvWriteResult.warning ? [kvWriteResult.warning] : undefined
-        ),
-        cache: {
-          status: "miss",
-          layer: "memory",
-          ttl_ms: SUMMARY_CACHE_TTL_MS,
-        },
-      };
-    }
-
-    return respond(payload, payload.ok ? 200 : 503, auth, usage);
-  } catch (error: unknown) {
+    return NextResponse.json(payload, {
+      status: service.ok ? 200 : 503,
+      headers: {
+        "cache-control": "no-store",
+        "x-xyvala-version": XYVALA_SNAPSHOT_VERSION,
+        "x-xyvala-endpoint": "/api/summary",
+      },
+    });
+  } catch (error) {
     const payload: SummaryResponse = {
       ok: false,
-      ts,
-      version: XYVALA_VERSION,
-      state: null,
-      opportunities: [],
-      scan_meta: {
-        assets: 0,
+      ts: nowIso(),
+      version: XYVALA_SNAPSHOT_VERSION,
+      market: "crypto",
+      quote: DEFAULT_QUOTE,
+      source: "fallback",
+      count: 0,
+      summary: {
+        avg_price: null,
+        avg_chg_24h_pct: null,
+        avg_chg_7d_pct: null,
+        total_market_cap: null,
+        total_volume_24h: null,
+        top_ranked_assets: [],
+        top_market_cap_assets: [],
+        top_volume_assets: [],
       },
-      error: error instanceof Error ? error.message : "summary_failed",
-      warnings: ["summary_failed"],
-      cache: {
-        status: "miss",
-        layer: "none",
-        ttl_ms: SUMMARY_CACHE_TTL_MS,
+      meta: {
+        region: "EU",
+        currency: "EUR",
+        q: null,
+        limit: DEFAULT_LIMIT,
+        warnings: [],
       },
+      error:
+        error instanceof Error && error.message
+          ? error.message
+          : "summary_route_unknown_error",
     };
 
-    return respond(payload, 500, auth, usage);
+    return NextResponse.json(payload, {
+      status: 500,
+      headers: {
+        "cache-control": "no-store",
+        "x-xyvala-version": XYVALA_SNAPSHOT_VERSION,
+        "x-xyvala-endpoint": "/api/summary",
+      },
+    });
   }
 }

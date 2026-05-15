@@ -1,37 +1,65 @@
-// lib/xyvala/access/access-guards.ts
+/*
+FILE: access-guards.ts
 
-import type { ScanAsset } from "@/lib/xyvala/contracts/scan-contract";
-import type { AccessMeta, AccessScope } from "./access-types";
+PARENTS:
+- lib/xyvala/contracts/scan-private-contract.ts
 
-function safeNullableNumber(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
+SECTIONS:
+1. Types
+2. Mappers
+3. Guards
 
-function safeNullableString(value: unknown): string | null {
-  return typeof value === "string" && value.trim().length > 0
-    ? value.trim()
-    : null;
-}
+DIRECTIVES:
+- Strict alignment with current PrivateScanAsset contract
+- No public exposure logic here
+- Stability remains the primary structural filter
+- Decision, regime and opportunity remain private
+*/
 
-export function applyScanCompartment(
-  data: ScanAsset[],
-  scope: AccessScope
-): ScanAsset[] {
-  return data.slice(0, scope.maxAssets).map((asset) => ({
-    ...asset,
-    score_delta: scope.showScoreDelta
-      ? safeNullableNumber(asset.score_delta)
-      : null,
-    score_trend: scope.showScoreTrend
-      ? safeNullableString(asset.score_trend)
-      : null,
-  }));
-}
+import type { PrivateScanAsset } from "@/lib/xyvala/contracts/scan-private-contract";
 
-export function buildAccessMeta(scope: AccessScope): AccessMeta {
+/* =========================
+   1. TYPES
+========================= */
+
+export type AssetAccessView = {
+  symbol: string;
+  stability_score: number | null;
+  opportunity_score: number | null;
+  regime: PrivateScanAsset["regime"];
+  decision: PrivateScanAsset["decision"];
+};
+
+/* =========================
+   2. MAPPERS
+========================= */
+
+export function toAssetAccessView(asset: PrivateScanAsset): AssetAccessView {
   return {
-    compartment: scope.compartment,
-    visiblePercent: scope.visiblePercent,
-    maxAssets: scope.maxAssets,
+    symbol: asset.symbol,
+    stability_score: asset.stability_score,
+    opportunity_score: asset.opportunity_score,
+    regime: asset.regime,
+    decision: asset.decision,
   };
+}
+
+/* =========================
+   3. GUARDS
+========================= */
+
+export function isAssetTradable(asset: PrivateScanAsset): boolean {
+  if (asset.decision === "ALLOW") {
+    return true;
+  }
+
+  if (
+    asset.regime !== "VOLATILE" &&
+    (asset.stability_score ?? 0) >= 60 &&
+    (asset.opportunity_score ?? 0) >= 50
+  ) {
+    return true;
+  }
+
+  return false;
 }

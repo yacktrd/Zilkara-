@@ -11,11 +11,7 @@ const XYVALA_VERSION = "v2";
 const CACHE_CONTROL = "no-store, no-cache, max-age=0, must-revalidate";
 const ADMIN_HEADER_NAME = "x-xyvala-admin-key";
 
-/* -------------------------------------------------------------------------- */
-/*                                    Types                                   */
-/* -------------------------------------------------------------------------- */
-
-type RouteMode = "global" | "apiKey" | "endpoint";
+type RouteMode = "global" | "key" | "endpoint";
 
 type UsageSnapshot = {
   [key: string]: unknown;
@@ -30,20 +26,15 @@ type AdminUsageResponse = {
   ok: boolean;
   ts: string;
   version: string;
-
   mode: RouteMode;
   filters: {
-    apiKey: string | null;
+    key: string | null;
     endpoint: string | null;
   };
-
   totals: UsageTotals;
-
   count: number;
   data: UsageSnapshot[];
-
   error: string | null;
-
   meta: {
     warnings: string[];
     source: {
@@ -54,13 +45,37 @@ type AdminUsageResponse = {
   };
 };
 
-type UsageListByKeyFn = (input: { apiKey: string }) => Promise<unknown>;
-type UsageListByEndpointFn = (input: { endpoint: string }) => Promise<unknown>;
-type UsageTotalsFn = () => Promise<unknown>;
+type UsageListByKeyRow = {
+  key: string;
+  plan: string;
+  keyType: string;
+  totalCount: number;
+  minuteCount: number;
+  dayCount: number;
+  endpoints: number;
+  updatedAt: number;
+};
 
-/* -------------------------------------------------------------------------- */
-/*                                   Config                                   */
-/* -------------------------------------------------------------------------- */
+type UsageListByEndpointRow = {
+  endpoint: string;
+  totalCount: number;
+  minuteCount: number;
+  dayCount: number;
+  keys: number;
+};
+
+type UsageTotalsRaw = {
+  totalKeys: number;
+  totalEndpoints: number;
+  totalUsageCount: number;
+  totalMinuteCount: number;
+  totalDayCount: number;
+  quotaExceededKeys: number;
+};
+
+type UsageListByKeyFn = () => UsageListByKeyRow[];
+type UsageListByEndpointFn = () => UsageListByEndpointRow[];
+type UsageTotalsFn = () => UsageTotalsRaw;
 
 const ALLOWED_ENDPOINTS = new Set([
   "/api/scan",
@@ -78,10 +93,6 @@ const ALLOWED_ENDPOINTS = new Set([
   "/api/admin/disable-key",
   "/api/admin/usage",
 ]);
-
-/* -------------------------------------------------------------------------- */
-/*                                    Utils                                   */
-/* -------------------------------------------------------------------------- */
 
 const nowIso = () => new Date().toISOString();
 
@@ -125,8 +136,8 @@ function normalizeTotals(value: unknown): UsageTotals {
   }
 
   return {
-    records: safeInt(value.records, 0),
-    totalCalls: safeInt(value.totalCalls, 0),
+    records: safeInt(value.totalKeys, 0),
+    totalCalls: safeInt(value.totalUsageCount, 0),
   };
 }
 
@@ -149,23 +160,18 @@ function buildResponse(
     ok: Boolean(input.ok),
     ts: input.ts,
     version: input.version ?? XYVALA_VERSION,
-
     mode: input.mode,
     filters: {
-      apiKey: input.filters.apiKey ?? null,
+      key: input.filters.key ?? null,
       endpoint: input.filters.endpoint ?? null,
     },
-
     totals: {
       records: input.totals?.records ?? 0,
       totalCalls: input.totals?.totalCalls ?? 0,
     },
-
     count: input.count ?? 0,
     data: input.data ?? [],
-
     error: input.error ?? null,
-
     meta: {
       warnings: input.meta?.warnings ?? [],
       source: {
@@ -283,7 +289,7 @@ async function safeGetTotals(
   }
 
   try {
-    const result = await fn();
+    const result = fn();
     return normalizeTotals(result);
   } catch {
     warnings.push("get_usage_totals_failed");
@@ -293,7 +299,7 @@ async function safeGetTotals(
 
 async function safeListByKey(
   fn: UsageListByKeyFn | null,
-  apiKey: string,
+  key: string,
   warnings: string[]
 ): Promise<UsageSnapshot[]> {
   if (!fn) {
@@ -302,8 +308,8 @@ async function safeListByKey(
   }
 
   try {
-    const result = await fn({ apiKey });
-    return asArrayOfObjects(result);
+    const result = fn();
+    return asArrayOfObjects(result).filter((row) => safeStr(row.key) === key);
   } catch {
     warnings.push("list_usage_by_key_failed");
     return [];
@@ -321,17 +327,15 @@ async function safeListByEndpoint(
   }
 
   try {
-    const result = await fn({ endpoint });
-    return asArrayOfObjects(result);
+    const result = fn();
+    return asArrayOfObjects(result).filter(
+      (row) => safeStr(row.endpoint) === endpoint
+    );
   } catch {
     warnings.push("list_usage_by_endpoint_failed");
     return [];
   }
 }
-
-/* -------------------------------------------------------------------------- */
-/*                                   Handler                                  */
-/* -------------------------------------------------------------------------- */
 
 export async function GET(req: NextRequest) {
   const ts = nowIso();
@@ -345,7 +349,7 @@ export async function GET(req: NextRequest) {
       ts,
       mode: "global",
       filters: {
-        apiKey: null,
+        key: null,
         endpoint: null,
       },
       error: admin.error,
@@ -368,7 +372,7 @@ export async function GET(req: NextRequest) {
   try {
     const sp = req.nextUrl.searchParams;
 
-    const apiKey = safeStr(sp.get("apiKey"));
+    const key = safeStr(sp.get("key")) ?? safeStr(sp.get("apiKey"));
     const endpointInput = normalizeEndpoint(sp.get("endpoint"), warnings);
     const endpointCheck = validateEndpoint(endpointInput, warnings);
     const endpoint = endpointCheck.endpoint;
@@ -378,12 +382,16 @@ export async function GET(req: NextRequest) {
     let mode: RouteMode = "global";
     let data: UsageSnapshot[] = [];
 
-    if (apiKey) {
-      mode = "apiKey";
-      data = await safeListByKey(fns.listUsageByKey, apiKey, warnings);
+    if (key) {
+      mode = "key";
+      data = await safeListByKey(fns.listUsageByKey, key, warnings);
     } else if (endpoint) {
       mode = "endpoint";
-      data = await safeListByEndpoint(fns.listUsageByEndpoint, endpoint, warnings);
+      data = await safeListByEndpoint(
+        fns.listUsageByEndpoint,
+        endpoint,
+        warnings
+      );
     } else {
       warnings.push("global_totals_only");
     }
@@ -394,18 +402,15 @@ export async function GET(req: NextRequest) {
       ok: true,
       ts,
       version: XYVALA_VERSION,
-
       mode,
       filters: {
-        apiKey,
+        key,
         endpoint,
       },
-
       totals,
       count: data.length,
       data,
       error: null,
-
       meta: {
         warnings,
         source: {
@@ -431,7 +436,7 @@ export async function GET(req: NextRequest) {
       ts,
       mode: "global",
       filters: {
-        apiKey: null,
+        key: null,
         endpoint: null,
       },
       error: message,

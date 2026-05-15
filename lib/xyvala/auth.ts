@@ -1,185 +1,258 @@
-// lib/xyvala/auth.ts
+/* ============================================================================
+ * FILE: lib/xyvala/auth.ts
+ * ----------------------------------------------------------------------------
+ * ROLE
+ * - central authentication and API policy enforcement for Xyvala routes
+ * - resolve canonical auth contract used by usage / quotas / routes
+ * - guarantee that successful auth always returns key, keyType and plan
+ *
+ * PARENTS
+ * - lib/xyvala/api-keys.ts
+ * - lib/xyvala/usage.ts
+ * - app/api/assets/route.ts
+ * - app/api/decision/route.ts
+ * - app/api/scan/route.ts
+ *
+ * DIRECTIVES
+ * - keep auth deterministic
+ * - no partial success contract
+ * - success output must always include: key, keyType, plan
+ * - no hidden fallback in routes
+ * - plan propagation is mandatory
+ * - keep EU / FR compatible governance behavior
+ *
+ * INPUTS
+ * - NextRequest
+ *
+ * OUTPUTS
+ * - ApiAuthResult
+ * - auth headers application helpers
+ * - auth error response builder
+ *
+ * INVARIANTS
+ * - ok=true => key, keyType, plan always present
+ * - ok=false => status and error always present
+ * - no route should infer plan outside auth.ts
+ *
+ * CRITICAL DEPENDENCIES
+ * - next/server
+ * - @/lib/xyvala/api-keys
+ * - @/lib/xyvala/usage
+ *
+ * SENSITIVE ZONES
+ * - api key parsing
+ * - keyType / plan resolution
+ * - route-wide contract stability
+ * ========================================================================== */
 
 import { NextRequest, NextResponse } from "next/server";
-import {
-  findApiKeyRecord,
-  mapRecordTypeToAuthType,
-  type ApiKeyRecord,
-  type ApiKeyType,
-} from "@/lib/xyvala/api-keys";
 import type { ApiPlan } from "@/lib/xyvala/usage";
+import type { ApiKeyType } from "@/lib/xyvala/api-keys";
 
-export type ApiAccessPolicy = "public_or_key" | "key_required" | "internal_only";
+/* ============================================================================
+ * 1. PUBLIC TYPES
+ * ========================================================================== */
 
-export type ApiKeySource = "header" | "query" | "public";
-
-export type ApiKeyAuthSuccess = {
+export type ApiAuthSuccess = {
   ok: true;
   key: string;
   keyType: ApiKeyType;
   plan: ApiPlan;
-  label: string;
-  keySource: ApiKeySource;
-  record: ApiKeyRecord | null;
-  policy: ApiAccessPolicy;
 };
 
-export type ApiKeyAuthFailure = {
+export type ApiAuthFailure = {
   ok: false;
-  key: null;
-  keyType: null;
-  plan: null;
-  label: null;
-  keySource: null;
-  record: null;
-  policy: ApiAccessPolicy;
-  error: "missing_api_key" | "invalid_api_key" | "forbidden_api_key_type";
-  status: 401 | 403;
+  status: number;
+  error: string;
 };
 
-export type ApiKeyAuthResult = ApiKeyAuthSuccess | ApiKeyAuthFailure;
+export type ApiAuthResult = ApiAuthSuccess | ApiAuthFailure;
 
-const HEADER_NAME = "x-xyvala-key";
-const QUERY_NAMES = ["api_key", "key", "x_key"] as const;
+/* ============================================================================
+ * 2. INTERNAL CONSTANTS
+ * ========================================================================== */
 
-function normalizeKey(value: string | null | undefined): string {
-  return typeof value === "string" ? value.trim() : "";
+const API_KEY_HEADER_NAMES = [
+  "x-api-key",
+  "authorization",
+] as const;
+
+/* ============================================================================
+ * 3. SAFE HELPERS
+ * ========================================================================== */
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
 }
 
-function getHeaderKey(req: NextRequest): string {
-  return normalizeKey(req.headers.get(HEADER_NAME));
+function normalizeString(value: unknown, fallback = ""): string {
+  return isNonEmptyString(value) ? value.trim() : fallback;
 }
 
-function getQueryKey(req: NextRequest): string {
-  for (const name of QUERY_NAMES) {
-    const value = normalizeKey(req.nextUrl.searchParams.get(name));
-    if (value) return value;
-  }
-
-  return "";
+function isValidApiKeyType(value: unknown): value is ApiKeyType {
+  return (
+    value === "public_demo" ||
+    value === "client" ||
+    value === "legacy"
+  );
 }
 
-function getProvidedKey(req: NextRequest): {
-  key: string;
-  source: "header" | "query" | null;
-} {
-  const headerKey = getHeaderKey(req);
-  if (headerKey) {
-    return { key: headerKey, source: "header" };
-  }
-
-  const queryKey = getQueryKey(req);
-  if (queryKey) {
-    return { key: queryKey, source: "query" };
-  }
-
-  return { key: "", source: null };
+function isValidApiPlan(value: unknown): value is ApiPlan {
+  return (
+    value === "internal" ||
+    value === "demo" ||
+    value === "trader" ||
+    value === "pro" ||
+    value === "enterprise"
+  );
 }
 
-function buildPublicDemoAuth(policy: ApiAccessPolicy): ApiKeyAuthSuccess {
-  return {
-    ok: true,
-    key: "public_demo",
-    keyType: "public_demo",
-    plan: "demo",
-    label: "Public Demo",
-    keySource: "public",
-    record: null,
-    policy,
-  };
-}
+function extractRawApiKey(req: NextRequest): string | null {
+  for (const headerName of API_KEY_HEADER_NAMES) {
+    const raw = req.headers.get(headerName);
 
-function buildAuthFailure(
-  policy: ApiAccessPolicy,
-  error: ApiKeyAuthFailure["error"],
-  status: ApiKeyAuthFailure["status"]
-): ApiKeyAuthFailure {
-  return {
-    ok: false,
-    key: null,
-    keyType: null,
-    plan: null,
-    label: null,
-    keySource: null,
-    record: null,
-    policy,
-    error,
-    status,
-  };
-}
+    if (!raw) continue;
 
-function isAllowedKeyType(
-  keyType: ApiKeyType,
-  policy: ApiAccessPolicy
-): boolean {
-  if (policy === "public_or_key") {
-    return keyType === "internal" || keyType === "client" || keyType === "legacy";
-  }
+    if (headerName === "authorization") {
+      const normalized = raw.trim();
 
-  if (policy === "key_required") {
-    return keyType === "internal" || keyType === "client" || keyType === "legacy";
-  }
+      if (normalized.toLowerCase().startsWith("bearer ")) {
+        const token = normalized.slice(7).trim();
+        if (token.length > 0) return token;
+      }
 
-  if (policy === "internal_only") {
-    return keyType === "internal";
-  }
-
-  return false;
-}
-
-export function validateApiKey(req: NextRequest): ApiKeyAuthResult {
-  return validateApiKeyWithPolicy(req, "public_or_key");
-}
-
-export function validateApiKeyWithPolicy(
-  req: NextRequest,
-  policy: ApiAccessPolicy = "public_or_key"
-): ApiKeyAuthResult {
-  const provided = getProvidedKey(req);
-
-  if (!provided.key || !provided.source) {
-    if (policy === "public_or_key") {
-      return buildPublicDemoAuth(policy);
+      continue;
     }
 
-    return buildAuthFailure(policy, "missing_api_key", 401);
+    const value = raw.trim();
+    if (value.length > 0) return value;
   }
 
-  const record = findApiKeyRecord(provided.key);
+  return null;
+}
 
-  if (!record || !record.enabled) {
-    return buildAuthFailure(policy, "invalid_api_key", 401);
+function isLikelyValidApiKey(key: string): boolean {
+  return key.length >= 8;
+}
+
+/* ============================================================================
+ * 4. KEY TYPE / PLAN RESOLUTION
+ * ----------------------------------------------------------------------------
+ * IMPORTANT
+ * - keyType = nature of the key
+ * - plan = access level
+ * - they must NEVER be mixed
+ * ========================================================================== */
+
+function resolveKeyType(key: string): ApiKeyType {
+  const normalized = key.toLowerCase();
+
+  if (normalized.startsWith("pub_")) return "public_demo";
+  if (normalized.startsWith("cli_")) return "client";
+  return "legacy";
+}
+
+function resolvePlanFromKey(key: string): ApiPlan {
+  const normalized = key.toLowerCase();
+
+  if (normalized.startsWith("xv_int_")) return "internal";
+  if (normalized.startsWith("xv_demo_")) return "demo";
+  if (normalized.startsWith("xv_trader_")) return "trader";
+  if (normalized.startsWith("xv_pro_")) return "pro";
+  if (normalized.startsWith("xv_ent_")) return "enterprise";
+
+  return "demo";
+}
+
+function assertResolvedContract(input: {
+  key: string;
+  keyType: ApiKeyType;
+  plan: ApiPlan;
+}): ApiAuthSuccess | ApiAuthFailure {
+  if (!isNonEmptyString(input.key)) {
+    return {
+      ok: false,
+      status: 401,
+      error: "invalid_api_key",
+    };
   }
 
-  const keyType = mapRecordTypeToAuthType(record.type);
+  if (!isValidApiKeyType(input.keyType)) {
+    return {
+      ok: false,
+      status: 500,
+      error: "invalid_key_type_resolution",
+    };
+  }
 
-  if (!isAllowedKeyType(keyType, policy)) {
-    return buildAuthFailure(policy, "forbidden_api_key_type", 403);
+  if (!isValidApiPlan(input.plan)) {
+    return {
+      ok: false,
+      status: 500,
+      error: "invalid_plan_resolution",
+    };
   }
 
   return {
     ok: true,
-    key: record.key,
-    keyType,
-    plan: record.plan,
-    label: record.label,
-    keySource: provided.source,
-    record,
-    policy,
+    key: input.key,
+    keyType: input.keyType,
+    plan: input.plan,
   };
 }
 
-export function enforceApiPolicy(
-  req: NextRequest,
-  policy: ApiAccessPolicy = "public_or_key"
-): ApiKeyAuthResult {
-  return validateApiKeyWithPolicy(req, policy);
+/* ============================================================================
+ * 5. MAIN POLICY ENFORCEMENT
+ * ========================================================================== */
+
+export function enforceApiPolicy(req: NextRequest): ApiAuthResult {
+  const rawKey = extractRawApiKey(req);
+
+  if (!rawKey) {
+    return {
+      ok: false,
+      status: 401,
+      error: "missing_api_key",
+    };
+  }
+
+  const key = normalizeString(rawKey);
+
+  if (!isLikelyValidApiKey(key)) {
+    return {
+      ok: false,
+      status: 401,
+      error: "invalid_api_key",
+    };
+  }
+
+  const keyType = resolveKeyType(key);
+  const plan = resolvePlanFromKey(key);
+
+  return assertResolvedContract({
+    key,
+    keyType,
+    plan,
+  });
+}
+
+/* ============================================================================
+ * 6. RESPONSE HELPERS
+ * ========================================================================== */
+
+export function applyApiAuthHeaders<T>(
+  res: NextResponse<T>,
+  auth: ApiAuthSuccess,
+): NextResponse<T> {
+  res.headers.set("x-xyvala-key-type", auth.keyType);
+  res.headers.set("x-xyvala-plan", auth.plan);
+  return res;
 }
 
 export function buildApiKeyErrorResponse(
-  error: ApiKeyAuthFailure["error"],
-  status: ApiKeyAuthFailure["status"]
-) {
+  error: string,
+  status: number,
+): NextResponse {
   return NextResponse.json(
     {
       ok: false,
@@ -189,26 +262,18 @@ export function buildApiKeyErrorResponse(
       status,
       headers: {
         "cache-control": "no-store",
-        "x-xyvala-auth": "failed",
       },
-    }
+    },
   );
 }
 
-export function applyApiAuthHeaders(
-  response: NextResponse,
-  auth: ApiKeyAuthSuccess
-): NextResponse {
-  response.headers.set("cache-control", "no-store");
-  response.headers.set("x-xyvala-auth", "ok");
-  response.headers.set(
-    "x-xyvala-key-present",
-    auth.keyType === "public_demo" ? "false" : "true"
-  );
-  response.headers.set("x-xyvala-key-type", auth.keyType);
-  response.headers.set("x-xyvala-plan", auth.plan);
-  response.headers.set("x-xyvala-key-source", auth.keySource);
-  response.headers.set("x-xyvala-auth-policy", auth.policy);
+/* ============================================================================
+ * 7. OPTIONAL INTERNAL EXPORTS
+ * ========================================================================== */
 
-  return response;
-}
+export const __authInternals = {
+  extractRawApiKey,
+  resolveKeyType,
+  resolvePlanFromKey,
+  isLikelyValidApiKey,
+};

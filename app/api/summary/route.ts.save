@@ -1,0 +1,413 @@
+/*
+FILE: app/api/summary/route.ts
+
+PARENTS:
+- lib/xyvala/services/scan-service.ts
+- lib/xyvala/contracts/scan-contract.ts
+- lib/xyvala/snapshot.ts
+
+SECTIONS:
+1. Imports
+2. Types
+3. Constants
+4. Safe helpers
+5. Summary helpers
+6. Route handler
+
+DIRECTIVES:
+- Summary endpoint for Xyvala
+- Must stay aligned with current ScanAsset contract
+- No legacy fields allowed
+- Stability is the primary structural score
+- Opportunity is secondary
+- Decision is the minimal action output
+- Keep output deterministic, minimal, and EU-compatible
+*/
+
+import { NextRequest, NextResponse } from "next/server";
+import { getScan } from "@/lib/xyvala/services/scan-service";
+import type {
+  Decision,
+  Regime,
+  ScanAsset,
+} from "@/lib/xyvala/contracts/scan-contract";
+import { XYVALA_SNAPSHOT_VERSION, type Quote } from "@/lib/xyvala/snapshot";
+
+/* =========================
+   2. TYPES
+========================= */
+
+type SummaryBucket = {
+  total: number;
+  stable: number;
+  transition: number;
+  volatile: number;
+  allow: number;
+  watch: number;
+  block: number;
+};
+
+type SummaryTopAsset = {
+  rank: number | null;
+  symbol: string;
+  name: string;
+  price: number | null;
+  chg_24h_pct: number | null;
+  chg_7d_pct: number | null;
+  stability_score: number | null;
+  opportunity_score: number | null;
+  regime: Regime | null;
+  decision: Decision | null;
+};
+
+type SummaryResponse = {
+  ok: boolean;
+  ts: string;
+  version: string;
+  market: "crypto";
+  quote: Quote;
+  source: "scan" | "fallback";
+  count: number;
+  summary: {
+    avg_stability_score: number | null;
+    avg_opportunity_score: number | null;
+    dominant_regime: Regime;
+    dominant_decision: Decision | null;
+    buckets: SummaryBucket;
+    top_stability_assets: SummaryTopAsset[];
+    top_opportunity_assets: SummaryTopAsset[];
+  };
+  meta: {
+    region: "EU";
+    currency: "EUR" | "USD" | "USDT";
+    q: string | null;
+    limit: number;
+    warnings: string[];
+  };
+  error: string | null;
+};
+
+/* =========================
+   3. CONSTANTS
+========================= */
+
+const DEFAULT_QUOTE: Quote = "eur";
+const DEFAULT_LIMIT = 100;
+const MAX_LIMIT = 250;
+
+/* =========================
+   4. SAFE HELPERS
+========================= */
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function safeLower(value: unknown): string {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
+function safeFiniteNumberOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function round2(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
+function mean(values: number[]): number | null {
+  if (values.length === 0) {
+    return null;
+  }
+
+  return round2(values.reduce((sum, value) => sum + value, 0) / values.length);
+}
+
+function normalizeQuote(value: string | null): Quote {
+  const quote = safeLower(value);
+
+  if (quote === "usd") return "usd";
+  if (quote === "usdt") return "usdt";
+  return DEFAULT_QUOTE;
+}
+
+function normalizeLimit(value: string | null): number {
+  const parsed = Number(value);
+
+  if (!Number.isFinite(parsed)) {
+    return DEFAULT_LIMIT;
+  }
+
+  return Math.max(1, Math.min(MAX_LIMIT, Math.trunc(parsed)));
+}
+
+function normalizeSearch(value: string | null): string | null {
+  const q = safeLower(value);
+  return q.length > 0 ? q : null;
+}
+
+function parseBool(value: string | null): boolean {
+  const normalized = safeLower(value);
+
+  return (
+    normalized === "1" ||
+    normalized === "true" ||
+    normalized === "yes" ||
+    normalized === "on"
+  );
+}
+
+function quoteToCurrency(quote: Quote): "EUR" | "USD" | "USDT" {
+  if (quote === "usd") return "USD";
+  if (quote === "usdt") return "USDT";
+  return "EUR";
+}
+
+/* =========================
+   5. SUMMARY HELPERS
+========================= */
+
+function emptyBuckets(): SummaryBucket {
+  return {
+    total: 0,
+    stable: 0,
+    transition: 0,
+    volatile: 0,
+    allow: 0,
+    watch: 0,
+    block: 0,
+  };
+}
+
+function mapTopAsset(asset: ScanAsset): SummaryTopAsset {
+  return {
+    rank: asset.rank ?? null,
+    symbol: asset.symbol,
+    name: asset.name,
+    price: asset.price ?? null,
+    chg_24h_pct: asset.chg_24h_pct ?? null,
+    chg_7d_pct: asset.chg_7d_pct ?? null,
+    stability_score: asset.stability_score ?? null,
+    opportunity_score: asset.opportunity_score ?? null,
+    regime: asset.regime ?? null,
+    decision: asset.decision ?? null,
+  };
+}
+
+function sortByStability(data: ScanAsset[]): ScanAsset[] {
+  return [...data].sort((a, b) => {
+    const aStability = a.stability_score ?? -1;
+    const bStability = b.stability_score ?? -1;
+
+    if (aStability !== bStability) {
+      return bStability - aStability;
+    }
+
+    const aOpportunity = a.opportunity_score ?? -1;
+    const bOpportunity = b.opportunity_score ?? -1;
+
+    if (aOpportunity !== bOpportunity) {
+      return bOpportunity - aOpportunity;
+    }
+
+    const aRank = a.rank ?? Number.POSITIVE_INFINITY;
+    const bRank = b.rank ?? Number.POSITIVE_INFINITY;
+
+    if (aRank !== bRank) {
+      return aRank - bRank;
+    }
+
+    return a.symbol.localeCompare(b.symbol);
+  });
+}
+
+function sortByOpportunity(data: ScanAsset[]): ScanAsset[] {
+  return [...data].sort((a, b) => {
+    const aOpportunity = a.opportunity_score ?? -1;
+    const bOpportunity = b.opportunity_score ?? -1;
+
+    if (aOpportunity !== bOpportunity) {
+      return bOpportunity - aOpportunity;
+    }
+
+    const aStability = a.stability_score ?? -1;
+    const bStability = b.stability_score ?? -1;
+
+    if (aStability !== bStability) {
+      return bStability - aStability;
+    }
+
+    const aRank = a.rank ?? Number.POSITIVE_INFINITY;
+    const bRank = b.rank ?? Number.POSITIVE_INFINITY;
+
+    if (aRank !== bRank) {
+      return aRank - bRank;
+    }
+
+    return a.symbol.localeCompare(b.symbol);
+  });
+}
+
+function dominantRegimeFromBuckets(buckets: SummaryBucket): Regime {
+  const maxValue = Math.max(
+    buckets.stable,
+    buckets.transition,
+    buckets.volatile,
+  );
+
+  if (maxValue === buckets.stable) return "STABLE";
+  if (maxValue === buckets.volatile) return "VOLATILE";
+  return "TRANSITION";
+}
+
+function dominantDecisionFromBuckets(
+  buckets: SummaryBucket,
+): Decision | null {
+  const maxValue = Math.max(buckets.allow, buckets.watch, buckets.block);
+
+  if (maxValue <= 0) {
+    return null;
+  }
+
+  if (maxValue === buckets.allow) return "ALLOW";
+  if (maxValue === buckets.block) return "BLOCK";
+  return "WATCH";
+}
+
+function buildSummary(data: ScanAsset[]) {
+  const buckets = emptyBuckets();
+  const stabilityValues: number[] = [];
+  const opportunityValues: number[] = [];
+
+  for (const asset of data) {
+    buckets.total += 1;
+
+    if (asset.regime === "STABLE") {
+      buckets.stable += 1;
+    } else if (asset.regime === "VOLATILE") {
+      buckets.volatile += 1;
+    } else {
+      buckets.transition += 1;
+    }
+
+    if (asset.decision === "ALLOW") {
+      buckets.allow += 1;
+    } else if (asset.decision === "BLOCK") {
+      buckets.block += 1;
+    } else if (asset.decision === "WATCH") {
+      buckets.watch += 1;
+    }
+
+    const stability = safeFiniteNumberOrNull(asset.stability_score);
+    const opportunity = safeFiniteNumberOrNull(asset.opportunity_score);
+
+    if (stability !== null) {
+      stabilityValues.push(stability);
+    }
+
+    if (opportunity !== null) {
+      opportunityValues.push(opportunity);
+    }
+  }
+
+  return {
+    avg_stability_score: mean(stabilityValues),
+    avg_opportunity_score: mean(opportunityValues),
+    dominant_regime: dominantRegimeFromBuckets(buckets),
+    dominant_decision: dominantDecisionFromBuckets(buckets),
+    buckets,
+    top_stability_assets: sortByStability(data).slice(0, 5).map(mapTopAsset),
+    top_opportunity_assets: sortByOpportunity(data).slice(0, 5).map(mapTopAsset),
+  };
+}
+
+/* =========================
+   6. ROUTE HANDLER
+========================= */
+
+export async function GET(req: NextRequest) {
+  const searchParams = req.nextUrl.searchParams;
+
+  const quote = normalizeQuote(searchParams.get("quote"));
+  const q = normalizeSearch(searchParams.get("q"));
+  const limit = normalizeLimit(searchParams.get("limit"));
+  const noStore = parseBool(searchParams.get("noStore"));
+
+  try {
+    const service = await getScan({
+      quote,
+      q,
+      sort: "stability",
+      order: "desc",
+      limit,
+      noStore,
+    });
+
+    const payload: SummaryResponse = {
+      ok: service.ok,
+      ts: nowIso(),
+      version: XYVALA_SNAPSHOT_VERSION,
+      market: "crypto",
+      quote,
+      source: service.source,
+      count: service.data.length,
+      summary: buildSummary(service.data),
+      meta: {
+        region: "EU",
+        currency: quoteToCurrency(quote),
+        q,
+        limit,
+        warnings: service.warnings,
+      },
+      error: service.error,
+    };
+
+    return NextResponse.json(payload, {
+      status: service.ok ? 200 : 503,
+      headers: {
+        "cache-control": "no-store",
+        "x-xyvala-version": XYVALA_SNAPSHOT_VERSION,
+        "x-xyvala-endpoint": "/api/summary",
+      },
+    });
+  } catch (error) {
+    const payload: SummaryResponse = {
+      ok: false,
+      ts: nowIso(),
+      version: XYVALA_SNAPSHOT_VERSION,
+      market: "crypto",
+      quote: DEFAULT_QUOTE,
+      source: "fallback",
+      count: 0,
+      summary: {
+        avg_stability_score: null,
+        avg_opportunity_score: null,
+        dominant_regime: "TRANSITION",
+        dominant_decision: null,
+        buckets: emptyBuckets(),
+        top_stability_assets: [],
+        top_opportunity_assets: [],
+      },
+      meta: {
+        region: "EU",
+        currency: "EUR",
+        q: null,
+        limit: DEFAULT_LIMIT,
+        warnings: [],
+      },
+      error:
+        error instanceof Error && error.message
+          ? error.message
+          : "summary_route_unknown_error",
+    };
+
+    return NextResponse.json(payload, {
+      status: 500,
+      headers: {
+        "cache-control": "no-store",
+        "x-xyvala-version": XYVALA_SNAPSHOT_VERSION,
+        "x-xyvala-endpoint": "/api/summary",
+      },
+    });
+  }
+}

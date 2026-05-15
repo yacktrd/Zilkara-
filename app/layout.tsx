@@ -1,5 +1,9 @@
-// app/layout.tsx
-import "../ui.css";
+import "./globals.css";
+
+export const metadata = {
+  title: "Xyvala",
+  description: "Market Analyzer",
+};
 
 export default function RootLayout({
   children,
@@ -8,7 +12,7 @@ export default function RootLayout({
 }) {
   return (
     <html lang="fr">
-      <body className="z-root">{children}</body>
+      <body>{children}</body>
     </html>
   );
 }

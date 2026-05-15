@@ -1,0 +1,1002 @@
+/* ==========================================================================
+   XYVALA — GLOBALS.CSS
+   ----------------------------------------------------------------------------
+   ROLE
+   - define the global visual contract for Xyvala
+   - preserve deterministic rendering semantics across desktop and mobile
+   - reinforce Xyvala hierarchy through spacing, contrast and typography
+   - keep market context readable without overpowering structural variables
+   - support Top Ranked and Market Overview layouts consistently
+   -
+   PARENT FILES
+   - app/layout.tsx
+   - components/scan-table.tsx
+   -
+   DIRECTIVES
+   - FR / EU compatible product presentation
+   - blue resting background must remain the main visual base
+   - structure must remain readable before action
+   - chart 7D stays contextual only
+   - no decorative overload
+   - no retail-trading visual aggression
+   - same classes => same rendering contract
+   -
+   INPUTS
+   - semantic UI classes emitted by scan-table.tsx
+   -
+   OUTPUTS
+   - stable visual hierarchy
+   - stable responsive layout
+   - stable color and spacing system
+   -
+   INVARIANTS
+   - dark UI only
+   - stable tokens in :root
+   - desktop table remains dense and readable
+   - mobile cards remain semantically aligned with desktop
+   -
+   CRITICAL DEPENDENCIES
+   - class names emitted by components/scan-table.tsx
+   -
+   SENSITIVE ZONES
+   - Top Ranked grid / card structure
+   - table density vs readability
+   - stability / regime / signal balance
+   - responsive switching desktopOnly / mobileOnly
+   ========================================================================== */
+
+/* ==========================================================================
+   1. ROOT TOKENS — CORE SYSTEM
+   ========================================================================== */
+
+:root {
+  color-scheme: dark;
+
+  /* BASE BACKGROUND — RESTING BLUE */
+  --bg-1: #08181d;
+  --bg-2: #0b1f24;
+  --bg-3: #102933;
+  --bg-4: #143240;
+
+  /* PANELS */
+  --panel-1: rgba(10, 24, 31, 0.94);
+  --panel-2: rgba(13, 30, 39, 0.96);
+  --panel-3: rgba(16, 37, 49, 0.98);
+  --panel-4: rgba(20, 45, 58, 0.98);
+
+  /* LINES */
+  --line: rgba(255, 255, 255, 0.08);
+  --line-soft: rgba(255, 255, 255, 0.05);
+  --line-strong: rgba(255, 255, 255, 0.14);
+
+  /* TEXT */
+  --text: #eef5fa;
+  --text-strong: #ffffff;
+  --muted: #9db0bd;
+  --muted-2: #7d94a4;
+
+  /* MARKET COLORS */
+  --green: #3cbf8c;
+  --red: #d65a5a;
+  --yellow: #d4a94a;
+  --blue: #7fb8e6;
+
+  /* STATUS BACKGROUNDS */
+  --green-bg: rgba(60, 191, 140, 0.12);
+  --red-bg: rgba(214, 90, 90, 0.12);
+  --yellow-bg: rgba(212, 169, 74, 0.13);
+  --blue-bg: rgba(127, 184, 230, 0.1);
+
+  /* SHADOWS */
+  --shadow: 0 18px 46px rgba(0, 0, 0, 0.32);
+  --shadow-soft: 0 10px 24px rgba(0, 0, 0, 0.22);
+
+  /* RADIUS */
+  --radius-xl: 22px;
+  --radius-lg: 18px;
+  --radius-md: 14px;
+  --radius-sm: 10px;
+
+  /* TYPO */
+  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Display", Inter, system-ui, sans-serif;
+
+  /* LAYOUT */
+  --section-max: 1360px;
+  --pad-page: clamp(14px, 2vw, 24px);
+
+  /* UI */
+  --toolbar-h: 46px;
+  --cta-h: 36px;
+
+  /* SPARK */
+  --spark-w: 130px;
+  --spark-h: 40px;
+
+  /* TABLE */
+  --table-min-width: 1180px;
+}
+
+/* ==========================================================================
+   2. RESET — CLEAN BASE
+   ========================================================================== */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  min-height: 100%;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-ui);
+  color: var(--text);
+  background:
+    radial-gradient(circle at 18% 8%, rgba(127, 184, 230, 0.14), transparent 28%),
+    radial-gradient(circle at 82% 0%, rgba(127, 184, 230, 0.09), transparent 32%),
+    linear-gradient(180deg, var(--bg-4) 0%, var(--bg-2) 32%, var(--bg-1) 100%);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+img {
+  max-width: 100%;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+/* ==========================================================================
+   3. SEMANTIC STATES — CORE SIGNALS
+   ========================================================================== */
+
+.pos {
+  color: var(--green);
+}
+
+.neg {
+  color: var(--red);
+}
+
+.neutral {
+  color: var(--muted);
+}
+
+.allow {
+  color: var(--green);
+  font-weight: 700;
+}
+
+.watch {
+  color: var(--yellow);
+  font-weight: 700;
+}
+
+.block {
+  color: var(--red);
+  font-weight: 700;
+}
+
+.regimeStable {
+  color: var(--green);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.regimeTransition {
+  color: var(--yellow);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.regimeVolatile {
+  color: var(--red);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+/* ==========================================================================
+   4. REUSABLE MODULES
+   ========================================================================== */
+
+.mono {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1, "lnum" 1;
+}
+
+.tradeBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 88px;
+  height: var(--cta-h);
+  padding: 0 14px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  transition: background 0.15s ease, transform 0.15s ease, border-color 0.15s ease;
+}
+
+.tradeBtn:hover {
+  background: rgba(255, 255, 255, 0.11);
+  border-color: var(--line-strong);
+  transform: translateY(-1px);
+}
+
+.tradeDisabled {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 88px;
+  height: var(--cta-h);
+  padding: 0 14px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* ==========================================================================
+   5. STRUCTURE
+   ========================================================================== */
+
+.section {
+  max-width: var(--section-max);
+  margin: 0 auto;
+  padding: 24px var(--pad-page);
+}
+
+.productTitle {
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+}
+
+/* ==========================================================================
+   6. HEADER / BRAND
+   ========================================================================== */
+
+.tableHeader {
+  margin-bottom: 14px;
+}
+
+.brandLink {
+  display: block;
+}
+
+.titleBlock {
+  display: flex;
+  align-items: center;
+  min-height: 54px;
+  padding: 0 18px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.06),
+    rgba(255, 255, 255, 0.03)
+  );
+  box-shadow: var(--shadow-soft);
+  color: var(--text-strong);
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+}
+
+/* ==========================================================================
+   7. TOOLBAR
+   ========================================================================== */
+
+.toolbar {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  margin-bottom: 18px;
+}
+
+.toolbarSearch {
+  min-width: min(420px, 100%);
+  flex: 1 1 320px;
+}
+
+.toolbarSearch input {
+  width: 100%;
+  height: var(--toolbar-h);
+  padding: 0 16px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text);
+  outline: none;
+  font-size: 15px;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.toolbarSearch input::placeholder {
+  color: var(--muted);
+}
+
+.toolbarSearch input:focus {
+  border-color: rgba(127, 184, 230, 0.42);
+  background: rgba(255, 255, 255, 0.07);
+}
+
+/* ==========================================================================
+   8. TOP RANKED — CONTAINER
+   ========================================================================== */
+
+.topOpportunitiesCompact {
+  padding: 18px;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  box-shadow: var(--shadow-soft);
+  margin-bottom: 18px;
+}
+
+.topOpportunitiesCompactHeader {
+  margin-bottom: 14px;
+}
+
+.topOpportunitiesCompactHeader h2 {
+  margin: 0 0 6px;
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--text-strong);
+}
+
+.topOpportunitiesCompactHeader p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* ==========================================================================
+   9. TOP RANKED — DESKTOP
+   ========================================================================== */
+
+.topRankedGrid {
+  display: grid;
+  gap: 12px;
+}
+
+.topRankedCard {
+  display: grid;
+  grid-template-columns: 
+    minmax(240px, 1.2fr) 
+    minmax(170px, 0.9fr) 
+    minmax(220px, 0.8fr);
+  gap: 18px;
+  align-items: center;
+
+  padding: 14px 16px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--line-soft);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.topRankedLeft {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+}
+
+.topRankedRank {
+  width: 36px;
+  min-width: 36px;
+  text-align: center;
+  font-size: 18px;
+  line-height: 1;
+}
+
+.topRankedAsset {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.topRankedAssetMeta {
+  min-width: 0;
+}
+
+.topRankedSymbol {
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1.1;
+  color: var(--text-strong);
+}
+
+.topRankedName {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.15;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.topRankedMarket {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+  min-width: 0;
+}
+
+.topRankedPrice {
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--text-strong);
+}
+
+.topRankedChanges {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 13px;
+}
+
+.topRankedStructure {
+  display: grid;
+  grid-template-columns: minmax(136px, 1fr) auto auto;
+  gap: 12px;
+  align-items: center;
+  justify-content: end;
+}
+
+.topRankedStability {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.topRankedBadge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 34px;
+  padding: 0 12px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+
+/* ==========================================================================
+   10. MARKET SECTION
+   ========================================================================== */
+
+.marketSection {
+  margin-top: 18px;
+}
+
+.marketSectionHeader {
+  margin-bottom: 12px;
+}
+
+.marketSectionHeader h2 {
+  margin: 0 0 6px;
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--text-strong);
+}
+
+.marketSectionHeader p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* ==========================================================================
+   11. TABLE WRAP
+   ========================================================================== */
+
+.tableWrap {
+  overflow-x: auto;
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-soft);
+}
+
+.zTable {
+  width: 100%;
+  min-width: var(--table-min-width);
+  border-collapse: separate;
+  border-spacing: 0;
+  background: var(--panel-1);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+.zTable th {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--muted);
+  text-align: left;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.02);
+  white-space: nowrap;
+}
+
+.zTable td {
+  padding: 14px;
+  border-bottom: 1px solid var(--line-soft);
+  vertical-align: middle;
+}
+
+.zTable tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.zTable tr:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.tableRow td:nth-child(3),
+.tableRow td:nth-child(4),
+.tableRow td:nth-child(5),
+.tableRow td:nth-child(8),
+.tableRow td:nth-child(9),
+.tableRow td:nth-child(10),
+.tableRow td:nth-child(11) {
+  white-space: nowrap;
+}
+
+/* ==========================================================================
+   12. ASSET CELLS
+   ========================================================================== */
+
+.assetCell {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.assetMeta {
+  min-width: 0;
+}
+
+.assetSymbol {
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.1;
+  color: var(--text-strong);
+}
+
+.assetName {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.15;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 180px;
+}
+
+.assetLogo {
+  width: 32px;
+  height: 32px;
+  min-width: 32px;
+}
+
+.assetLogoImg,
+.assetLogoFallback {
+  width: 32px;
+  height: 32px;
+  border-radius: 999px;
+}
+
+.assetLogoImg {
+  display: block;
+  object-fit: cover;
+  border: 1px solid var(--line-soft);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.assetLogoFallback {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+/* ==========================================================================
+   13. STABILITY / SCORE / TRADE
+   ========================================================================== */
+
+.stabilityCell {
+  min-width: 132px;
+}
+
+.stabilityBar {
+  position: relative;
+  width: 92px;
+  height: 8px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.stabilityFill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(
+    90deg,
+    var(--red) 0%,
+    var(--yellow) 55%,
+    var(--green) 100%
+  );
+}
+
+.stabilityLabel {
+  display: inline-block;
+  margin-left: 10px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text);
+  vertical-align: middle;
+}
+
+.opportunityCell {
+  text-align: center;
+}
+
+.opportunityBadge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 42px;
+  min-height: 32px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--blue-bg);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.tradeCell {
+  text-align: center;
+}
+
+/* ==========================================================================
+   14. SPARKLINES
+   ========================================================================== */
+
+.sparkCell {
+  display: inline-flex;
+  align-items: center;
+}
+
+.sparkSvg {
+  display: block;
+  width: var(--spark-w);
+  height: var(--spark-h);
+}
+
+.sparkPath {
+  fill: none;
+  stroke-width: 2.25;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.sparkUp .sparkPath {
+  stroke: var(--green);
+}
+
+.sparkDown .sparkPath {
+  stroke: var(--red);
+}
+
+.sparkFlat .sparkPath {
+  stroke: var(--muted);
+}
+
+.sparkFallback {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* ==========================================================================
+   15. MOBILE
+   ========================================================================== */
+
+.mobileList {
+  display: grid;
+  gap: 12px;
+}
+
+.mobileCard {
+  padding: 14px;
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  box-shadow: var(--shadow-soft);
+}
+
+.topRankedMobileCard {
+  border-color: var(--line-strong);
+}
+
+.mobileCardHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.mobileCardRank {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.mobileDecisionBadge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 30px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.mobileCardBody {
+  display: grid;
+  gap: 12px;
+}
+
+.mobileAssetBlock {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.mobileCardAsset {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.mobileCardAssetMeta {
+  min-width: 0;
+}
+
+.mobileCardSymbol {
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1.1;
+  color: var(--text-strong);
+}
+
+.mobileCardName {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.15;
+}
+
+.mobilePriceBlock {
+  text-align: right;
+}
+
+.mobilePriceValue {
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--text-strong);
+}
+
+.mobileAssetChanges {
+  display: grid;
+  gap: 8px;
+}
+
+.mobileMetricRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.mobileMetricLabel {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.mobileMetricValue {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.mobileChartBlock {
+  border-radius: var(--radius-md);
+  border: 1px solid var(--line-soft);
+  background: rgba(255, 255, 255, 0.03);
+  padding: 12px;
+}
+
+.mobileChartShell {
+  display: grid;
+  gap: 8px;
+}
+
+.mobileChartLabel {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.mobileStructureBlock {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 12px;
+  align-items: start;
+}
+
+.mobileStructureMetrics {
+  display: grid;
+  gap: 8px;
+}
+
+.mobileOpportunityBlock {
+  display: grid;
+  gap: 6px;
+  justify-items: end;
+}
+
+.mobileOpportunityLabel {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.mobileOpportunityValue {
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.mobileCardFoot {
+  margin-top: 12px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* ==========================================================================
+   16. EMPTY STATES
+   ========================================================================== */
+
+.emptyState {
+  padding: 18px;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  box-shadow: var(--shadow-soft);
+}
+
+.emptyState strong {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 15px;
+}
+
+.emptyState div {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* ==========================================================================
+   17. LEGACY / COMPAT
+   ========================================================================== */
+
+.topOpportunityRow {
+  display: flex;
+  justify-content: space-between;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+/* ==========================================================================
+   18. RESPONSIVE
+   ========================================================================== */
+
+.desktopOnly {
+  display: block;
+}
+
+.mobileOnly {
+  display: none;
+}
+
+@media (max-width: 1100px) {
+  .topRankedCard {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .topRankedMarket,
+  .topRankedStructure {
+    justify-content: start;
+  }
+
+  .topRankedStructure {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 900px) {
+  .section {
+    padding: 18px var(--pad-page);
+  }
+
+  .desktopOnly {
+    display: none;
+  }
+
+  .mobileOnly {
+    display: block;
+  }
+
+  .titleBlock {
+    min-height: 48px;
+    font-size: 24px;
+  }
+
+  .toolbar {
+    justify-content: stretch;
+  }
+
+  .toolbarSearch {
+    min-width: 100%;
+    flex-basis: 100%;
+  }
+}

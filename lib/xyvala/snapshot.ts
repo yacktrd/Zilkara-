@@ -1,356 +1,227 @@
-// lib/xyvala/snapshot.ts
-/* XYVALA — Snapshot Cache (V3 stabilisé)
-   Rôle :
-   - source centrale de vérité cache pour scan / zones / decision
-   - shape stable, réutilisable et vérifiable
-   - in-memory best-effort borné
-   - rétrocompatibilité douce avec anciens appels setToCache(..., ttlMs)
-   - prêt pour migration vers Redis / KV sans casser l’API
-*/
+/* ============================================================================
+ * FILE: lib/xyvala/snapshot.ts
+ * ----------------------------------------------------------------------------
+ * TITLE
+ * - Xyvala passive scan snapshot contract
+ *
+ * ROLE
+ * - expose snapshot contract types
+ * - expose runtime constants used by scan services and API routes
+ * - validate passive scan snapshots without transforming market data
+ *
+ * DIRECTIVES
+ * - contract and guard layer only
+ * - no RFS recomputation
+ * - no MCI recomputation
+ * - no calibration logic
+ * - no API logic
+ * - no UI logic
+ * - no deep asset normalization
+ * - no market reconstruction
+ * - snapshot is passive contract truth
+ * - scan-transformer.ts / upstream services own data normalization
+ * - undefined must never be exposed
+ * - null is accepted only when the ScanAsset contract allows it
+ * ========================================================================== */
 
-export type Market = "crypto" | string;
-export type Quote = "usd" | "usdt" | "eur" | string;
+import type { ScanAsset } from "@/lib/xyvala/contracts/scan-contract";
 
-export type Regime = "STABLE" | "TRANSITION" | "VOLATILE" | string;
-export type ScoreTrend = "up" | "down" | null;
+/* ============================================================================
+ * 1. RUNTIME CONSTANTS
+ * ========================================================================== */
 
-export type ScanAsset = {
-  id: string;
-  symbol: string;
-  name: string;
+export const XYVALA_SNAPSHOT_VERSION = "v1" as const;
 
-  price: number | null;
-  chg_24h_pct: number | null;
+export const XYVALA_MARKETS = ["crypto"] as const;
+export const XYVALA_QUOTES = ["eur", "usd", "usdt"] as const;
+export const XYVALA_SNAPSHOT_SOURCES = ["scan", "fallback", "cache"] as const;
 
-  confidence_score: number | null;
-  regime: Regime | null;
+export const XYVALA_SORT_KEYS = [
+  "rank",
+  "price",
+  "market_cap",
+  "volume_24h",
+  "change_24h",
+  "change_7d",
+] as const;
 
-  binance_url: string;
-  affiliate_url: string;
+export const XYVALA_SORT_ORDERS = ["asc", "desc"] as const;
 
-  market_cap: number | null;
-  volume_24h: number | null;
+/* ============================================================================
+ * 2. CONTRACT TYPES
+ * ========================================================================== */
 
-  score_delta: number | null;
-  score_trend: ScoreTrend;
-};
+export type SnapshotVersion = typeof XYVALA_SNAPSHOT_VERSION;
+export type Market = (typeof XYVALA_MARKETS)[number];
+export type Quote = (typeof XYVALA_QUOTES)[number];
+export type SnapshotSource = (typeof XYVALA_SNAPSHOT_SOURCES)[number];
+export type SnapshotSortKey = (typeof XYVALA_SORT_KEYS)[number];
+export type SnapshotSortOrder = (typeof XYVALA_SORT_ORDERS)[number];
 
-export type ScanContext = {
-  market_regime: Regime | null;
-  stable_ratio: number | null;
-  transition_ratio: number | null;
-  volatile_ratio: number | null;
+export type ScanSnapshotMeta = {
+  limit: number;
+  sort: SnapshotSortKey;
+  order: SnapshotSortOrder;
+  q: string | null;
+  warnings: string[];
 };
 
 export type ScanSnapshot = {
-  ok: true;
+  ok: boolean;
   ts: string;
-  version: string;
-  source: "scan" | "fallback" | "cache";
-
+  version: SnapshotVersion;
+  source: SnapshotSource;
   market: Market;
   quote: Quote;
-
   count: number;
   data: ScanAsset[];
-
-  context: ScanContext;
-
-  meta: {
-    limit: number;
-    sort: "score" | "price";
-    order: "asc" | "desc";
-    q: string | null;
-    warnings: string[];
-  };
+  meta: ScanSnapshotMeta;
+  error?: string | null;
 };
 
-type Entry<T> = {
-  ts: number;
-  value: T;
-  expiresAt: number | null;
-};
+/* ============================================================================
+ * 3. SAFE GUARD HELPERS
+ * ========================================================================== */
 
-const MAX_CACHE_ENTRIES = 500;
-
-const mem = new Map<string, Entry<unknown>>();
-
-function safeStr(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "";
-}
-
-function safeFiniteNumberOrNull(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function normalizeKeyPart(value: string | number | null | undefined): string {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return String(value);
-  }
-
-  if (typeof value === "string") {
-    return value.trim();
-  }
-
-  return "";
-}
-
-function normalizeTtlMs(value: unknown): number | null {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    return null;
-  }
-
-  const ttl = Math.max(0, Math.trunc(value));
-  return ttl > 0 ? ttl : null;
-}
-
-function pruneCacheIfNeeded(): void {
-  if (mem.size < MAX_CACHE_ENTRIES) return;
-
-  const firstKey = mem.keys().next().value;
-  if (typeof firstKey === "string") {
-    mem.delete(firstKey);
-  }
-}
-
-function buildKey(
-  ns: string,
-  parts: Record<string, string | number | null | undefined>
-): string {
-  const flat = Object.entries(parts)
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([k, v]) => `${k}=${normalizeKeyPart(v)}`)
-    .join("&");
-
-  return `xyvala:${ns}:${flat}`;
-}
-
-function isExpired(entry: Entry<unknown>, ttlMs: number): boolean {
-  const now = Date.now();
-
-  if (entry.expiresAt !== null && now >= entry.expiresAt) {
-    return true;
-  }
-
-  if (ttlMs <= 0) {
-    return true;
-  }
-
-  return now - entry.ts > ttlMs;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
+function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isScanAsset(value: unknown): value is ScanAsset {
-  if (!isRecord(value)) return false;
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
 
-  if (!safeStr(value.id)) return false;
-  if (!safeStr(value.symbol)) return false;
-  if (!safeStr(value.name)) return false;
-  if (!safeStr(value.binance_url)) return false;
-  if (!safeStr(value.affiliate_url)) return false;
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
 
-  const scoreTrend = value.score_trend;
-  if (scoreTrend !== "up" && scoreTrend !== "down" && scoreTrend !== null) {
-    return false;
-  }
+function isNullableFiniteNumber(value: unknown): value is number | null {
+  return value === null || isFiniteNumber(value);
+}
 
-  if (safeFiniteNumberOrNull(value.price) === null && value.price !== null) {
-    return false;
-  }
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
+}
 
-  if (safeFiniteNumberOrNull(value.chg_24h_pct) === null && value.chg_24h_pct !== null) {
-    return false;
-  }
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
 
-  if (
-    safeFiniteNumberOrNull(value.confidence_score) === null &&
-    value.confidence_score !== null
-  ) {
-    return false;
-  }
+function isNullableNumberArray(value: unknown): value is number[] | null {
+  return (
+    value === null ||
+    (Array.isArray(value) &&
+      value.every((item) => typeof item === "number" && Number.isFinite(item)))
+  );
+}
 
-  if (safeFiniteNumberOrNull(value.market_cap) === null && value.market_cap !== null) {
-    return false;
-  }
+function isMarket(value: unknown): value is Market {
+  return XYVALA_MARKETS.includes(value as Market);
+}
 
-  if (safeFiniteNumberOrNull(value.volume_24h) === null && value.volume_24h !== null) {
-    return false;
-  }
+function isQuote(value: unknown): value is Quote {
+  return XYVALA_QUOTES.includes(value as Quote);
+}
 
-  if (safeFiniteNumberOrNull(value.score_delta) === null && value.score_delta !== null) {
-    return false;
-  }
+function isSnapshotSource(value: unknown): value is SnapshotSource {
+  return XYVALA_SNAPSHOT_SOURCES.includes(value as SnapshotSource);
+}
+
+function isSnapshotSortKey(value: unknown): value is SnapshotSortKey {
+  return XYVALA_SORT_KEYS.includes(value as SnapshotSortKey);
+}
+
+function isSnapshotSortOrder(value: unknown): value is SnapshotSortOrder {
+  return XYVALA_SORT_ORDERS.includes(value as SnapshotSortOrder);
+}
+
+/* ============================================================================
+ * 4. ASSET GUARD
+ * ========================================================================== */
+
+function isScoreStatus(value: unknown): value is "computed" {
+  return value === "computed";
+}
+
+export function isScanAsset(value: unknown): value is ScanAsset {
+  if (!isPlainObject(value)) return false;
+
+  /* --------------------------------------------------------------------------
+   * Identity
+   * ------------------------------------------------------------------------ */
+
+  if (!isNonEmptyString(value.id)) return false;
+  if (!isNonEmptyString(value.symbol)) return false;
+  if (!isNonEmptyString(value.name)) return false;
+
+  /* --------------------------------------------------------------------------
+   * Market data
+   * ------------------------------------------------------------------------ */
+
+  if (!isNullableFiniteNumber(value.price)) return false;
+  if (!isNullableFiniteNumber(value.chg_24h_pct)) return false;
+  if (!isNullableFiniteNumber(value.chg_7d_pct)) return false;
+
+  if (!isNullableFiniteNumber(value.market_cap)) return false;
+  if (!isNullableFiniteNumber(value.volume_24h)) return false;
+
+  /* --------------------------------------------------------------------------
+   * Public structural reading
+   * ------------------------------------------------------------------------ */
+
+  if (!isNullableFiniteNumber(value.stability_score)) return false;
+  if (!isScoreStatus(value.stability_status)) return false;
+
+  /* --------------------------------------------------------------------------
+   * Visual support
+   * ------------------------------------------------------------------------ */
+
+  if (!isNullableNumberArray(value.sparkline_7d)) return false;
+
+  /* --------------------------------------------------------------------------
+   * Metadata
+   * ------------------------------------------------------------------------ */
+
+  if (!isNullableFiniteNumber(value.rank)) return false;
+  if (!isNullableString(value.logo_url)) return false;
 
   return true;
 }
 
-export function getFromCache<T>(k: string, ttlMs: number): T | null {
-  const entry = mem.get(k);
-  if (!entry) return null;
+/* ============================================================================
+ * 5. SNAPSHOT GUARD
+ * ========================================================================== */
 
-  const effectiveTtl = Number.isFinite(ttlMs) ? Math.max(0, Math.trunc(ttlMs)) : 0;
-
-  if (isExpired(entry, effectiveTtl)) {
-    mem.delete(k);
-    return null;
-  }
-
-  return entry.value as T;
-}
-
-export function setToCache<T>(k: string, value: T, ttlMs?: number): void {
-  pruneCacheIfNeeded();
-
-  const normalizedTtl = normalizeTtlMs(ttlMs);
-
-  mem.set(k, {
-    ts: Date.now(),
-    value,
-    expiresAt: normalizedTtl !== null ? Date.now() + normalizedTtl : null,
-  });
-}
-
-export function clearSnapshotCache(): void {
-  mem.clear();
-}
-
-export function getSnapshotCacheSize(): number {
-  return mem.size;
-}
-
-export function scanKey(opts: {
-  version: string;
-  market: string;
-  quote: string;
-  sort: "score" | "price";
-  order: "asc" | "desc";
-  limit: number;
-  q: string | null;
-}): string {
-  return buildKey("scan", {
-    v: opts.version,
-    market: opts.market,
-    quote: opts.quote,
-    sort: opts.sort,
-    order: opts.order,
-    limit: opts.limit,
-    q: opts.q ?? "",
-  });
-}
-
-export function zonesKey(opts: {
-  version: string;
-  scan_cache_key: string;
-  symbol: string;
-  tf: string;
-}): string {
-  return buildKey("zones", {
-    v: opts.version,
-    scan: opts.scan_cache_key,
-    symbol: opts.symbol,
-    tf: opts.tf,
-  });
-}
-
-export function decisionKey(opts: {
-  version: string;
-  zones_cache_key: string;
-  symbol: string;
-  tf: string;
-}): string {
-  return buildKey("decision", {
-    v: opts.version,
-    zones: opts.zones_cache_key,
-    symbol: opts.symbol,
-    tf: opts.tf,
-  });
-}
-
-/**
- * Validation minimale pour sécuriser les routes qui réutilisent le snapshot.
- * Objectif :
- * - bloquer les formes cassées les plus probables
- * - rester légère
- */
 export function isScanSnapshot(value: unknown): value is ScanSnapshot {
-  if (!isRecord(value)) {
+  if (!isPlainObject(value)) return false;
+
+  if (typeof value.ok !== "boolean") return false;
+  if (!isNonEmptyString(value.ts)) return false;
+  if (value.version !== XYVALA_SNAPSHOT_VERSION) return false;
+
+  if (!isSnapshotSource(value.source)) return false;
+  if (!isMarket(value.market)) return false;
+  if (!isQuote(value.quote)) return false;
+
+  if (!isFiniteNumber(value.count)) return false;
+  if (!Array.isArray(value.data)) return false;
+  if (!value.data.every(isScanAsset)) return false;
+
+  if (value.count !== value.data.length) return false;
+
+  if (value.error !== undefined && value.error !== null && typeof value.error !== "string") {
     return false;
   }
 
-  const snapshot = value as Partial<ScanSnapshot>;
+  if (!isPlainObject(value.meta)) return false;
 
-  if (snapshot.ok !== true) return false;
-  if (!safeStr(snapshot.ts)) return false;
-  if (!safeStr(snapshot.version)) return false;
+  const meta = value.meta;
 
-  if (
-    snapshot.source !== "scan" &&
-    snapshot.source !== "fallback" &&
-    snapshot.source !== "cache"
-  ) {
-    return false;
-  }
-
-  if (!Array.isArray(snapshot.data)) return false;
-  if (!snapshot.data.every(isScanAsset)) return false;
-
-  if (!isRecord(snapshot.meta)) return false;
-  if (!isRecord(snapshot.context)) return false;
-
-  const meta = snapshot.meta;
-  const context = snapshot.context;
-
-  if (meta.sort !== "score" && meta.sort !== "price") {
-    return false;
-  }
-
-  if (meta.order !== "asc" && meta.order !== "desc") {
-    return false;
-  }
-
-  if (
-    safeFiniteNumberOrNull(snapshot.count) === null ||
-    safeFiniteNumberOrNull(meta.limit) === null
-  ) {
-    return false;
-  }
-
-  if (!Array.isArray(meta.warnings) || meta.warnings.some((item) => typeof item !== "string")) {
-    return false;
-  }
-
-  if (
-    safeFiniteNumberOrNull(context.stable_ratio) === null &&
-    context.stable_ratio !== null
-  ) {
-    return false;
-  }
-
-  if (
-    safeFiniteNumberOrNull(context.transition_ratio) === null &&
-    context.transition_ratio !== null
-  ) {
-    return false;
-  }
-
-  if (
-    safeFiniteNumberOrNull(context.volatile_ratio) === null &&
-    context.volatile_ratio !== null
-  ) {
-    return false;
-  }
-
-  const marketRegime = context.market_regime;
-  if (
-    typeof marketRegime !== "string" &&
-    marketRegime !== null &&
-    marketRegime !== undefined
-  ) {
-    return false;
-  }
+  if (!isFiniteNumber(meta.limit)) return false;
+  if (!isSnapshotSortKey(meta.sort)) return false;
+  if (!isSnapshotSortOrder(meta.order)) return false;
+  if (meta.q !== null && typeof meta.q !== "string") return false;
+  if (!isStringArray(meta.warnings)) return false;
 
   return true;
 }

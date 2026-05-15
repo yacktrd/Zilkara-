@@ -1,24 +1,100 @@
-// components/scan-table.tsx
-
 "use client";
 
-import React, { useMemo, useState } from "react";
-import type { ScanAsset, Regime } from "@/lib/xyvala/scan";
+/* ============================================================================
+ * FILE: components/scan-table.tsx
+ * ----------------------------------------------------------------------------
+ * TITLE
+ * - Xyvala public structural market interface
+ *
+ * ROLE
+ * - render public ScanAsset data
+ * - display public structural labels produced by the public structure layer
+ * - keep UI passive and deterministic
+ *
+ * PARENTS
+ * - app/scan/page.tsx
+ * - app/page.tsx when scan table is rendered on the public landing surface
+ *
+ * DIRECTIVES
+ * - public UI only
+ * - no private score usage
+ * - no local structural reconstruction
+ * - no RFS recomputation
+ * - no MCI recomputation
+ * - no calibration exposure
+ * - no investment advice
+ * - one public data source for desktop and mobile
+ * - desktop and mobile may diverge only by layout, density and visual hierarchy
+ *
+ * INVARIANTS
+ * - same input => same output
+ * - visibleData is the single public rendering source
+ * - mobile must not rebuild analytical states
+ * - UI must display public labels only
+ * ========================================================================== */
 
-type RegimeFilter = "ALL" | Regime;
-type SortDirection = "none" | "asc" | "desc";
-type SortPreset = "score_desc" | "score_asc" | "price_desc" | "price_asc";
+import React, { useDeferredValue, useMemo, useState } from "react";
+import { Sparkline } from "./sparkline";
 
-type ScanTableAsset = ScanAsset & {
-  affiliate_url?: string;
+import {
+  buildPublicMarketStructureSummary,
+  buildPublicStructure,
+  type PublicActivityLabel,
+  type PublicMarketClimate,
+  type PublicSparklineContext7D,
+  type PublicStructureTransition,
+} from "@/lib/xyvala/public/public-structure";
+
+/* ============================================================================
+ * 1. TYPES
+ * ========================================================================== */
+
+type Quote = "EUR" | "USD" | "USDT";
+
+type AssetInput = {
+  id?: unknown;
+  symbol?: unknown;
+  name?: unknown;
+  rank?: unknown;
+  price?: unknown;
+  chg_24h_pct?: unknown;
+  chg_7d_pct?: unknown;
+  market_cap?: unknown;
+  volume_24h?: unknown;
+  sparkline_7d?: unknown;
+};
+
+type Asset = {
+  key: string;
+  rank: number | null;
+  symbol: string;
+  name: string;
+  price: number | null;
+  pct24h: number | null;
+  pct7d: number | null;
+  marketCap: number | null;
+  volume24h: number | null;
+  sparkline: number[] | null;
+  activity: PublicActivityLabel;
+  sparklineContext7D: PublicSparklineContext7D;
+  transition: PublicStructureTransition;
 };
 
 type Props = {
-  assets: ScanTableAsset[];
-  quote: string;
-  sort?: string;
+  assets: unknown;
+  quote?: Quote | string;
   limit?: number;
 };
+
+type MarketSummaryInput = {
+  activity: PublicActivityLabel;
+  sparkline_context_7d: PublicSparklineContext7D;
+  structure_transition: PublicStructureTransition;
+};
+
+/* ============================================================================
+ * 2. SAFE HELPERS
+ * ========================================================================== */
 
 function safeString(value: unknown, fallback = ""): string {
   return typeof value === "string" && value.trim().length > 0
@@ -26,460 +102,446 @@ function safeString(value: unknown, fallback = ""): string {
     : fallback;
 }
 
-function safeNumber(value: unknown, fallback = 0): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+function safeNumberOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-function normalizeSortPreset(value: string | undefined): SortPreset {
-  const normalized = safeString(value, "score_desc").toLowerCase();
-
-  if (normalized === "score_asc") return "score_asc";
-  if (normalized === "price_desc") return "price_desc";
-  if (normalized === "price_asc") return "price_asc";
-
-  return "score_desc";
+function safeRank(value: unknown): number | null {
+  const parsed = safeNumberOrNull(value);
+  return parsed !== null && parsed > 0 ? Math.trunc(parsed) : null;
 }
 
-function normalizeLimit(value: number | undefined, fallback: number): number {
-  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
-  return Math.max(1, Math.floor(value));
-}
+function safeArrayNumbers(value: unknown): number[] | null {
+  if (!Array.isArray(value)) return null;
 
-function formatPrice(value: number, quote: string): string {
-  if (!Number.isFinite(value)) return "-";
-
-  const formatted =
-    value >= 1000
-      ? value.toLocaleString("fr-FR", { maximumFractionDigits: 2 })
-      : value >= 1
-        ? value.toLocaleString("fr-FR", { maximumFractionDigits: 4 })
-        : value.toLocaleString("fr-FR", { maximumFractionDigits: 8 });
-
-  return `${formatted} ${quote.toUpperCase()}`;
-}
-
-function formatPct(value: number): string {
-  if (!Number.isFinite(value)) return "-";
-  const sign = value > 0 ? "+" : "";
-  return `${sign}${value.toFixed(2)}%`;
-}
-
-function getPctClass(value: number): string {
-  if (!Number.isFinite(value)) return "z-muted";
-  if (value > 0) return "z-pos";
-  if (value < 0) return "z-neg";
-  return "z-muted";
-}
-
-function getRegimeLabel(regime: Regime): string {
-  if (regime === "STABLE") return "Stable";
-  if (regime === "TRANSITION") return "Transition";
-  return "Instable";
-}
-
-function getInitialSortState(sort: SortPreset): {
-  priceSort: SortDirection;
-  scoreSort: SortDirection;
-} {
-  if (sort === "price_asc") {
-    return { priceSort: "asc", scoreSort: "none" };
-  }
-
-  if (sort === "price_desc") {
-    return { priceSort: "desc", scoreSort: "none" };
-  }
-
-  if (sort === "score_asc") {
-    return { priceSort: "none", scoreSort: "asc" };
-  }
-
-  return { priceSort: "none", scoreSort: "desc" };
-}
-
-function resolveAssetHref(asset: ScanTableAsset): string {
-  return safeString(asset.affiliate_url) || safeString(asset.binance_url) || "#";
-}
-
-function resolveAssetKey(asset: ScanTableAsset): string {
-  const id = safeString(asset.id);
-  const symbol = safeString(asset.symbol, "UNKNOWN");
-  return id ? `${id}-${symbol}` : symbol;
-}
-
-function FilterButton({
-  active,
-  children,
-  onClick,
-}: {
-  active: boolean;
-  children: React.ReactNode;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`z-filterBtn${active ? " is-active" : ""}`}
-      aria-pressed={active}
-    >
-      {children}
-    </button>
+  const points = value.filter(
+    (item): item is number =>
+      typeof item === "number" && Number.isFinite(item),
   );
+
+  return points.length >= 2 ? points : null;
 }
 
-function FilterGroup({
-  title,
-  children,
+function normalizeQuote(value: Quote | string): Quote {
+  const quote = safeString(value).toUpperCase();
+
+  if (quote === "USD") return "USD";
+  if (quote === "USDT") return "USDT";
+
+  return "EUR";
+}
+
+function normalizeSourceAssets(value: unknown): unknown[] | null {
+  if (!value) return null;
+  if (Array.isArray(value)) return value;
+
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    if (Array.isArray(record.data)) return record.data;
+  }
+
+  return null;
+}
+
+/* ============================================================================
+ * 3. NORMALIZATION
+ * ========================================================================== */
+
+function normalizeAsset(input: AssetInput): Asset {
+  const symbol = safeString(input.symbol, "UNKNOWN").toUpperCase();
+  const name = safeString(input.name, symbol);
+
+  const pct24h = safeNumberOrNull(input.chg_24h_pct);
+  const pct7d = safeNumberOrNull(input.chg_7d_pct);
+  const marketCap = safeNumberOrNull(input.market_cap);
+  const volume24h = safeNumberOrNull(input.volume_24h);
+  const sparkline = safeArrayNumbers(input.sparkline_7d);
+
+  const publicStructure = buildPublicStructure({
+    pct_24h: pct24h,
+    pct_7d: pct7d,
+    volume_24h: volume24h,
+    market_cap: marketCap,
+    sparkline_7d: sparkline,
+  });
+
+  return {
+    key: safeString(input.id, symbol),
+    rank: safeRank(input.rank),
+    symbol,
+    name,
+    price: safeNumberOrNull(input.price),
+    pct24h,
+    pct7d,
+    marketCap,
+    volume24h,
+    sparkline,
+    activity: publicStructure.activity,
+    sparklineContext7D: publicStructure.sparkline_context_7d,
+    transition: publicStructure.structure_transition,
+  };
+}
+
+/* ============================================================================
+ * 4. SORTING
+ * ========================================================================== */
+
+function getTransitionPriority(transition: PublicStructureTransition): number {
+  if (transition === "Fragmentation Detected") return 6;
+  if (transition === "Active Expansion") return 5;
+  if (transition === "Expansion Phase") return 4;
+  if (transition === "Recovery Structure") return 3;
+  if (transition === "Neutral Structure") return 2;
+  if (transition === "Stable Structure") return 1;
+
+  return 0;
+}
+
+function pickTransitionHighlights(data: Asset[]): Asset[] {
+  return [...data]
+    .sort((left, right) => {
+      const transitionDelta =
+        getTransitionPriority(right.transition) -
+        getTransitionPriority(left.transition);
+
+      if (transitionDelta !== 0) return transitionDelta;
+
+      const leftVolume = left.volume24h ?? -1;
+      const rightVolume = right.volume24h ?? -1;
+
+      if (leftVolume !== rightVolume) return rightVolume - leftVolume;
+
+      return left.symbol.localeCompare(right.symbol);
+    })
+    .slice(0, 3);
+}
+
+/* ============================================================================
+ * 5. VISUAL HELPERS
+ * ========================================================================== */
+
+function resolveValueClass(value: number | null): string {
+  if (value === null) return "valueNeutral";
+  if (value > 0) return "valuePositive";
+  if (value < 0) return "valueNegative";
+
+  return "valueNeutral";
+}
+
+/* ============================================================================
+ * 6. FORMATTERS
+ * ========================================================================== */
+
+function formatPrice(value: number | null, quote: Quote): string {
+  if (value === null) return "–";
+
+  const currency = quote === "USD" ? "USD" : "EUR";
+
+  return new Intl.NumberFormat("fr-FR", {
+    style: "currency",
+    currency,
+    maximumFractionDigits: value < 1 ? 6 : 2,
+  }).format(value);
+}
+
+function formatPct(value: number | null): string {
+  if (value === null) return "–";
+  return `${value > 0 ? "+" : ""}${value.toFixed(2)}%`;
+}
+
+function formatCompactCurrency(value: number | null, quote: Quote): string {
+  if (value === null) return "–";
+
+  const currency = quote === "USD" ? "USD" : "EUR";
+
+  return new Intl.NumberFormat("fr-FR", {
+    style: "currency",
+    currency,
+    notation: "compact",
+    maximumFractionDigits: 2,
+  }).format(value);
+}
+
+function formatRank(value: number | null, fallback: number): string {
+  return String(value ?? fallback);
+}
+
+/* ============================================================================
+ * 7. VIEW COMPONENTS
+ * ========================================================================== */
+
+function ContextBand({
+  marketClimate,
+  dominantTransition,
+  activityContext,
+  assetsCount,
 }: {
-  title: string;
-  children: React.ReactNode;
+  marketClimate: PublicMarketClimate;
+  dominantTransition: PublicStructureTransition | "Unavailable";
+  activityContext: PublicActivityLabel;
+  assetsCount: number;
 }) {
   return (
-    <div className="z-filterGroup">
-      <p className="z-filterTitle">{title}</p>
-      <div className="z-filterRow">{children}</div>
+    <div className="contextBand">
+      <div className="contextCard contextCardMain">
+        <span>Market Climate</span>
+        <strong>{marketClimate}</strong>
+      </div>
+
+      <div className="contextCard">
+        <span>Dominant Transition</span>
+        <strong>{dominantTransition}</strong>
+      </div>
+
+      <div className="contextCard">
+        <span>Activity</span>
+        <strong>{activityContext}</strong>
+      </div>
+
+      <div className="contextCard">
+        <span>Assets Read</span>
+        <strong>{assetsCount}</strong>
+      </div>
     </div>
   );
 }
 
-function SearchInput({
-  value,
-  onChange,
-}: {
-  value: string;
-  onChange: (next: string) => void;
-}) {
+function TransitionPanel({ assets }: { assets: Asset[] }) {
   return (
-    <input
-      type="search"
-      value={value}
-      onChange={(event) => onChange(event.target.value)}
-      placeholder="Rechercher BTC, ETH, SOL..."
-      autoComplete="off"
-      autoCorrect="off"
-      autoCapitalize="off"
-      spellCheck={false}
-      className="z-search"
-    />
+    <section className="transitionPanel">
+      <div className="transitionPanelHeader">
+        <h2>Structural Transitions</h2>
+      </div>
+
+      <div className="transitionGrid">
+        {assets.map((asset) => (
+          <article className="transitionCard" key={`transition-${asset.key}`}>
+            <div>
+              <strong>{asset.symbol}</strong>
+              <span>{asset.name}</span>
+            </div>
+
+            <div className="transitionCardSpark">
+              <Sparkline data={asset.sparkline} />
+            </div>
+
+            <div>
+              <span>Transition</span>
+              <p>{asset.transition}</p>
+            </div>
+          </article>
+        ))}
+      </div>
+    </section>
   );
 }
 
-function ResultMeta({
-  visible,
-  total,
-}: {
-  visible: number;
-  total: number;
-}) {
-  return (
-    <div className="z-toolbarMeta">
-      <span className="z-toolbarCount">Actifs affichés</span>
-      <span className="z-chip">
-        {visible} / {total}
-      </span>
-    </div>
-  );
-}
-
-function EmptyState({ children }: { children: React.ReactNode }) {
-  return <div className="z-empty">{children}</div>;
-}
-
-function MobileAssetCard({
-  asset,
-  quote,
-}: {
-  asset: ScanTableAsset;
-  quote: string;
-}) {
-  const href = resolveAssetHref(asset);
-  const symbol = safeString(asset.symbol, "UNKNOWN");
-  const name = safeString(asset.name, symbol);
-  const regime = asset.regime;
-  const score = Math.round(safeNumber(asset.confidence_score, 0));
-  const price = formatPrice(safeNumber(asset.price, 0), quote);
-  const change = safeNumber(asset.chg_24h_pct, 0);
-
-  return (
-    <a
-      href={href}
-      target="_blank"
-      rel="noopener noreferrer"
-      className="z-card z-hiddenDesktop"
-      aria-label={`Ouvrir ${symbol}`}
-    >
-      <div className="z-asset">
-        <p className="z-symbol">{symbol}</p>
-        <p className="z-name">{name}</p>
-      </div>
-
-      <div className="z-score z-num">{score}</div>
-
-      <div className="z-regime">
-        <span className="z-dot" data-regime={regime} aria-hidden="true" />
-        <span>{getRegimeLabel(regime)}</span>
-      </div>
-
-      <div className="z-stats">
-        <div className="z-stat">
-          <span className="z-statLabel">Prix</span>
-          <span className="z-statValue z-num">{price}</span>
-        </div>
-
-        <div className="z-stat">
-          <span className="z-statLabel">24h</span>
-          <span className={`z-statValue z-num ${getPctClass(change)}`}>
-            {formatPct(change)}
-          </span>
-        </div>
-      </div>
-
-      <span className="z-trade">Ouvrir</span>
-    </a>
-  );
-}
-
-function DesktopTable({
+function DesktopMarketTable({
   assets,
   quote,
 }: {
-  assets: ScanTableAsset[];
-  quote: string;
+  assets: Asset[];
+  quote: Quote;
 }) {
   return (
-    <div className="z-tableWrap z-hiddenMobile">
-      <div className="z-tableScroll">
-        <table className="z-table">
-          <thead>
-            <tr>
-              <th className="z-colAsset">Actif</th>
-              <th className="z-colPrice">Prix</th>
-              <th className="z-col24h">24h</th>
-              <th className="z-colRegime">Régime</th>
-              <th className="z-colScore">Score</th>
+    <div className="desktopMarketTable">
+      <table className="table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Asset</th>
+            <th>Price</th>
+            <th>24H</th>
+            <th>7D</th>
+            <th>Activity</th>
+            <th>Volume</th>
+            <th>Market Cap</th>
+            <th>Transition</th>
+          </tr>
+        </thead>
+
+        <tbody>
+          {assets.map((asset, index) => (
+            <tr key={asset.key}>
+              <td>{formatRank(asset.rank, index + 1)}</td>
+
+              <td>
+                <strong>{asset.symbol}</strong>
+                <div>{asset.name}</div>
+              </td>
+
+              <td>{formatPrice(asset.price, quote)}</td>
+
+              <td className={resolveValueClass(asset.pct24h)}>
+                {formatPct(asset.pct24h)}
+              </td>
+
+              <td>
+                <Sparkline data={asset.sparkline} />
+              </td>
+
+              <td>{asset.activity}</td>
+              <td>{formatCompactCurrency(asset.volume24h, quote)}</td>
+              <td>{formatCompactCurrency(asset.marketCap, quote)}</td>
+              <td>{asset.transition}</td>
             </tr>
-          </thead>
-
-          <tbody>
-            {assets.map((asset) => {
-              const href = resolveAssetHref(asset);
-              const symbol = safeString(asset.symbol, "UNKNOWN");
-              const name = safeString(asset.name, symbol);
-              const price = formatPrice(safeNumber(asset.price, 0), quote);
-              const change = safeNumber(asset.chg_24h_pct, 0);
-              const score = Math.round(safeNumber(asset.confidence_score, 0));
-
-              return (
-                <tr key={resolveAssetKey(asset)}>
-                  <td>
-                    <a
-                      href={href}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="z-cellAsset"
-                    >
-                      <span
-                        className="z-dot"
-                        data-regime={asset.regime}
-                        aria-hidden="true"
-                      />
-                      <div className="z-assetText">
-                        <span className="z-assetName">{symbol}</span>
-                        <span className="z-assetSub">{name}</span>
-                      </div>
-                    </a>
-                  </td>
-
-                  <td className="z-num">{price}</td>
-
-                  <td className={`z-num ${getPctClass(change)}`}>
-                    {formatPct(change)}
-                  </td>
-
-                  <td>
-                    <span className="z-regime">
-                      <span
-                        className="z-dot"
-                        data-regime={asset.regime}
-                        aria-hidden="true"
-                      />
-                      <span>{getRegimeLabel(asset.regime)}</span>
-                    </span>
-                  </td>
-
-                  <td className="z-scoreCell z-num">{score}</td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
 
-export function ScanTable({
+function MobileMarketCards({
   assets,
   quote,
-  sort,
-  limit,
-}: Props) {
-  const initialSort = getInitialSortState(normalizeSortPreset(sort));
-  const normalizedLimit = normalizeLimit(limit, assets.length);
-
-  const [query, setQuery] = useState("");
-  const [regimeFilter, setRegimeFilter] = useState<RegimeFilter>("ALL");
-  const [priceSort, setPriceSort] = useState<SortDirection>(initialSort.priceSort);
-  const [scoreSort, setScoreSort] = useState<SortDirection>(initialSort.scoreSort);
-
-  const filteredAssets = useMemo(() => {
-    const normalizedQuery = query.trim().toLowerCase();
-
-    const filtered = assets.filter((asset) => {
-      const symbol = safeString(asset.symbol).toLowerCase();
-      const name = safeString(asset.name).toLowerCase();
-
-      const matchesQuery =
-        normalizedQuery.length === 0 ||
-        symbol.includes(normalizedQuery) ||
-        name.includes(normalizedQuery);
-
-      const matchesRegime =
-        regimeFilter === "ALL" || asset.regime === regimeFilter;
-
-      return matchesQuery && matchesRegime;
-    });
-
-    const sorted = [...filtered].sort((a, b) => {
-      const aScore = safeNumber(a.confidence_score);
-      const bScore = safeNumber(b.confidence_score);
-      const aPrice = safeNumber(a.price);
-      const bPrice = safeNumber(b.price);
-
-      if (scoreSort !== "none") {
-        const scoreDelta =
-          scoreSort === "asc" ? aScore - bScore : bScore - aScore;
-        if (scoreDelta !== 0) return scoreDelta;
-      }
-
-      if (priceSort !== "none") {
-        const priceDelta =
-          priceSort === "asc" ? aPrice - bPrice : bPrice - aPrice;
-        if (priceDelta !== 0) return priceDelta;
-      }
-
-      return safeString(a.symbol).localeCompare(safeString(b.symbol));
-    });
-
-    return sorted.slice(0, normalizedLimit);
-  }, [assets, query, regimeFilter, priceSort, scoreSort, normalizedLimit]);
-
-  if (!assets.length) {
-    return <EmptyState>Aucun résultat.</EmptyState>;
-  }
-
+}: {
+  assets: Asset[];
+  quote: Quote;
+}) {
   return (
-    <div className="z-scanShell">
-      <div className="z-scanToolbar">
-        <SearchInput value={query} onChange={setQuery} />
-        <ResultMeta visible={filteredAssets.length} total={assets.length} />
+    <div className="mobileMarketCards">
+      {assets.map((asset, index) => (
+        <article className="mobileAssetCard" key={`mobile-${asset.key}`}>
+          <div className="mobileAssetHeader">
+            <div>
+              <span>#{formatRank(asset.rank, index + 1)}</span>
+              <strong>{asset.symbol}</strong>
+              <p>{asset.name}</p>
+            </div>
 
-        <div className="z-filterGrid">
-          <FilterGroup title="Régime">
-            <FilterButton
-              active={regimeFilter === "ALL"}
-              onClick={() => setRegimeFilter("ALL")}
-            >
-              Tout
-            </FilterButton>
-
-            <FilterButton
-              active={regimeFilter === "STABLE"}
-              onClick={() => setRegimeFilter("STABLE")}
-            >
-              Stable
-            </FilterButton>
-
-            <FilterButton
-              active={regimeFilter === "TRANSITION"}
-              onClick={() => setRegimeFilter("TRANSITION")}
-            >
-              Transition
-            </FilterButton>
-
-            <FilterButton
-              active={regimeFilter === "VOLATILE"}
-              onClick={() => setRegimeFilter("VOLATILE")}
-            >
-              Instable
-            </FilterButton>
-          </FilterGroup>
-
-          <FilterGroup title="Prix">
-            <FilterButton
-              active={priceSort === "asc"}
-              onClick={() => setPriceSort("asc")}
-            >
-              Croissant
-            </FilterButton>
-
-            <FilterButton
-              active={priceSort === "desc"}
-              onClick={() => setPriceSort("desc")}
-            >
-              Décroissant
-            </FilterButton>
-
-            <FilterButton
-              active={priceSort === "none"}
-              onClick={() => setPriceSort("none")}
-            >
-              Neutre
-            </FilterButton>
-          </FilterGroup>
-
-          <FilterGroup title="Score">
-            <FilterButton
-              active={scoreSort === "asc"}
-              onClick={() => setScoreSort("asc")}
-            >
-              Croissant
-            </FilterButton>
-
-            <FilterButton
-              active={scoreSort === "desc"}
-              onClick={() => setScoreSort("desc")}
-            >
-              Décroissant
-            </FilterButton>
-
-            <FilterButton
-              active={scoreSort === "none"}
-              onClick={() => setScoreSort("none")}
-            >
-              Neutre
-            </FilterButton>
-          </FilterGroup>
-        </div>
-      </div>
-
-      {filteredAssets.length === 0 ? (
-        <EmptyState>Aucun actif ne correspond aux filtres actuels.</EmptyState>
-      ) : (
-        <>
-          <div className="z-list">
-            {filteredAssets.map((asset) => (
-              <MobileAssetCard
-                key={resolveAssetKey(asset)}
-                asset={asset}
-                quote={quote}
-              />
-            ))}
+            <div className="mobileAssetPrice">
+              <strong>{formatPrice(asset.price, quote)}</strong>
+              <span className={resolveValueClass(asset.pct24h)}>
+                {formatPct(asset.pct24h)}
+              </span>
+            </div>
           </div>
 
-          <DesktopTable assets={filteredAssets} quote={quote} />
-        </>
-      )}
+          <div className="mobileSparkline">
+            <Sparkline data={asset.sparkline} />
+          </div>
+
+          <div className="mobileAssetMeta">
+            <div>
+              <span>Transition</span>
+              <strong>{asset.transition}</strong>
+            </div>
+
+            <div>
+              <span>Activity</span>
+              <strong>{asset.activity}</strong>
+            </div>
+
+            <div>
+              <span>Volume</span>
+              <strong>{formatCompactCurrency(asset.volume24h, quote)}</strong>
+            </div>
+
+            <div>
+              <span>Market Cap</span>
+              <strong>{formatCompactCurrency(asset.marketCap, quote)}</strong>
+            </div>
+          </div>
+        </article>
+      ))}
     </div>
+  );
+}
+
+/* ============================================================================
+ * 8. MAIN COMPONENT
+ * ========================================================================== */
+
+export default function ScanTable({
+  assets,
+  quote = "EUR",
+  limit = 250,
+}: Props) {
+  const [query, setQuery] = useState("");
+  const deferredQuery = useDeferredValue(query);
+
+  const normalizedQuote = normalizeQuote(quote);
+  const sourceAssets = normalizeSourceAssets(assets);
+
+  const visibleData = useMemo(() => {
+    if (!sourceAssets) return [];
+
+    const q = deferredQuery.trim().toLowerCase();
+
+    const normalized = sourceAssets.map((asset) =>
+      normalizeAsset(asset as AssetInput),
+    );
+
+    const filtered = q
+      ? normalized.filter(
+          (asset) =>
+            asset.symbol.toLowerCase().includes(q) ||
+            asset.name.toLowerCase().includes(q),
+        )
+      : normalized;
+
+    return filtered.slice(0, limit);
+  }, [sourceAssets, deferredQuery, limit]);
+
+  const structuralSummary = useMemo(() => {
+    const summaryInput: MarketSummaryInput[] = visibleData.map((asset) => ({
+      activity: asset.activity,
+      sparkline_context_7d: asset.sparklineContext7D,
+      structure_transition: asset.transition,
+    }));
+
+    return buildPublicMarketStructureSummary(summaryInput);
+  }, [visibleData]);
+
+  const transitionHighlights = useMemo(() => {
+    return pickTransitionHighlights(visibleData);
+  }, [visibleData]);
+
+  if (!sourceAssets) {
+    return <div className="emptyState">No data</div>;
+  }
+
+  return (
+    <section className="section">
+      <header className="header">
+        <h1>Xyvala</h1>
+        <p>European Market Structure Intelligence</p>
+        <p>Read structural market transitions before they become obvious.</p>
+      </header>
+
+      <ContextBand
+        marketClimate={structuralSummary.market_climate}
+        dominantTransition={structuralSummary.dominant_transition}
+        activityContext={structuralSummary.activity_context}
+        assetsCount={structuralSummary.assets_count}
+      />
+
+      <div className="toolbar">
+        <div className="marketState">
+          Structural Market Context: {structuralSummary.market_climate}
+        </div>
+
+        <input
+          type="search"
+          placeholder="BTC, ETH, SOL..."
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+        />
+      </div>
+
+      <TransitionPanel assets={transitionHighlights} />
+
+      <section className="marketSection">
+        <div className="marketSectionHeader">
+          <h2>Market Structure</h2>
+        </div>
+
+        <DesktopMarketTable assets={visibleData} quote={normalizedQuote} />
+        <MobileMarketCards assets={visibleData} quote={normalizedQuote} />
+      </section>
+
+      <p>Not investment advice.</p>
+    </section>
   );
 }

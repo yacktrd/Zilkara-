@@ -1,166 +1,207 @@
-// lib/xyvala/scan-engine.ts
+/* ============================================================================
+ * FILE: lib/xyvala/scan-engine.ts
+ * ========================================================================== */
 
-/**
- * XYVALA Scan Engine
- * coeur du moteur de scan
- */
+import type {
+  PrivateScanAsset,
+  PrivateScanRegime,
+  PrivateScanStatus,
+} from "@/lib/xyvala/contracts/scan-private-contract";
 
-export type Regime = "STABLE" | "TRANSITION" | "VOLATILE"
+import { runRFS } from "@/lib/xyvala/rfs-core";
 
-export type ScanAsset = {
-  id: string
-  symbol: string
-  name: string
+import {
+  buildMarketContext,
+  type MarketContext,
+} from "@/lib/xyvala/market-context";
 
-  price: number | null
-  chg_24h_pct: number | null
+export type ScanEngineSortKey = "stability" | "price";
+export type ScanEngineSortOrder = "asc" | "desc";
 
-  confidence_score: number | null
-  regime: Regime | null
+export type ScanEngineResult = {
+  data: PrivateScanAsset[];
+  market_context: MarketContext;
+};
 
-  market_cap: number | null
-  volume_24h: number | null
+const MIN_RFS_PRICES = 8;
+
+function clampScore(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  return Math.max(0, Math.min(100, Math.round(value * 100) / 100));
 }
 
-export type ScanContext = {
-  market_regime: Regime
-  stable_ratio: number
-  transition_ratio: number
-  volatile_ratio: number
+function resolvePrices(asset: PrivateScanAsset): number[] {
+  return Array.isArray(asset.sparkline_7d)
+    ? asset.sparkline_7d.filter(
+        (value): value is number =>
+          typeof value === "number" && Number.isFinite(value) && value > 0,
+      )
+    : [];
 }
 
-/* ----------------------------- utils ----------------------------- */
-
-function safeNum(v: unknown): number | null {
-  return typeof v === "number" && Number.isFinite(v) ? v : null
+function resolveStatus(score: number | null): PrivateScanStatus {
+  return score === null ? "unavailable" : "computed";
 }
 
-function safeStr(v: unknown): string | null {
-  return typeof v === "string" && v.trim().length > 0 ? v.trim() : null
+function resolvePartialStatus(score: number | null): PrivateScanStatus {
+  return score === null ? "partial" : "computed";
 }
 
-function sanitizeSymbol(symbol: string) {
-  return symbol
-    .toUpperCase()
-    .replace(/[^A-Z0-9]/g, "")
-    .slice(0, 20)
+function resolveRegime(value: unknown): PrivateScanRegime {
+  if (value === "STABLE") return "STABLE";
+  if (value === "VOLATILE") return "VOLATILE";
+  return "TRANSITION";
 }
 
-/* ----------------------------- normalize ----------------------------- */
+export function applyRFS(data: PrivateScanAsset[]): PrivateScanAsset[] {
+  return data.map((asset) => {
+    const prices = resolvePrices(asset);
 
-export function normalizeAsset(raw: any): ScanAsset | null {
+    if (prices.length < MIN_RFS_PRICES) {
+      return {
+        ...asset,
+        stability_score: null,
+        stability_status: "partial",
+        regime: "TRANSITION",
+        structure_score: null,
+        market_score: null,
+        coherence_score: null,
+        rupture_score: null,
+        rupture_probability: null,
+        rupture_penalty_score: null,
+        continuity_probability: null,
+        confidence_score: null,
+        confidence_status: "partial",
+        governance: {
+          ...asset.governance,
+          warnings: [
+            ...asset.governance.warnings,
+            "scan_engine_insufficient_rfs_prices",
+          ],
+        },
+      };
+    }
 
-  const sym0 = safeStr(raw?.symbol) ?? safeStr(raw?.id)
+    try {
+      const rfs = runRFS({ prices });
 
-  if (!sym0) return null
+      const stability = clampScore(rfs.stability);
+      const structure = clampScore(rfs.structure_score);
+      const market = clampScore(rfs.market_score);
+      const coherence = clampScore(rfs.coherence_score);
+      const rupture = clampScore(rfs.rupture_score);
+      const ruptureProbability = clampScore(rfs.rupture_probability);
+      const rupturePenalty = clampScore(rfs.rupture_penalty_score);
+      const continuity = clampScore(rfs.continuity_probability);
+      const confidence = clampScore(rfs.confidence_score);
 
-  const symbol = sanitizeSymbol(sym0)
+      return {
+        ...asset,
 
-  const name = safeStr(raw?.name) ?? symbol
+        stability_score: stability,
+        stability_status: resolveStatus(stability),
 
-  return {
+        structure_score: structure,
+        market_score: market,
+        coherence_score: coherence,
 
-    id: safeStr(raw?.id) ?? symbol,
-    symbol,
-    name,
+        occurrence_score: clampScore(rfs.occurrence_score),
+        frequency_score: clampScore(rfs.frequency_score),
+        convergence_score: clampScore(rfs.convergence_score),
+        duration_score: clampScore(rfs.duration_score),
 
-    price: safeNum(raw?.price),
-    chg_24h_pct: safeNum(raw?.chg_24h_pct),
+        rupture_score: rupture,
+        rupture_probability: ruptureProbability,
+        rupture_penalty_score: rupturePenalty,
+        rupture_occurrence_score: clampScore(rfs.rupture_occurrence_score),
+        rupture_frequency_score: clampScore(rfs.rupture_frequency_score),
+        rupture_convergence_score: clampScore(rfs.rupture_convergence_score),
+        rupture_duration_score: clampScore(rfs.rupture_duration_score),
 
-    confidence_score: safeNum(raw?.confidence_score),
+        crash_score: clampScore(rfs.crash_score),
+        crash_state:
+          rfs.crash_state === "NONE" ||
+          rfs.crash_state === "RISING" ||
+          rfs.crash_state === "CRASH"
+            ? rfs.crash_state
+            : "UNKNOWN",
 
-    regime: safeStr(raw?.regime) as Regime ?? null,
+        continuity_probability: continuity,
 
-    market_cap: safeNum(raw?.market_cap),
-    volume_24h: safeNum(raw?.volume_24h)
+        confidence_score: confidence,
+        confidence_status: resolvePartialStatus(confidence),
 
-  }
+        regime: resolveRegime(rfs.regime),
 
+        governance: {
+          ...asset.governance,
+          warnings: asset.governance.warnings,
+        },
+      };
+    } catch {
+      return {
+        ...asset,
+        stability_score: null,
+        stability_status: "degraded",
+        regime: "TRANSITION",
+        structure_score: null,
+        market_score: null,
+        coherence_score: null,
+        rupture_score: null,
+        rupture_probability: null,
+        rupture_penalty_score: null,
+        continuity_probability: null,
+        confidence_score: null,
+        confidence_status: "degraded",
+        governance: {
+          ...asset.governance,
+          warnings: [...asset.governance.warnings, "scan_engine_rfs_failed"],
+        },
+      };
+    }
+  });
 }
-
-/* ----------------------------- context ----------------------------- */
-
-export function computeContext(data: ScanAsset[]): ScanContext {
-
-  let stable = 0
-  let transition = 0
-  let volatile = 0
-
-  for (const a of data) {
-
-    const r = (a.regime ?? "").toUpperCase()
-
-    if (r === "STABLE") stable++
-    else if (r === "TRANSITION") transition++
-    else if (r === "VOLATILE") volatile++
-
-  }
-
-  const total = data.length || 1
-
-  const stable_ratio = stable / total
-  const transition_ratio = transition / total
-  const volatile_ratio = volatile / total
-
-  let market_regime: Regime = "TRANSITION"
-
-  const max = Math.max(
-    stable_ratio,
-    transition_ratio,
-    volatile_ratio
-  )
-
-  if (max === stable_ratio) market_regime = "STABLE"
-  else if (max === volatile_ratio) market_regime = "VOLATILE"
-
-  return {
-    market_regime,
-    stable_ratio,
-    transition_ratio,
-    volatile_ratio
-  }
-
-}
-
-/* ----------------------------- sort ----------------------------- */
 
 export function sortAssets(
-  data: ScanAsset[],
-  key: "score" | "price",
-  order: "asc" | "desc"
-) {
+  data: PrivateScanAsset[],
+  key: ScanEngineSortKey,
+  order: ScanEngineSortOrder,
+): PrivateScanAsset[] {
+  const direction = order === "asc" ? 1 : -1;
 
-  const dir = order === "asc" ? 1 : -1
+  return [...data].sort((a, b) => {
+    const left = key === "price" ? a.price : a.stability_score;
+    const right = key === "price" ? b.price : b.stability_score;
 
-  data.sort((a, b) => {
+    const leftValid = typeof left === "number" && Number.isFinite(left);
+    const rightValid = typeof right === "number" && Number.isFinite(right);
 
-    const av =
-      key === "price"
-        ? a.price
-        : a.confidence_score
+    if (leftValid !== rightValid) return leftValid ? -1 : 1;
+    if (!leftValid && !rightValid) return a.symbol.localeCompare(b.symbol);
 
-    const bv =
-      key === "price"
-        ? b.price
-        : b.confidence_score
+    if (left !== right) {
+      return ((left as number) - (right as number)) * direction;
+    }
 
-    const aValid = typeof av === "number"
-    const bValid = typeof bv === "number"
+    return a.symbol.localeCompare(b.symbol);
+  });
+}
 
-    if (aValid !== bValid)
-      return aValid ? -1 : 1
+export function buildScanEngineResult(input: {
+  data: PrivateScanAsset[];
+  key?: ScanEngineSortKey;
+  order?: ScanEngineSortOrder;
+}): ScanEngineResult {
+  const enriched = applyRFS(input.data);
 
-    if (!aValid && !bValid)
-      return a.symbol.localeCompare(b.symbol)
+  const sorted = sortAssets(
+    enriched,
+    input.key ?? "stability",
+    input.order ?? "desc",
+  );
 
-    const ax = av as number
-    const bx = bv as number
-
-    if (ax !== bx)
-      return (ax - bx) * dir
-
-    return a.symbol.localeCompare(b.symbol)
-
-  })
-
+  return {
+    data: sorted,
+    market_context: buildMarketContext(sorted),
+  };
 }

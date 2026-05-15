@@ -47,10 +47,6 @@ let cachedRegistry: RegistryLoadResult | null = null;
 
 const EPOCH_ISO = new Date(0).toISOString();
 
-function nowIso(): string {
-  return new Date().toISOString();
-}
-
 function safeStr(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
@@ -78,7 +74,10 @@ function normalizeIsoDate(value: unknown, fallback: string): string {
   return Number.isNaN(parsed.getTime()) ? fallback : parsed.toISOString();
 }
 
-function normalizePlanForType(type: ApiKeyRecordType, plan: ApiPlan): ApiPlan {
+function normalizePlanForType(
+  type: ApiKeyRecordType,
+  plan: ApiPlan
+): ApiPlan {
   if (type === "internal") return "internal";
   if (type === "public_demo") return "demo";
   if (type === "legacy" && plan === "internal") return "trader";
@@ -139,7 +138,7 @@ function buildApiKeyRecord(input: BuildApiKeyRecordInput): ApiKeyRecord | null {
     type: input.type,
     enabled: input.enabled ?? true,
     createdAt: normalizeIsoDate(input.createdAt, EPOCH_ISO),
-    updatedAt: normalizeIsoDate(input.updatedAt, nowIso()),
+    updatedAt: normalizeIsoDate(input.updatedAt, EPOCH_ISO),
     keySource: input.keySource ?? "env",
   };
 }
@@ -172,7 +171,10 @@ function sortRecords(records: ApiKeyRecord[]): ApiKeyRecord[] {
   return [...records].sort(compareRecords);
 }
 
-function choosePreferredRecord(current: ApiKeyRecord, incoming: ApiKeyRecord): ApiKeyRecord {
+function choosePreferredRecord(
+  current: ApiKeyRecord,
+  incoming: ApiKeyRecord
+): ApiKeyRecord {
   if (getSourceRank(incoming.keySource) < getSourceRank(current.keySource)) {
     return incoming;
   }
@@ -232,17 +234,17 @@ function loadEnvApiKeyRecords(): ApiKeyRecord[] {
       type: "internal",
       keySource: "env",
       createdAt: EPOCH_ISO,
-      updatedAt: nowIso(),
+      updatedAt: EPOCH_ISO,
     }),
 
     buildApiKeyRecord({
       key: process.env.XYVALA_PUBLIC_DEMO_KEY ?? "",
-      label: process.env.XYVALA_PUBLIC_DEMO_LABEL ?? "Public Demo",
+      label: process.env.XYVALA_PUBLIC_DEMO_LABEL ?? "Public Demo Key",
       plan: "demo",
       type: "public_demo",
       keySource: "env",
       createdAt: EPOCH_ISO,
-      updatedAt: nowIso(),
+      updatedAt: EPOCH_ISO,
     }),
 
     buildApiKeyRecord({
@@ -252,7 +254,7 @@ function loadEnvApiKeyRecords(): ApiKeyRecord[] {
       type: "legacy",
       keySource: "env",
       createdAt: EPOCH_ISO,
-      updatedAt: nowIso(),
+      updatedAt: EPOCH_ISO,
     }),
   ];
 
@@ -271,9 +273,7 @@ function loadApiKeyRegistry(): RegistryLoadResult {
 
   const records = dedupeRecords([...registryRecords, ...envRecords]);
 
-  return {
-    records,
-  };
+  return { records };
 }
 
 export function getApiKeyRegistry(): ApiKeyRecord[] {

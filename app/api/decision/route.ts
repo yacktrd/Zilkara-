@@ -1,576 +1,159 @@
-// app/api/decision/route.ts
+/* ============================================================================
+ * FILE: app/api/decision/route.ts
+ * ========================================================================== */
+
 import { NextRequest, NextResponse } from "next/server";
+
 import {
-  validateApiKey,
-  buildApiKeyErrorResponse,
   applyApiAuthHeaders,
+  buildApiKeyErrorResponse,
+  enforceApiPolicy,
 } from "@/lib/xyvala/auth";
-import { trackUsage } from "@/lib/xyvala/usage";
+
+import { applyQuotaHeaders, trackUsage } from "@/lib/xyvala/usage";
+
 import {
-  scanKey,
-  zonesKey,
-  decisionKey,
-  getFromCache,
-  setToCache,
-  type ScanSnapshot,
-  type Regime,
+  XYVALA_SNAPSHOT_VERSION,
+  type Quote,
 } from "@/lib/xyvala/snapshot";
-import { createMemoryRecord } from "@/lib/xyvala/memory";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const revalidate = 0;
 
-const XYVALA_VERSION = "v1";
-const TTL_MS = 45_000;
+const ENDPOINT = "/api/decision";
+const DEFAULT_QUOTE: Quote = "eur";
 
-type RfsAction = "ALLOW" | "WATCH" | "BLOCK";
-type ExecutionMode = "none" | "progressive" | "confirmation" | "reduced";
-
-type BestZone = {
-  price: number;
-  occurrence_score: number;
-  convergence_score: number;
-  correlation_score: number;
-} | null;
-
-type ZonesLikeResponse = {
-  ok?: boolean;
-  best_zone?: BestZone;
-  context?: {
-    market_regime?: Regime;
-  } | null;
-};
+type AuthResult = ReturnType<typeof enforceApiPolicy>;
+type AuthSuccess = Extract<AuthResult, { ok: true }>;
+type UsageResult = Awaited<ReturnType<typeof trackUsage>> | null;
 
 type DecisionResponse = {
   ok: boolean;
   ts: string;
   version: string;
-  symbol: string;
-  tf: string;
-
-  best_zone: BestZone;
-
-  context: {
-    market_regime: Regime;
-  };
-
-  rfs_decision: {
-    action: RfsAction;
-    reason_codes: string[];
-    execution_mode: ExecutionMode;
-  };
-
-  memory: {
-    record_id: string | null;
-    status: "created" | "skipped";
-  };
-
-  source: "compute" | "cache";
-  error: string | null;
-
+  market: "crypto";
+  quote: Quote;
+  status: "restricted";
+  data: null;
   meta: {
-    scan_cache_key: string;
-    zones_cache_key: string;
-    decision_cache_key: string;
-    cache: "hit" | "miss";
+    access_scope: "private_decision_not_public";
     warnings: string[];
   };
+  error: string | null;
 };
 
-const NOW_ISO = () => new Date().toISOString();
-
-/* -------------------------------------------------------------------------- */
-/*                                    Utils                                   */
-/* -------------------------------------------------------------------------- */
-
-function safeStr(v: unknown): string | null {
-  if (typeof v !== "string") return null;
-  const s = v.trim();
-  return s.length ? s : null;
+function nowIso(): string {
+  return new Date().toISOString();
 }
 
-function safeNum(v: unknown): number | null {
-  return typeof v === "number" && Number.isFinite(v) ? v : null;
+function safeString(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
 }
 
-function sanitizeSymbol(input: string): string {
-  return input.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 20);
+function normalizeQuote(value: string | null): Quote {
+  const quote = safeString(value).toLowerCase();
+
+  if (quote === "usd") return "usd";
+  if (quote === "usdt") return "usdt";
+
+  return DEFAULT_QUOTE;
 }
 
-function normalizeTf(tf: string | null): string {
-  const v = (tf ?? "AUTO").trim().toUpperCase();
-
-  if (v === "1H" || v === "4H" || v === "1D" || v === "1W" || v === "AUTO") {
-    return v;
-  }
-
-  return "AUTO";
+function uniqueWarnings(
+  ...groups: Array<string[] | undefined | null>
+): string[] {
+  return [
+    ...new Set(
+      groups
+        .flatMap((group) => (Array.isArray(group) ? group : []))
+        .filter(
+          (item): item is string =>
+            typeof item === "string" && item.trim().length > 0,
+        ),
+    ),
+  ];
 }
 
-function uniqueWarnings(...groups: Array<string[] | undefined | null>): string[] {
-  const merged = groups.flatMap((group) => (Array.isArray(group) ? group : []));
-  return [...new Set(merged.filter((item) => typeof item === "string" && item.trim().length > 0))];
-}
-
-function normalizeRegime(v: unknown): Regime {
-  const s = safeStr(v)?.toUpperCase();
-
-  if (s === "STABLE" || s === "TRANSITION" || s === "VOLATILE") {
-    return s;
-  }
-
-  return "TRANSITION";
-}
-
-function hasUsableBestZone(value: unknown): value is Exclude<BestZone, null> {
-  if (!value || typeof value !== "object") return false;
-
-  const record = value as Record<string, unknown>;
-
-  return (
-    safeNum(record.price) !== null &&
-    safeNum(record.occurrence_score) !== null &&
-    safeNum(record.convergence_score) !== null &&
-    safeNum(record.correlation_score) !== null
-  );
-}
-
-function normalizeBestZone(value: unknown): BestZone {
-  if (!hasUsableBestZone(value)) return null;
-
+function buildResponse(input: {
+  quote: Quote;
+  warnings: string[];
+  error: string | null;
+}): DecisionResponse {
   return {
-    price: Number((value as Record<string, unknown>).price),
-    occurrence_score: Number((value as Record<string, unknown>).occurrence_score),
-    convergence_score: Number((value as Record<string, unknown>).convergence_score),
-    correlation_score: Number((value as Record<string, unknown>).correlation_score),
-  };
-}
-
-function buildResponse(
-  input: Partial<DecisionResponse> &
-    Pick<DecisionResponse, "ts" | "symbol" | "tf">
-): DecisionResponse {
-  return {
-    ok: Boolean(input.ok),
-    ts: input.ts,
-    version: input.version ?? XYVALA_VERSION,
-
-    symbol: input.symbol,
-    tf: input.tf,
-
-    best_zone: input.best_zone ?? null,
-
-    context: {
-      market_regime: input.context?.market_regime ?? "TRANSITION",
-    },
-
-    rfs_decision: {
-      action: input.rfs_decision?.action ?? "WATCH",
-      reason_codes: input.rfs_decision?.reason_codes ?? [],
-      execution_mode: input.rfs_decision?.execution_mode ?? "none",
-    },
-
-    memory: {
-      record_id: input.memory?.record_id ?? null,
-      status: input.memory?.status ?? "skipped",
-    },
-
-    source: input.source ?? "compute",
-    error: input.error ?? null,
-
+    ok: true,
+    ts: nowIso(),
+    version: XYVALA_SNAPSHOT_VERSION,
+    market: "crypto",
+    quote: input.quote,
+    status: "restricted",
+    data: null,
     meta: {
-      scan_cache_key: input.meta?.scan_cache_key ?? "",
-      zones_cache_key: input.meta?.zones_cache_key ?? "",
-      decision_cache_key: input.meta?.decision_cache_key ?? "",
-      cache: input.meta?.cache ?? "miss",
-      warnings: input.meta?.warnings ?? [],
+      access_scope: "private_decision_not_public",
+      warnings: uniqueWarnings(input.warnings, [
+        "decision_endpoint_public_output_restricted",
+      ]),
     },
+    error: input.error,
   };
 }
 
-function rfsDecide(input: {
-  market_regime: Regime;
-  best_zone: BestZone;
-}): {
-  action: RfsAction;
-  reason_codes: string[];
-  execution_mode: ExecutionMode;
-} {
-  const { market_regime, best_zone } = input;
+function respond(
+  payload: DecisionResponse,
+  status: number,
+  auth: AuthSuccess,
+  usage: UsageResult,
+): NextResponse {
+  let response = NextResponse.json(payload, {
+    status,
+    headers: {
+      "cache-control": "no-store",
+      "x-xyvala-version": XYVALA_SNAPSHOT_VERSION,
+      "x-xyvala-endpoint": ENDPOINT,
+    },
+  });
 
-  if (!best_zone) {
-    return {
-      action: "WATCH",
-      reason_codes: ["NO_ZONE"],
-      execution_mode: "none",
-    };
+  response = applyApiAuthHeaders(response, auth);
+
+  if (usage) {
+    response = applyQuotaHeaders(response, usage);
   }
 
-  const score = best_zone.correlation_score;
-
-  if (market_regime === "VOLATILE") {
-    if (score >= 80) {
-      return {
-        action: "WATCH",
-        reason_codes: ["REGIME_VOLATILE", "ZONE_HIGH"],
-        execution_mode: "reduced",
-      };
-    }
-
-    return {
-      action: "BLOCK",
-      reason_codes: ["REGIME_VOLATILE", "ZONE_NOT_STRONG"],
-      execution_mode: "none",
-    };
-  }
-
-  if (market_regime === "STABLE") {
-    if (score >= 80) {
-      return {
-        action: "ALLOW",
-        reason_codes: ["REGIME_STABLE", "ZONE_HIGH"],
-        execution_mode: "progressive",
-      };
-    }
-
-    if (score >= 60) {
-      return {
-        action: "WATCH",
-        reason_codes: ["REGIME_STABLE", "ZONE_MID"],
-        execution_mode: "confirmation",
-      };
-    }
-
-    return {
-      action: "WATCH",
-      reason_codes: ["REGIME_STABLE", "ZONE_LOW"],
-      execution_mode: "none",
-    };
-  }
-
-  if (score >= 80) {
-    return {
-      action: "ALLOW",
-      reason_codes: ["REGIME_TRANSITION", "ZONE_HIGH"],
-      execution_mode: "confirmation",
-    };
-  }
-
-  if (score >= 60) {
-    return {
-      action: "WATCH",
-      reason_codes: ["REGIME_TRANSITION", "ZONE_MID"],
-      execution_mode: "confirmation",
-    };
-  }
-
-  return {
-    action: "WATCH",
-    reason_codes: ["REGIME_TRANSITION", "ZONE_LOW"],
-    execution_mode: "reduced",
-  };
+  return response;
 }
-
-/* -------------------------------------------------------------------------- */
-/*                                  Handler                                   */
-/* -------------------------------------------------------------------------- */
 
 export async function GET(req: NextRequest) {
-  const ts = NOW_ISO();
-  const routeWarnings: string[] = [];
-
-  const auth = validateApiKey(req);
+  const auth: AuthResult = enforceApiPolicy(req);
 
   if (!auth.ok) {
     return buildApiKeyErrorResponse(auth.error, auth.status);
   }
 
-  try {
-    await trackUsage({
-      apiKey: auth.key,
-      endpoint: "/api/decision",
-    });
-  } catch {
-    routeWarnings.push("usage_tracking_failed");
-  }
+  let usage: UsageResult = null;
+  let usageWarnings: string[] = [];
 
   try {
-    const sp = req.nextUrl.searchParams;
-
-    const symbol = sanitizeSymbol(safeStr(sp.get("symbol")) ?? "");
-    const tf = normalizeTf(sp.get("tf"));
-
-    if (!symbol) {
-      const res = buildResponse({
-        ok: false,
-        ts,
-        symbol: "",
-        tf,
-        error: "missing_symbol",
-        rfs_decision: {
-          action: "BLOCK",
-          reason_codes: ["MISSING_SYMBOL"],
-          execution_mode: "none",
-        },
-        meta: {
-          scan_cache_key: "",
-          zones_cache_key: "",
-          decision_cache_key: "",
-          cache: "miss",
-          warnings: uniqueWarnings(routeWarnings),
-        },
-      });
-
-      return applyApiAuthHeaders(
-        NextResponse.json(res, {
-          status: 400,
-          headers: {
-            "cache-control": "no-store",
-            "x-xyvala-version": XYVALA_VERSION,
-          },
-        }),
-        auth
-      );
-    }
-
-    const scan_cache_key = scanKey({
-      version: XYVALA_VERSION,
-      market: "crypto",
-      quote: "usd",
-      sort: "score",
-      order: "desc",
-      limit: 250,
-      q: null,
+    usage = await trackUsage({
+      key: auth.key,
+      keyType: auth.keyType,
+      endpoint: ENDPOINT,
+      plan: auth.plan,
     });
-
-    const snapshot = await getFromCache<ScanSnapshot>(scan_cache_key, TTL_MS);
-
-    if (!snapshot) {
-      const res = buildResponse({
-        ok: false,
-        ts,
-        symbol,
-        tf,
-        error: "scan_snapshot_missing",
-        rfs_decision: {
-          action: "WATCH",
-          reason_codes: ["SCAN_SNAPSHOT_MISSING"],
-          execution_mode: "none",
-        },
-        meta: {
-          scan_cache_key,
-          zones_cache_key: "",
-          decision_cache_key: "",
-          cache: "miss",
-          warnings: uniqueWarnings(routeWarnings, ["scan_snapshot_missing"]),
-        },
-      });
-
-      return applyApiAuthHeaders(
-        NextResponse.json(res, {
-          status: 503,
-          headers: {
-            "cache-control": "no-store",
-            "x-xyvala-version": XYVALA_VERSION,
-          },
-        }),
-        auth
-      );
-    }
-
-    const tfForZones = tf === "AUTO" ? "1H,4H,1D" : tf;
-
-    const zones_cache_key = zonesKey({
-      version: XYVALA_VERSION,
-      scan_cache_key,
-      symbol,
-      tf: tfForZones,
-    });
-
-    const decision_cache_key = decisionKey({
-      version: XYVALA_VERSION,
-      zones_cache_key,
-      symbol,
-      tf,
-    });
-
-    const cached = await getFromCache<DecisionResponse>(decision_cache_key, TTL_MS);
-
-    if (cached && cached.ok === true) {
-      const res = buildResponse({
-        ...cached,
-        ts,
-        source: "cache",
-        meta: {
-          ...cached.meta,
-          cache: "hit",
-          warnings: uniqueWarnings(cached.meta?.warnings, routeWarnings),
-        },
-      });
-
-      return applyApiAuthHeaders(
-        NextResponse.json(res, {
-          status: 200,
-          headers: {
-            "cache-control": "no-store",
-            "x-xyvala-version": XYVALA_VERSION,
-            "x-xyvala-cache": "hit",
-          },
-        }),
-        auth
-      );
-    }
-
-    if (cached && cached.ok !== true) {
-      routeWarnings.push("stale_decision_cache_ignored");
-    }
-
-    const zonesResp = await getFromCache<ZonesLikeResponse>(zones_cache_key, TTL_MS);
-
-    if (!zonesResp || zonesResp.ok !== true) {
-      const res = buildResponse({
-        ok: false,
-        ts,
-        symbol,
-        tf,
-        error: "zones_snapshot_missing",
-        rfs_decision: {
-          action: "WATCH",
-          reason_codes: ["ZONES_SNAPSHOT_MISSING"],
-          execution_mode: "none",
-        },
-        meta: {
-          scan_cache_key,
-          zones_cache_key,
-          decision_cache_key,
-          cache: "miss",
-          warnings: uniqueWarnings(routeWarnings, ["zones_snapshot_missing"]),
-        },
-      });
-
-      return applyApiAuthHeaders(
-        NextResponse.json(res, {
-          status: 503,
-          headers: {
-            "cache-control": "no-store",
-            "x-xyvala-version": XYVALA_VERSION,
-          },
-        }),
-        auth
-      );
-    }
-
-    const best_zone = normalizeBestZone(zonesResp.best_zone);
-    const market_regime = normalizeRegime(
-      zonesResp.context?.market_regime ??
-        snapshot.context?.market_regime ??
-        "TRANSITION"
-    );
-
-    const rfs_decision = rfsDecide({
-      market_regime,
-      best_zone,
-    });
-
-    let memoryRecordId: string | null = null;
-    let memoryStatus: "created" | "skipped" = "skipped";
-
-    try {
-      const record = await createMemoryRecord({
-        ts,
-        symbol,
-        tf,
-        snapshot_hash: null,
-        market_regime,
-        best_zone_price: best_zone?.price ?? null,
-        zone_score: best_zone?.correlation_score ?? null,
-        action: rfs_decision.action,
-        execution_mode: rfs_decision.execution_mode,
-      });
-
-      if (record?.id) {
-        memoryRecordId = record.id;
-        memoryStatus = "created";
-      } else {
-        routeWarnings.push("memory_record_missing_id");
-      }
-    } catch {
-      routeWarnings.push("memory_write_failed");
-    }
-
-    const response = buildResponse({
-      ok: true,
-      ts,
-      symbol,
-      tf,
-      best_zone,
-      context: {
-        market_regime,
-      },
-      rfs_decision,
-      memory: {
-        record_id: memoryRecordId,
-        status: memoryStatus,
-      },
-      source: "compute",
-      error: null,
-      meta: {
-        scan_cache_key,
-        zones_cache_key,
-        decision_cache_key,
-        cache: "miss",
-        warnings: uniqueWarnings(routeWarnings),
-      },
-    });
-
-    await setToCache(decision_cache_key, response, TTL_MS);
-
-    return applyApiAuthHeaders(
-      NextResponse.json(response, {
-        status: 200,
-        headers: {
-          "cache-control": "no-store",
-          "x-xyvala-version": XYVALA_VERSION,
-          "x-xyvala-cache": "miss",
-        },
-      }),
-      auth
-    );
-  } catch (error: unknown) {
-    const message =
+  } catch (error) {
+    usageWarnings = uniqueWarnings([
       error instanceof Error && error.message
-        ? error.message
-        : "unknown_error";
-
-    const res = buildResponse({
-      ok: false,
-      ts,
-      symbol: "",
-      tf: "AUTO",
-      error: message,
-      rfs_decision: {
-        action: "BLOCK",
-        reason_codes: ["ROUTE_EXCEPTION"],
-        execution_mode: "none",
-      },
-      meta: {
-        scan_cache_key: "",
-        zones_cache_key: "",
-        decision_cache_key: "",
-        cache: "miss",
-        warnings: ["route_exception"],
-      },
-    });
-
-    return applyApiAuthHeaders(
-      NextResponse.json(res, {
-        status: 500,
-        headers: {
-          "cache-control": "no-store",
-          "x-xyvala-version": XYVALA_VERSION,
-        },
-      }),
-      auth
-    );
+        ? `usage_track_failed:${error.message}`
+        : "usage_track_failed",
+    ]);
   }
+
+  const quote = normalizeQuote(req.nextUrl.searchParams.get("quote"));
+
+  const payload = buildResponse({
+    quote,
+    warnings: usageWarnings,
+    error: null,
+  });
+
+  return respond(payload, 200, auth, usage);
 }

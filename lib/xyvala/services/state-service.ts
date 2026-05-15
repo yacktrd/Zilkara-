@@ -1,24 +1,47 @@
-// lib/xyvala/services/state-service.ts
+/* ============================================================================
+ * FILE: lib/xyvala/services/state-service.ts
+ * ----------------------------------------------------------------------------
+ * TITLE
+ * - Xyvala public market state service
+ *
+ * ROLE
+ * - read canonical public scan snapshots from cache
+ * - derive descriptive public market context from observable fields only
+ * - prevent public scoring / decision / stability leakage
+ *
+ * DIRECTIVES
+ * - public service only
+ * - no RFS recomputation
+ * - no MCI recomputation
+ * - no calibration logic
+ * - no regime reconstruction
+ * - no decision exposure
+ * - no stability score exposure
+ * - no opportunity exposure
+ * - no investment signal
+ * - observable market statistics only
+ * ========================================================================== */
 
+import { getFromCache, setToCache } from "@/lib/xyvala/cache/cache-core";
+import { buildCanonicalSnapshotKey } from "@/lib/xyvala/cache/snapshot-key";
 import {
-  getFromCache,
-  scanKey,
-  setToCache,
-  type ScanSnapshot,
+  isScanSnapshot,
+  XYVALA_SNAPSHOT_VERSION,
   type Quote,
+  type ScanSnapshot,
 } from "@/lib/xyvala/snapshot";
 
-const XYVALA_VERSION = "v1";
-const DEFAULT_MARKET = "crypto";
-const DEFAULT_QUOTE: Quote = "usd";
-const DEFAULT_SORT = "score";
-const DEFAULT_ORDER = "desc";
-const DEFAULT_LIMIT = 250;
+/* ============================================================================
+ * 1. CONFIG
+ * ========================================================================== */
 
-const SNAPSHOT_TTL_MS = 45_000;
+const XYVALA_VERSION = XYVALA_SNAPSHOT_VERSION;
+const DEFAULT_QUOTE: Quote = "eur";
 const STATE_CACHE_TTL_MS = 15_000;
 
-export type MarketRegime = "STABLE" | "TRANSITION" | "VOLATILE" | null;
+/* ============================================================================
+ * 2. TYPES
+ * ========================================================================== */
 
 export type StateServiceInput = {
   quote?: Quote | string | null;
@@ -26,14 +49,16 @@ export type StateServiceInput = {
 };
 
 export type StateServiceState = {
-  market_regime: MarketRegime;
-  stable_ratio: number | null;
-  transition_ratio: number | null;
-  volatile_ratio: number | null;
-  liquidity_state: string | null;
-  volatility_state: string | null;
-  risk_mode: string | null;
-  execution_bias: string | null;
+  assets_count: number;
+  priced_assets_count: number;
+  volume_assets_count: number;
+  market_cap_assets_count: number;
+
+  average_change_24h_pct: number | null;
+  average_absolute_change_24h_pct: number | null;
+
+  average_change_7d_pct: number | null;
+  average_absolute_change_7d_pct: number | null;
 };
 
 export type StateServiceResult = {
@@ -47,157 +72,178 @@ export type StateServiceResult = {
   error: string | null;
 };
 
-type StateCacheEntry = {
-  ts: number;
-  value: StateServiceResult;
+export type ScanSnapshotReadResult = {
+  snapshot: ScanSnapshot | null;
+  warnings: string[];
 };
 
-const mem = new Map<string, StateCacheEntry>();
+/* ============================================================================
+ * 3. SAFE HELPERS
+ * ========================================================================== */
 
 function nowIso(): string {
   return new Date().toISOString();
 }
 
-function nowMs(): number {
-  return Date.now();
-}
-
-function safeStr(value: unknown): string {
+function safeString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function safeNum(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
 }
 
-function uniqueWarnings(...groups: Array<string[] | undefined | null>): string[] {
-  const merged = groups.flatMap((group) => (Array.isArray(group) ? group : []));
-  return [...new Set(merged.filter((item) => typeof item === "string" && item.trim().length > 0))];
+function round2(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
+function uniqueWarnings(
+  ...groups: Array<string[] | undefined | null>
+): string[] {
+  return [
+    ...new Set(
+      groups
+        .flatMap((group) => (Array.isArray(group) ? group : []))
+        .filter(
+          (item): item is string =>
+            typeof item === "string" && item.trim().length > 0,
+        ),
+    ),
+  ];
 }
 
 function normalizeQuote(value: unknown): Quote {
-  const quote = safeStr(value).toLowerCase();
-  if (quote === "eur") return "eur";
+  const quote = safeString(value).toLowerCase();
+
+  if (quote === "usd") return "usd";
   if (quote === "usdt") return "usdt";
+
   return DEFAULT_QUOTE;
 }
 
-function normalizeRegime(value: unknown): MarketRegime {
-  const regime = safeStr(value).toUpperCase();
-  if (regime === "STABLE") return "STABLE";
-  if (regime === "TRANSITION") return "TRANSITION";
-  if (regime === "VOLATILE") return "VOLATILE";
-  return null;
-}
-
-function buildSnapshotCacheKey(quote: Quote): string {
-  return scanKey({
-    version: XYVALA_VERSION,
-    market: DEFAULT_MARKET,
-    quote,
-    sort: DEFAULT_SORT,
-    order: DEFAULT_ORDER,
-    limit: DEFAULT_LIMIT,
-    q: null,
-  });
-}
-
-function buildStateCacheKey(quote: Quote): string {
-  return `xyvala:state:${XYVALA_VERSION}:quote=${quote}`;
-}
-
-function getStateMemCache(key: string, ttlMs: number): StateServiceResult | null {
-  const entry = mem.get(key);
-  if (!entry) return null;
-
-  if (nowMs() - entry.ts > ttlMs) {
-    mem.delete(key);
+function average(values: number[]): number | null {
+  if (values.length === 0) {
     return null;
   }
 
-  return entry.value;
+  return round2(values.reduce((sum, value) => sum + value, 0) / values.length);
 }
 
-function setStateMemCache(key: string, value: StateServiceResult): void {
-  mem.set(key, {
-    ts: nowMs(),
-    value,
-  });
+/* ============================================================================
+ * 4. CACHE KEYS
+ * ========================================================================== */
+
+function buildStateCacheKey(quote: Quote): string {
+  return `xyvala:state:v=${XYVALA_VERSION}&quote=${quote}`;
 }
 
-function inferLiquidityState(stableRatio: number | null): string | null {
-  if (stableRatio === null) return null;
-  if (stableRatio >= 0.7) return "HIGH";
-  if (stableRatio >= 0.45) return "BALANCED";
-  return "THIN";
-}
+/* ============================================================================
+ * 5. SNAPSHOT READER
+ * ========================================================================== */
 
-function inferVolatilityState(volatileRatio: number | null): string | null {
-  if (volatileRatio === null) return null;
-  if (volatileRatio >= 0.35) return "HIGH";
-  if (volatileRatio >= 0.15) return "MEDIUM";
-  return "LOW";
-}
+export async function readScanSnapshot(
+  quote: Quote,
+): Promise<ScanSnapshotReadResult> {
+  const key = buildCanonicalSnapshotKey(quote);
+  const raw = await getFromCache<unknown>(key);
 
-function inferRiskMode(regime: MarketRegime, volatileRatio: number | null): string | null {
-  if (regime === "STABLE") return "DEFENSIVE";
-  if (regime === "TRANSITION") return "SELECTIVE";
-  if (regime === "VOLATILE") return volatileRatio !== null && volatileRatio >= 0.45 ? "RISK_OFF" : "TACTICAL";
-  return null;
-}
-
-function inferExecutionBias(regime: MarketRegime, stableRatio: number | null): string | null {
-  if (regime === "STABLE") return "MEAN_REVERSION";
-  if (regime === "TRANSITION") return "MIXED";
-  if (regime === "VOLATILE") return stableRatio !== null && stableRatio < 0.25 ? "BREAKOUT" : "FAST_REACTION";
-  return null;
-}
-
-function buildStateFromSnapshot(snapshot: ScanSnapshot): StateServiceState | null {
-  const market_regime = normalizeRegime(snapshot.context?.market_regime);
-  const stable_ratio = safeNum(snapshot.context?.stable_ratio);
-  const transition_ratio = safeNum(snapshot.context?.transition_ratio);
-  const volatile_ratio = safeNum(snapshot.context?.volatile_ratio);
-
-  const hasCoreSignal =
-    market_regime !== null ||
-    stable_ratio !== null ||
-    transition_ratio !== null ||
-    volatile_ratio !== null;
-
-  if (!hasCoreSignal) {
-    return null;
+  if (!isScanSnapshot(raw)) {
+    return {
+      snapshot: null,
+      warnings: ["scan_snapshot_cache_miss_or_invalid"],
+    };
   }
 
   return {
-    market_regime,
-    stable_ratio,
-    transition_ratio,
-    volatile_ratio,
-    liquidity_state: inferLiquidityState(stable_ratio),
-    volatility_state: inferVolatilityState(volatile_ratio),
-    risk_mode: inferRiskMode(market_regime, volatile_ratio),
-    execution_bias: inferExecutionBias(market_regime, stable_ratio),
+    snapshot: raw,
+    warnings: [],
   };
 }
 
+/* ============================================================================
+ * 6. PUBLIC MARKET CONTEXT
+ * ========================================================================== */
+
+function buildStateFromSnapshot(snapshot: ScanSnapshot): StateServiceState | null {
+  const assets = Array.isArray(snapshot.data) ? snapshot.data : [];
+
+  if (assets.length === 0) {
+    return null;
+  }
+
+  const change24hValues: number[] = [];
+  const absoluteChange24hValues: number[] = [];
+
+  const change7dValues: number[] = [];
+  const absoluteChange7dValues: number[] = [];
+
+  let pricedAssetsCount = 0;
+  let volumeAssetsCount = 0;
+  let marketCapAssetsCount = 0;
+
+  for (const asset of assets) {
+    if (isFiniteNumber(asset.price)) {
+      pricedAssetsCount += 1;
+    }
+
+    if (isFiniteNumber(asset.volume_24h)) {
+      volumeAssetsCount += 1;
+    }
+
+    if (isFiniteNumber(asset.market_cap)) {
+      marketCapAssetsCount += 1;
+    }
+
+    if (isFiniteNumber(asset.chg_24h_pct)) {
+      change24hValues.push(asset.chg_24h_pct);
+      absoluteChange24hValues.push(Math.abs(asset.chg_24h_pct));
+    }
+
+    if (isFiniteNumber(asset.chg_7d_pct)) {
+      change7dValues.push(asset.chg_7d_pct);
+      absoluteChange7dValues.push(Math.abs(asset.chg_7d_pct));
+    }
+  }
+
+  return {
+    assets_count: assets.length,
+    priced_assets_count: pricedAssetsCount,
+    volume_assets_count: volumeAssetsCount,
+    market_cap_assets_count: marketCapAssetsCount,
+
+    average_change_24h_pct: average(change24hValues),
+    average_absolute_change_24h_pct: average(absoluteChange24hValues),
+
+    average_change_7d_pct: average(change7dValues),
+    average_absolute_change_7d_pct: average(absoluteChange7dValues),
+  };
+}
+
+/* ============================================================================
+ * 7. RESULT FACTORY
+ * ========================================================================== */
+
 function buildResult(
-  input: Partial<StateServiceResult> & Pick<StateServiceResult, "ts" | "quote">
+  input: Partial<StateServiceResult> & Pick<StateServiceResult, "ts" | "quote">,
 ): StateServiceResult {
   return {
-    ok: Boolean(input.ok),
+    ok: input.ok === true,
     ts: input.ts,
     version: input.version ?? XYVALA_VERSION,
     source: input.source ?? "fallback",
     quote: input.quote,
     state: input.state ?? null,
-    warnings: input.warnings ?? [],
+    warnings: Array.isArray(input.warnings) ? input.warnings : [],
     error: input.error ?? null,
   };
 }
 
+/* ============================================================================
+ * 8. PUBLIC SERVICE
+ * ========================================================================== */
+
 export async function getStateService(
-  input: StateServiceInput = {}
+  input: StateServiceInput = {},
 ): Promise<StateServiceResult> {
   const ts = nowIso();
   const quote = normalizeQuote(input.quote);
@@ -206,7 +252,10 @@ export async function getStateService(
   const stateCacheKey = buildStateCacheKey(quote);
 
   if (!noStore) {
-    const cachedState = getStateMemCache(stateCacheKey, STATE_CACHE_TTL_MS);
+    const cachedState = await getFromCache<StateServiceResult>(
+      stateCacheKey,
+      STATE_CACHE_TTL_MS,
+    );
 
     if (cachedState) {
       return buildResult({
@@ -218,24 +267,20 @@ export async function getStateService(
     }
   }
 
-  const warnings: string[] = [];
-  const snapshotCacheKey = buildSnapshotCacheKey(quote);
-
   let snapshot: ScanSnapshot | null = null;
+  let warnings: string[] = [];
 
   try {
-    const cachedSnapshot = getFromCache<ScanSnapshot>(snapshotCacheKey, SNAPSHOT_TTL_MS);
-    snapshot = cachedSnapshot ?? null;
+    const readResult = await readScanSnapshot(quote);
 
-    if (!snapshot) {
-      warnings.push("scan_snapshot_missing");
-    }
-  } catch (error) {
-    warnings.push(
+    snapshot = readResult.snapshot;
+    warnings = uniqueWarnings(warnings, readResult.warnings);
+  } catch (error: unknown) {
+    warnings = uniqueWarnings(warnings, [
       error instanceof Error && error.message
         ? `scan_snapshot_read_failed:${error.message}`
-        : "scan_snapshot_read_failed"
-    );
+        : "scan_snapshot_read_failed",
+    ]);
   }
 
   if (!snapshot) {
@@ -246,11 +291,11 @@ export async function getStateService(
       source: "fallback",
       state: null,
       warnings,
-      error: "scan_snapshot_missing",
+      error: "scan_snapshot_missing_or_invalid",
     });
 
     if (!noStore) {
-      setStateMemCache(stateCacheKey, fallback);
+      await setToCache(stateCacheKey, fallback, STATE_CACHE_TTL_MS);
     }
 
     return fallback;
@@ -258,42 +303,20 @@ export async function getStateService(
 
   const state = buildStateFromSnapshot(snapshot);
 
-  if (!state) {
-    const degraded = buildResult({
-      ok: false,
-      ts,
-      quote,
-      source: "scan_snapshot",
-      state: null,
-      warnings: uniqueWarnings(warnings, ["state_context_missing_or_invalid"]),
-      error: "state_context_missing_or_invalid",
-    });
-
-    if (!noStore) {
-      setStateMemCache(stateCacheKey, degraded);
-    }
-
-    return degraded;
-  }
-
   const result = buildResult({
-    ok: true,
+    ok: state !== null,
     ts,
     quote,
     source: "scan_snapshot",
     state,
-    warnings,
-    error: null,
+    warnings: state
+      ? warnings
+      : uniqueWarnings(warnings, ["public_market_state_unavailable"]),
+    error: state ? null : "public_market_state_unavailable",
   });
 
   if (!noStore) {
-    setStateMemCache(stateCacheKey, result);
-
-    try {
-      setToCache(`xyvala:state:snapshot:${XYVALA_VERSION}:quote=${quote}`, result);
-    } catch (error) {
-      void error;
-    }
+    await setToCache(stateCacheKey, result, STATE_CACHE_TTL_MS);
   }
 
   return result;

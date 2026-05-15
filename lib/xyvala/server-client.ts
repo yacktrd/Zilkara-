@@ -369,24 +369,33 @@ export async function xyvalaServerFetch<T extends JsonRecord = JsonRecord>(
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const requestHeaders = buildRequestHeaders(internalKey, input.headers, hasBody);
+  const requestHeaders = buildRequestHeaders(
+    internalKey,
+    input.headers,
+    hasBody,
+  );
 
-    const body = hasBody ? JSON.stringify(input.body) : undefined;
+  const body = hasBody ? JSON.stringify(input.body) : null;
 
-    const response = await fetch(finalUrl, {
-      method,
-      headers: requestHeaders,
-      body,
-      cache: cacheMode,
-      signal: controller.signal,
-    });
+  const requestInit: RequestInit = {
+    method,
+    headers: requestHeaders,
+    cache: cacheMode,
+    signal: controller.signal,
+  };
 
-    const contentType = safeStr(response.headers.get("content-type")) || null;
-    const parsed = await parseJsonSafely<T>(response);
+  if (body !== null) {
+    requestInit.body = body;
+  }
 
-    if (parsed.warnings.length > 0) {
-      warnings.push(...parsed.warnings);
-    }
+  const response = await fetch(finalUrl, requestInit);
+
+  const contentType = safeStr(response.headers.get("content-type")) || null;
+  const parsed = await parseJsonSafely<T>(response);
+
+  if (parsed.warnings.length > 0) {
+    warnings.push(...parsed.warnings);
+  }
 
     if (!response.ok) {
       return {

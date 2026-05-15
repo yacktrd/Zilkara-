@@ -27,18 +27,12 @@ export async function POST(req: Request) {
       req.headers.get("x-real-ip") ??
       "";
 
-    // V1: logs (brancher DB ensuite)
-    console.log(
-      JSON.stringify({
-        event: "track",
-        type,
-        symbol,
-        url,
-        ua,
-        ip,
-        at: new Date().toISOString(),
-      })
-    );
+    if (process.env.NODE_ENV === "development") {
+  console.debug("TRACK_EVENT", {
+    type,
+    symbol,
+  });
+}
 
     return NextResponse.json({ ok: true }, { status: 200 });
   } catch {
