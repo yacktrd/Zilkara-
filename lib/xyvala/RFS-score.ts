@@ -66,6 +66,12 @@ import {
   type PatternKind,
 } from "@/lib/xyvala/pattern-core";
 
+import {
+  computeImpulseState,
+  type ImpulseDirectionalBias,
+  type ImpulseTransitionState,
+} from "@/lib/xyvala/engine/impulse-state-core";
+
 /* ============================================================================
  * 1. PUBLIC TYPES
  * ========================================================================== */
@@ -116,6 +122,14 @@ export type RfsScoreResult = {
   market_score: number;
   confidence_score: number;
   coherence_score: number;
+
+  impulse_pressure_score: number;
+  impulse_instability_score: number;
+  impulse_saturation_score: number;
+  impulse_exhaustion_score: number;
+
+  impulse_directional_bias: ImpulseDirectionalBias;
+  impulse_transition_state: ImpulseTransitionState;
 
   occurrence_score: number;
   frequency_score: number;
@@ -1378,10 +1392,43 @@ export function runRFSScore(input: RfsScoreInput): RfsScoreResult {
       Math.min(comparisons.length * 4, 100) * 0.14,
   );
 
+   
+const impulseState = computeImpulseState({
+  current_signature: {
+    slope_pct: currentSignature.slope_pct,
+    amplitude_pct: currentSignature.amplitude_pct,
+    instability_score: currentSignature.instability_score,
+    break_rate: currentSignature.break_rate,
+    duration_score: currentSignature.duration_score,
+  },
+
+  occurrence_score: occurrenceScore,
+  frequency_score: frequencyScore,
+  convergence_score: convergenceScore,
+  correlation_score: correlationScore,
+  duration_score: durationScore,
+
+  rupture_probability: ruptureProbability,
+  rupture_penalty_score: rupturePenaltyScore,
+
+  stability,
+  coherence_score: coherenceScore,
+
+  rolling_7d: rolling7d,
+  rolling_24h: rolling24h,
+});
+
   return {
     stability: round2(stability),
     mid_term_score: round2(midTermScore),
     regime,
+    
+    impulse_pressure_score: impulseState.impulse_pressure_score,
+    impulse_instability_score: impulseState.impulse_instability_score,
+    impulse_saturation_score: impulseState.impulse_saturation_score,
+    impulse_exhaustion_score: impulseState.impulse_exhaustion_score,
+    impulse_directional_bias: impulseState.impulse_directional_bias,
+    impulse_transition_state: impulseState.impulse_transition_state,
 
     structure_score: round2(structureScore),
     market_score: round2(marketScore),
