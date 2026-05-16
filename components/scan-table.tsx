@@ -43,6 +43,9 @@ import {
   type PublicMarketClimate,
   type PublicSparklineContext7D,
   type PublicStructureTransition,
+  type PublicGrowthContext,
+  type PublicCoreStructure,
+  type PublicDecayContext,
 } from "@/lib/xyvala/public/public-structure";
 
 /* ============================================================================
@@ -274,11 +277,17 @@ function ContextBand({
   marketClimate,
   dominantTransition,
   activityContext,
+  growthContext,
+  coreStructure,
+  decayContext,
   assetsCount,
 }: {
   marketClimate: PublicMarketClimate;
   dominantTransition: PublicStructureTransition | "Unavailable";
   activityContext: PublicActivityLabel;
+  growthContext: PublicGrowthContext;
+  coreStructure: PublicCoreStructure;
+  decayContext: PublicDecayContext;
   assetsCount: number;
 }) {
   return (
@@ -297,6 +306,22 @@ function ContextBand({
         <span>Activity</span>
         <strong>{activityContext}</strong>
       </div>
+ 
+      <div className="contextCard">
+        <span>Growth Context</span>
+        <strong>{growthContext}</strong>
+     </div>
+
+      <div className="contextCard">
+        <span>Core Structure</span>
+        <strong>{coreStructure}</strong>
+      </div>
+
+      <div className="contextCard">
+        <span>Decay Context</span>
+        <strong>{decayContext}</strong>
+     </div>
+
 
       <div className="contextCard">
         <span>Assets Read</span>
@@ -511,11 +536,14 @@ export default function ScanTable({
       </header>
 
       <ContextBand
-        marketClimate={structuralSummary.market_climate}
-        dominantTransition={structuralSummary.dominant_transition}
-        activityContext={structuralSummary.activity_context}
-        assetsCount={structuralSummary.assets_count}
-      />
+  marketClimate={structuralSummary.market_climate}
+  dominantTransition={structuralSummary.dominant_transition}
+  activityContext={structuralSummary.activity_context}
+  growthContext={structuralSummary.growth_context}
+  coreStructure={structuralSummary.core_structure}
+  decayContext={structuralSummary.decay_context}
+  assetsCount={structuralSummary.assets_count}
+/>
 
       <div className="toolbar">
         <div className="marketState">

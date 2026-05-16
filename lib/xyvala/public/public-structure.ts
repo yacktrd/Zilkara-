@@ -6,10 +6,10 @@
  *
  * ROLE
  * - derive public descriptive market structure labels from observable data only
- * - centralize public transition, activity and market climate interpretation
+ * - centralize public transition, activity, market climate and Triple Layer context
  * - keep UI components passive and deterministic
  *
- * PARENT FILES
+ * PARENTS
  * - lib/xyvala/contracts/scan-contract.ts
  * - lib/xyvala/services/scan-service.ts
  * - components/scan-table.tsx
@@ -38,17 +38,21 @@
  * - 7D sparkline context
  * - structure transition label
  * - market climate summary
+ * - public Triple Layer context
  *
  * INVARIANTS
  * - null means explicitly unavailable
  * - labels remain descriptive, never prescriptive
  * - no buy / sell / hold semantics
+ * - no predictive wording
+ * - no numerical private scoring
  * - UI must display these values, not rebuild them
  *
  * SENSITIVE ZONES
  * - public/private boundary
  * - legal wording
  * - transition labels must remain non-advisory
+ * - Triple Layer context must remain descriptive and public-safe
  * ========================================================================== */
 
 /* ============================================================================
@@ -83,6 +87,24 @@ export type PublicMarketClimate =
   | "Transitioning Market"
   | "Unavailable";
 
+export type PublicGrowthContext =
+  | "Low"
+  | "Moderate"
+  | "Active"
+  | "Unavailable";
+
+export type PublicCoreStructure =
+  | "Weak"
+  | "Mixed"
+  | "Stable"
+  | "Unavailable";
+
+export type PublicDecayContext =
+  | "Limited"
+  | "Rising"
+  | "Elevated"
+  | "Unavailable";
+
 export type PublicStructureInput = {
   pct_24h: number | null;
   pct_7d: number | null;
@@ -107,6 +129,11 @@ export type PublicMarketStructureSummary = {
   market_climate: PublicMarketClimate;
   dominant_transition: PublicStructureTransition | "Unavailable";
   activity_context: PublicActivityLabel;
+
+  growth_context: PublicGrowthContext;
+  core_structure: PublicCoreStructure;
+  decay_context: PublicDecayContext;
+
   assets_count: number;
   expansion_count: number;
   fragmentation_count: number;
@@ -360,7 +387,80 @@ export function buildPublicStructure(
 }
 
 /* ============================================================================
- * 7. PUBLIC MARKET SUMMARY
+ * 7. PUBLIC TRIPLE LAYER CONTEXT
+ * ----------------------------------------------------------------------------
+ * ROLE
+ * - expose descriptive market context only
+ * - no scoring
+ * - no prediction
+ * - no investment recommendation
+ * ========================================================================== */
+
+export function resolveGrowthContext(
+  assets: readonly PublicMarketStructureAsset[],
+): PublicGrowthContext {
+  if (assets.length === 0) return "Unavailable";
+
+  const expanding = assets.filter(
+    (asset) =>
+      asset.structure_transition === "Expansion Phase" ||
+      asset.structure_transition === "Active Expansion",
+  ).length;
+
+  const ratio = expanding / assets.length;
+
+  if (ratio >= 0.4) return "Active";
+  if (ratio >= 0.18) return "Moderate";
+
+  return "Low";
+}
+
+export function resolveCoreStructure(
+  assets: readonly PublicMarketStructureAsset[],
+): PublicCoreStructure {
+  if (assets.length === 0) return "Unavailable";
+
+  const stable = assets.filter(
+    (asset) =>
+      asset.structure_transition === "Stable Structure" ||
+      asset.structure_transition === "Compression Phase",
+  ).length;
+
+  const neutral = assets.filter(
+    (asset) => asset.structure_transition === "Neutral Structure",
+  ).length;
+
+  const coreRatio = (stable + neutral * 0.5) / assets.length;
+
+  if (coreRatio >= 0.45) return "Stable";
+  if (coreRatio >= 0.2) return "Mixed";
+
+  return "Weak";
+}
+
+export function resolveDecayContext(
+  assets: readonly PublicMarketStructureAsset[],
+): PublicDecayContext {
+  if (assets.length === 0) return "Unavailable";
+
+  const fragmented = assets.filter(
+    (asset) => asset.structure_transition === "Fragmentation Detected",
+  ).length;
+
+  const recovery = assets.filter(
+    (asset) => asset.structure_transition === "Recovery Structure",
+  ).length;
+
+  const decayRatio = (fragmented + recovery * 0.35) / assets.length;
+
+  if (decayRatio >= 0.3) return "Elevated";
+  if (decayRatio >= 0.12) return "Rising";
+
+  return "Limited";
+}
+
+/* ============================================================================
+ * 8. PUBLIC MARKET SUMMARY
  * ========================================================================== */
 
 function countByTransition(
@@ -462,6 +562,11 @@ export function buildPublicMarketStructureSummary(
     market_climate: resolvePublicMarketClimate(assets),
     dominant_transition: resolveDominantTransition(assets),
     activity_context: resolveActivityContext(assets),
+
+    growth_context: resolveGrowthContext(assets),
+    core_structure: resolveCoreStructure(assets),
+    decay_context: resolveDecayContext(assets),
+
     assets_count: assets.length,
     expansion_count: expansionCount,
     fragmentation_count: fragmentationCount,
