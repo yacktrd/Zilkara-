@@ -14,6 +14,8 @@ import { applyQuotaHeaders, trackUsage } from "@/lib/xyvala/usage";
 
 import { getAssetsService } from "@/lib/xyvala/services/assets-service";
 
+import { resolveAccessScope } from "@/lib/xyvala/access/access-resolver";
+
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -115,7 +117,12 @@ export async function GET(req: NextRequest) {
     ]);
   }
 
-  const payload = await getAssetsService(buildAssetsServiceInput(req));
+   const access = resolveAccessScope(auth);
+
+const payload = await getAssetsService({
+  ...buildAssetsServiceInput(req),
+  access,
+});
 
   const responsePayload = {
     ...payload,

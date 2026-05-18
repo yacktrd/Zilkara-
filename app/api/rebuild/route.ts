@@ -193,15 +193,13 @@ function validatePublicAssets(data: unknown[]): {
  * 5. SNAPSHOT HELPERS
  * ========================================================================== */
 
-function buildCanonicalScanCacheKey(
-  quote: Quote,
-): string {
+function buildCanonicalScanCacheKey(quote: Quote): string {
   return scanKey({
     version: XYVALA_SNAPSHOT_VERSION,
     market: DEFAULT_MARKET,
     quote,
-    sort: "price",
-    order: "desc",
+    sort: "rank",
+    order: "asc",
     limit: DEFAULT_LIMIT,
     q: null,
   });
@@ -222,11 +220,11 @@ function buildSnapshotCandidate(input: {
     count: input.data.length,
     data: input.data,
     meta: {
-      limit: DEFAULT_LIMIT,
-      sort: "price",
-      order: "desc",
-      q: null,
-      warnings: input.warnings,
+    limit: DEFAULT_LIMIT,
+    sort: "rank",
+    order: "asc",
+    q: null,
+    warnings: input.warnings,
     },
   };
 }
@@ -334,6 +332,11 @@ export async function GET(req: Request) {
 
     const key =
       buildCanonicalScanCacheKey(quote);
+
+    console.log("[REBUILD] writing snapshot", {
+  key,
+  count: snapshot.data.length,
+});
 
     await setToCache(
       key,

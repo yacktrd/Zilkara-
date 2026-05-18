@@ -5,9 +5,9 @@
  * - Xyvala impulse state core
  *
  * ROLE
- * - measure latent structural impulse pressure from already-computed RFS inputs
- * - describe compression, pressure building, release and exhaustion states
- * - keep impulse reading isolated from RFS orchestration, MCI and public UI
+ * - compute private impulse scores from already-computed structural inputs
+ * - keep impulse scoring isolated from RFS, MCI, calibration, API and UI
+ * - optionally resolve transition state through adaptive impulse policy
  *
  * DIRECTIVES
  * - private analytical engine only
@@ -15,7 +15,7 @@
  * - no API logic
  * - no cache logic
  * - no MCI decision logic
- * - no calibration logic
+ * - no calibration building logic
  * - no public wording
  * - no investment advice
  * - no prediction
@@ -30,6 +30,8 @@
  * - rupture scores
  * - stability / coherence scores
  * - rolling 7D and rolling 24H temporal blocks
+ * - optional Triple Layer contextual scores
+ * - optional adaptive impulse policy
  *
  * OUTPUTS
  * - impulse pressure score
@@ -40,10 +42,12 @@
  * - impulse transition state
  *
  * INVARIANTS
- * - impulse layer does not decide
+ * - impulse layer does not decide market action
  * - impulse layer does not replace stability
  * - impulse layer does not replace rupture
  * - impulse layer reads structural pressure only
+ * - Triple Layer is contextual only
+ * - adaptive policy resolves thresholds only when explicitly provided
  * - all scores are bounded from 0 to 100
  *
  * SENSITIVE ZONES
@@ -52,6 +56,12 @@
  * - false signal perception
  * - overfitting thresholds
  * ========================================================================== */
+
+import {
+  resolveImpulseStateWithAdaptivePolicy,
+  type ImpulseAdaptivePolicy,
+  type ImpulseAdaptiveState,
+} from "@/lib/xyvala/calibration/impulse-adaptive-thresholds";
 
 /* ============================================================================
  * 1. TYPES
@@ -82,6 +92,12 @@ export type ImpulseSignatureInput = {
   duration_score: number;
 };
 
+export type ImpulseTripleLayerContext = {
+  growth_score: number | null;
+  core_score: number | null;
+  decay_score: number | null;
+};
+
 export type ImpulseStateInput = {
   current_signature: ImpulseSignatureInput;
 
@@ -99,6 +115,9 @@ export type ImpulseStateInput = {
 
   rolling_7d: ImpulseTemporalBlock;
   rolling_24h: ImpulseTemporalBlock;
+
+  triple_layer?: ImpulseTripleLayerContext;
+  adaptive_policy?: ImpulseAdaptivePolicy;
 };
 
 export type ImpulseStateResult = {
@@ -142,6 +161,11 @@ function normalizeSignedPctAbs(value: number, multiplier: number): number {
   return clamp(Math.abs(value) * multiplier);
 }
 
+function normalizeNullableScore(value: unknown): number | null {
+  if (!isFiniteNumber(value)) return null;
+  return round2(clamp(value));
+}
+
 function normalizeSignature(
   signature: ImpulseSignatureInput,
 ): ImpulseSignatureInput {
@@ -164,6 +188,26 @@ function normalizeTemporalBlock(
     rupture_score: clamp(block.rupture_score),
     rupture_probability: clamp(block.rupture_probability),
   };
+}
+
+function normalizeTripleLayerContext(
+  context?: ImpulseTripleLayerContext,
+): ImpulseTripleLayerContext {
+  return {
+    growth_score: normalizeNullableScore(context?.growth_score),
+    core_score: normalizeNullableScore(context?.core_score),
+    decay_score: normalizeNullableScore(context?.decay_score),
+  };
+}
+
+function toImpulseTransitionState(
+  state: ImpulseAdaptiveState,
+): ImpulseTransitionState {
+  if (state === "COMPRESSION") return "COMPRESSION";
+  if (state === "PRESSURE_BUILDING") return "PRESSURE_BUILDING";
+  if (state === "RELEASE") return "RELEASE";
+  if (state === "EXHAUSTION") return "EXHAUSTION";
+  return "NEUTRAL";
 }
 
 /* ============================================================================
@@ -196,7 +240,11 @@ export function resolveImpulseDirectionalBias(input: {
 }
 
 /* ============================================================================
- * 4. TRANSITION STATE
+ * 4. STATIC FALLBACK TRANSITION STATE
+ * ----------------------------------------------------------------------------
+ * ROLE
+ * - preserve deterministic fallback behavior when no adaptive policy is provided
+ * - keep legacy compatibility without forcing calibration coupling
  * ========================================================================== */
 
 export function resolveImpulseTransitionState(input: {
@@ -335,13 +383,55 @@ export function computeImpulseExhaustionScore(input: {
 }
 
 /* ============================================================================
- * 6. PUBLIC EXECUTION
+ * 6. ADAPTIVE TRANSITION RESOLUTION
+ * ========================================================================== */
+
+function resolveCalibratedImpulseTransitionState(input: {
+  pressure_score: number;
+  instability_score: number;
+  saturation_score: number;
+  exhaustion_score: number;
+  triple_layer: ImpulseTripleLayerContext;
+  adaptive_policy?: ImpulseAdaptivePolicy;
+  rolling_7d: ImpulseTemporalBlock;
+  rolling_24h: ImpulseTemporalBlock;
+}): ImpulseTransitionState {
+  if (input.adaptive_policy) {
+    return toImpulseTransitionState(
+      resolveImpulseStateWithAdaptivePolicy({
+        pressure_score: input.pressure_score,
+        instability_score: input.instability_score,
+        saturation_score: input.saturation_score,
+        exhaustion_score: input.exhaustion_score,
+
+        growth_score: input.triple_layer.growth_score,
+        core_score: input.triple_layer.core_score,
+        decay_score: input.triple_layer.decay_score,
+
+        policy: input.adaptive_policy,
+      }),
+    );
+  }
+
+  return resolveImpulseTransitionState({
+    pressure_score: input.pressure_score,
+    instability_score: input.instability_score,
+    saturation_score: input.saturation_score,
+    exhaustion_score: input.exhaustion_score,
+    rolling_7d: input.rolling_7d,
+    rolling_24h: input.rolling_24h,
+  });
+}
+
+/* ============================================================================
+ * 7. PUBLIC EXECUTION
  * ========================================================================== */
 
 export function computeImpulseState(input: ImpulseStateInput): ImpulseStateResult {
   const currentSignature = normalizeSignature(input.current_signature);
   const rolling7d = normalizeTemporalBlock(input.rolling_7d);
   const rolling24h = normalizeTemporalBlock(input.rolling_24h);
+  const tripleLayer = normalizeTripleLayerContext(input.triple_layer);
 
   const compressionScore = computeImpulseCompressionScore({
     current_signature: currentSignature,
@@ -385,14 +475,33 @@ export function computeImpulseState(input: ImpulseStateInput): ImpulseStateResul
     rolling_24h: rolling24h,
   });
 
-  const impulseTransitionState = resolveImpulseTransitionState({
-    pressure_score: impulsePressureScore,
-    instability_score: impulseInstabilityScore,
-    saturation_score: impulseSaturationScore,
-    exhaustion_score: impulseExhaustionScore,
-    rolling_7d: rolling7d,
-    rolling_24h: rolling24h,
-  });
+  const transitionInput: {
+  pressure_score: number;
+  instability_score: number;
+  saturation_score: number;
+  exhaustion_score: number;
+  triple_layer: ImpulseTripleLayerContext;
+  adaptive_policy?: ImpulseAdaptivePolicy;
+  rolling_7d: ImpulseTemporalBlock;
+  rolling_24h: ImpulseTemporalBlock;
+} = {
+  pressure_score: impulsePressureScore,
+  instability_score: impulseInstabilityScore,
+  saturation_score: impulseSaturationScore,
+  exhaustion_score: impulseExhaustionScore,
+
+  triple_layer: tripleLayer,
+
+  rolling_7d: rolling7d,
+  rolling_24h: rolling24h,
+};
+
+if (input.adaptive_policy !== undefined) {
+  transitionInput.adaptive_policy = input.adaptive_policy;
+}
+
+const impulseTransitionState =
+  resolveCalibratedImpulseTransitionState(transitionInput);
 
   return {
     impulse_pressure_score: round2(impulsePressureScore),

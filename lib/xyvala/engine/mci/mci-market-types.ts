@@ -1,20 +1,5 @@
 /* ============================================================================
  * FILE: lib/xyvala/engine/mci/mci-market-types.ts
- * ----------------------------------------------------------------------------
- * ROLE
- * - centralize all MCI market types
- * - enforce strict typing across tri-block architecture
- * - expose MCI market output contracts for orchestration and calibration mapping
- *
- * DIRECTIVES
- * - types only
- * - no logic here
- * - no runtime calculation
- * - no adaptive calibration dependency
- * - no UI logic
- * - no API logic
- * - reusable across all MCI modules
- * - source contracts must be explicit
  * ========================================================================== */
 
 import type { RfsMarketResult } from "@/lib/xyvala/engine/rfs-market";
@@ -34,6 +19,13 @@ import type {
 
 export type MarketDecision = "ALLOW" | "WATCH" | "BLOCK";
 
+export type MciMarketStatus =
+  | "VALID"
+  | "PARTIAL"
+  | "DEGRADED"
+  | "INVALID"
+  | "UNAVAILABLE";
+
 export type RunMciMarketInput = {
   rfs: RfsMarketResult;
   behavior?: BehaviorContract | null;
@@ -52,8 +44,21 @@ export type MciExecutionMode =
   | "SNAPSHOT_ONLY";
 
 /* ============================================================================
- * 3. PROBABILITIES
+ * 3. RFS COMPATIBILITY CONTRACTS
  * ========================================================================== */
+
+export type MciMarketRfsScores = {
+  occurrence: number;
+  convergence: number;
+  duration: number;
+  frequency: number;
+  correlation: number;
+
+  stability: number;
+  rupture: number;
+  opportunity: number;
+  confidence: number;
+};
 
 export type MciMarketProbabilities = {
   risk_rupture_probability: number;
@@ -61,6 +66,18 @@ export type MciMarketProbabilities = {
   recovery_probability: number;
   temporal_coherence_probability: number;
   temporal_support_probability: number;
+};
+
+export type MciMarketRfsStates = {
+  regime: "STABLE" | "TRANSITION" | "VOLATILE";
+  rfs_status: MciMarketStatus;
+};
+
+export type MciMarketRfsInput = {
+  scores: MciMarketRfsScores;
+  states: MciMarketRfsStates;
+  probabilities: MciMarketProbabilities;
+  warnings?: string[];
 };
 
 /* ============================================================================
@@ -85,17 +102,57 @@ export type MciMarketRuptureEvolution = {
 };
 
 /* ============================================================================
- * 6. DIAGNOSTICS
+ * 6. IMPULSE PRIVATE EXTENSION
+ * ========================================================================== */
+
+export type MciImpulseDirectionalBias =
+  | "UP"
+  | "DOWN"
+  | "MIXED"
+  | "NEUTRAL";
+
+export type MciImpulseTransitionState =
+  | "COMPRESSION"
+  | "PRESSURE_BUILDING"
+  | "RELEASE"
+  | "EXHAUSTION"
+  | "NEUTRAL";
+
+export type MciImpulseGovernanceState =
+  | "neutral"
+  | "supportive"
+  | "defensive"
+  | "restrictive"
+  | "blocked"
+  | "unavailable";
+
+export type MciMarketImpulseLayer = {
+  impulse_pressure_score: number | null;
+  impulse_instability_score: number | null;
+  impulse_saturation_score: number | null;
+  impulse_exhaustion_score: number | null;
+
+  impulse_directional_bias: MciImpulseDirectionalBias;
+  impulse_transition_state: MciImpulseTransitionState;
+
+  impulse_governance_state: MciImpulseGovernanceState;
+  impulse_validity: ValidityState;
+};
+
+/* ============================================================================
+ * 7. DIAGNOSTICS
  * ========================================================================== */
 
 export type MciMarketDiagnostics = Record<string, number | boolean | string>;
 
 /* ============================================================================
- * 7. MARKET RESULT
+ * 8. MARKET RESULT
  * ========================================================================== */
 
-export type MciMarketResult = MciMarketNeutralization &
-  MciMarketRuptureEvolution & {
+export type MciMarketResult =
+  MciMarketNeutralization &
+  MciMarketRuptureEvolution &
+  Partial<MciMarketImpulseLayer> & {
     decision: MarketDecision;
 
     opportunity_score: number;

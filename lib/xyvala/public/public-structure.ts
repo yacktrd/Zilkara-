@@ -105,6 +105,14 @@ export type PublicDecayContext =
   | "Elevated"
   | "Unavailable";
 
+export type PublicImpulseContext =
+  | "Compression"
+  | "Pressure Building"
+  | "Release"
+  | "Exhaustion"
+  | "Neutral"
+  | "Unavailable";
+
 export type PublicStructureInput = {
   pct_24h: number | null;
   pct_7d: number | null;
@@ -117,12 +125,14 @@ export type PublicStructureResult = {
   activity: PublicActivityLabel;
   sparkline_context_7d: PublicSparklineContext7D;
   structure_transition: PublicStructureTransition;
+  impulse_context: PublicImpulseContext;
 };
 
 export type PublicMarketStructureAsset = {
   activity: PublicActivityLabel;
   sparkline_context_7d: PublicSparklineContext7D;
   structure_transition: PublicStructureTransition;
+  impulse_context: PublicImpulseContext;
 };
 
 export type PublicMarketStructureSummary = {
@@ -133,6 +143,7 @@ export type PublicMarketStructureSummary = {
   growth_context: PublicGrowthContext;
   core_structure: PublicCoreStructure;
   decay_context: PublicDecayContext;
+  impulse_context: PublicImpulseContext;
 
   assets_count: number;
   expansion_count: number;
@@ -162,6 +173,43 @@ function normalizeSparkline(value: unknown): number[] | null {
 
 function abs(value: number | null): number {
   return Math.abs(value ?? 0);
+}
+
+function resolveImpulseContext(
+  assets: readonly PublicMarketStructureAsset[],
+): PublicImpulseContext {
+  if (assets.length === 0) return "Unavailable";
+
+  const counts: Record<PublicImpulseContext, number> = {
+    Compression: 0,
+    "Pressure Building": 0,
+    Release: 0,
+    Exhaustion: 0,
+    Neutral: 0,
+    Unavailable: 0,
+  };
+
+  for (const asset of assets) {
+    counts[asset.impulse_context] += 1;
+  }
+
+  const availableTotal =
+    counts.Compression +
+    counts["Pressure Building"] +
+    counts.Release +
+    counts.Exhaustion +
+    counts.Neutral;
+
+  if (availableTotal === 0) return "Unavailable";
+
+  if (counts.Exhaustion / availableTotal >= 0.3) return "Exhaustion";
+  if (counts.Release / availableTotal >= 0.3) return "Release";
+  if (counts["Pressure Building"] / availableTotal >= 0.3) {
+    return "Pressure Building";
+  }
+  if (counts.Compression / availableTotal >= 0.3) return "Compression";
+
+  return "Neutral";
 }
 
 /* ============================================================================
@@ -362,7 +410,7 @@ export function buildPublicStructure(
     volume_24h: normalizeNullableNumber(input.volume_24h),
     market_cap: normalizeNullableNumber(input.market_cap),
     sparkline_7d: normalizeSparkline(input.sparkline_7d),
-  };
+ };
 
   return {
     activity: resolvePublicActivity({
@@ -383,6 +431,7 @@ export function buildPublicStructure(
       market_cap: normalizedInput.market_cap,
       sparkline_7d: normalizedInput.sparkline_7d,
     }),
+      impulse_context: "Unavailable",
   };
 }
 
@@ -566,6 +615,7 @@ export function buildPublicMarketStructureSummary(
     growth_context: resolveGrowthContext(assets),
     core_structure: resolveCoreStructure(assets),
     decay_context: resolveDecayContext(assets),
+    impulse_context: resolveImpulseContext(assets),
 
     assets_count: assets.length,
     expansion_count: expansionCount,

@@ -29,7 +29,7 @@
 
 import type { ScanAsset } from "@/lib/xyvala/contracts/scan-contract";
 import type { PrivateScanAsset } from "@/lib/xyvala/contracts/scan-private-contract";
-
+import type { PublicImpulseContext } from "@/lib/xyvala/public/public-structure";
 import { buildPublicStructure } from "@/lib/xyvala/public/public-structure";
 
 /* ============================================================================
@@ -61,6 +61,16 @@ function safeNullableNumberArray(value: unknown): number[] | null {
   const numbers = value.filter(isFiniteNumber);
 
   return numbers.length >= 2 ? numbers : null;
+}
+
+function toPublicImpulseContext(value: unknown): PublicImpulseContext {
+  if (value === "COMPRESSION") return "Compression";
+  if (value === "PRESSURE_BUILDING") return "Pressure Building";
+  if (value === "RELEASE") return "Release";
+  if (value === "EXHAUSTION") return "Exhaustion";
+  if (value === "NEUTRAL") return "Neutral";
+
+  return "Unavailable";
 }
 
 /* ============================================================================
@@ -105,6 +115,7 @@ export function privateScanAssetToPublicScanAsset(
     public_activity: publicStructure.activity,
     public_sparkline_context_7d: publicStructure.sparkline_context_7d,
     public_structure_transition: publicStructure.structure_transition,
+    public_impulse_context: toPublicImpulseContext(asset.impulse_transition_state),
 
     rank: safeNullableNumber(asset.rank),
     logo_url: safeNullableString(asset.logo_url),

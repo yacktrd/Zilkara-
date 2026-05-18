@@ -53,7 +53,8 @@ export type AccessCompartment =
   | "public_10"
   | "demo_30"
   | "trader_60"
-  | "full_100";
+  | "full_100"
+  | "admin_100";
 
 /* ============================================================================
  * 2. VISIBLE PERCENT (LOCKED VALUES)

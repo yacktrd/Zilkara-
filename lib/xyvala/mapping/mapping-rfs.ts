@@ -455,7 +455,9 @@ function buildAssetResult(input: {
   const mappingNullPressureScore = scoreNullPressure(input.asset);
   const mappingIdentityScore = scoreIdentity(input.asset);
   const mappingIdentityConvergenceScore = scoreIdentityConvergence(input.asset);
-  const mappingIdentityDurationScore = 100;
+  const mappingIdentityDurationScore = safeStr(input.identity.provider_id)
+  ? 100
+  : 65;
 
   const mappingCollisionScore = input.collisionDetected ? 100 : 0;
   const mappingCriticalMissingScore = scoreCriticalMissing({

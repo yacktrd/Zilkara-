@@ -1,74 +1,14 @@
 /* ============================================================================
  * FILE: lib/xyvala/services/raw-assets-service.ts
- * ----------------------------------------------------------------------------
- * ROLE
- * - load canonical raw assets for Xyvala rebuild pipeline
- * - fetch provider payload from CoinGecko market endpoint
- * - normalize provider payload through provider mapper
- * - validate propagation quality through mapping-rfs and mapping-mci
- * - compute market RFS and market MCI before canonical raw asset propagation
- * - return deterministic rebuild-ready raw assets only
- * - preserve universe continuity through explicit multi-level fallback
- *
- * PARENTS
- * - lib/xyvala/mapping/coingecko-mapper.ts
- * - lib/xyvala/mapping/mapping-rfs.ts
- * - lib/xyvala/mapping/mapping-mci.ts
- * - lib/xyvala/engine/rfs-market.ts
- * - lib/xyvala/engine/mci-market.ts
- * - app/api/rebuild/route.ts
- *
- * DIRECTIVES
- * - no dependency on /api/scan
- * - no dependency on snapshot cache
- * - no dependency on scan-service.ts
- * - EUR remains default quote
- * - deterministic output only
- * - same canonical input => same output shape
- * - explicit failure only if provider source is unavailable or invalid
- * - mapping propagation must remain separated from market decision logic
- * - technical propagation logic must not be exposed as product decision logic
- * - never return an empty universe when valid mapped assets still exist
- * - fallback must remain explicit, auditable and bounded
- * - ranking priority remains: stability > regime > opportunity
- *
- * INPUTS
- * - quote
- *
- * OUTPUTS
- * - RawAssetsResult
- *
- * INVARIANTS
- * - raw-assets-service never calls /api/scan
- * - raw-assets-service never reads snapshot cache
- * - nullable public fields remain nullable
- * - output is suitable for snapshot normalization
- * - technical propagation gating is handled before market decision propagation
- * - degraded fallback never mutates analytical truth already computed
- *
- * CRITICAL DEPENDENCIES
- * - CoinGecko raw market endpoint
- * - coingecko-mapper
- * - mapping-rfs
- * - mapping-mci
- * - rfs-market
- * - mci-market
- *
- * SENSITIVE ZONES
- * - upstream API availability
- * - URL construction
- * - provider payload validation
- * - canonical identity propagation
- * - mapping propagation gating
- * - market decision propagation
- * - fallback ranking and degradation scoring
  * ========================================================================== */
 
 import type { Quote } from "@/lib/xyvala/snapshot";
+
 import {
   mapCoinGeckoAsset,
   type CoinGeckoMappedAsset,
 } from "@/lib/xyvala/mapping/coingecko-mapper";
+
 import { runMappingRfs } from "@/lib/xyvala/mapping/mapping-rfs";
 import { runMappingMci } from "@/lib/xyvala/mapping/mapping-mci";
 import { runRfsMarket } from "@/lib/xyvala/engine/rfs-market";
@@ -130,7 +70,22 @@ type MarketEvaluation = {
   marketMci: ReturnType<typeof runMciMarket>;
 };
 
-type SourceMode = NonNullable<RawAssetsResult["meta"]>["source_mode"];
+type BuildMetaInput = {
+  quote: Quote;
+  sourceMode: NonNullable<RawAssetsResult["meta"]>["source_mode"];
+  fallbackLevel: NonNullable<RawAssetsResult["meta"]>["fallback_level"];
+  degradationScore: number;
+  providerRawCount: number;
+  providerMappedCount: number;
+  mappingRfsCount: number;
+  propagatedCount: number;
+  mappingPropagationDecision: NonNullable<
+    RawAssetsResult["meta"]
+  >["mapping_propagation_decision"];
+  mappingPropagationMode: NonNullable<
+    RawAssetsResult["meta"]
+  >["mapping_propagation_mode"];
+};
 
 /* ============================================================================
  * 2. CONFIG
@@ -141,6 +96,7 @@ const DEFAULT_API_BASE_URL = "https://api.coingecko.com/api/v3";
 const DEFAULT_PER_PAGE = 250;
 const DEFAULT_PAGE = 1;
 const REQUEST_TIMEOUT_MS = 12_000;
+
 const MIN_EMERGENCY_UNIVERSE = 20;
 const MAX_EMERGENCY_UNIVERSE = 50;
 
@@ -159,13 +115,10 @@ function safeUpper(value: unknown, fallback = ""): string {
   return text ? text.toUpperCase() : "";
 }
 
-function safeNumber(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
 function normalizeQuote(value: Quote | string | null | undefined): Quote {
   if (value === "usd") return "usd";
   if (value === "usdt") return "usdt";
+
   return DEFAULT_QUOTE;
 }
 
@@ -173,24 +126,17 @@ function buildAbortSignal(timeoutMs: number): AbortSignal {
   return AbortSignal.timeout(timeoutMs);
 }
 
-function clampScore(value: number): number {
-  if (!Number.isFinite(value)) return 0;
-  if (value < 0) return 0;
-  if (value > 100) return 100;
-  return Math.round(value * 100) / 100;
-}
-
 function uniqueWarnings(
   ...groups: Array<string[] | undefined | null>
 ): string[] {
-  const merged = groups.flatMap((group) => (Array.isArray(group) ? group : []));
-
   return [
     ...new Set(
-      merged.filter(
-        (item): item is string =>
-          typeof item === "string" && item.trim().length > 0,
-      ),
+      groups
+        .flatMap((group) => (Array.isArray(group) ? group : []))
+        .filter(
+          (item): item is string =>
+            typeof item === "string" && item.trim().length > 0,
+        ),
     ),
   ];
 }
@@ -201,6 +147,7 @@ function countWarnings(warnings: string[]): string[] {
   for (const warning of warnings) {
     const key = safeStr(warning);
     if (!key) continue;
+
     counts.set(key, (counts.get(key) ?? 0) + 1);
   }
 
@@ -220,10 +167,19 @@ function normalizeArrayOfNumbers(value: unknown): number[] | null {
   return points.length > 1 ? points : null;
 }
 
+function toNullableNumber(value: number | null | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function mappedMarketCap(mapped: CoinGeckoMappedAsset): number {
+  return toNullableNumber(mapped.market_cap) ?? -1;
+}
+
 function regimeRank(value: "STABLE" | "TRANSITION" | "VOLATILE" | null): number {
   if (value === "STABLE") return 3;
   if (value === "TRANSITION") return 2;
   if (value === "VOLATILE") return 1;
+
   return 0;
 }
 
@@ -231,20 +187,12 @@ function decisionRank(value: "ALLOW" | "WATCH" | "BLOCK" | null): number {
   if (value === "ALLOW") return 3;
   if (value === "WATCH") return 2;
   if (value === "BLOCK") return 1;
+
   return 0;
 }
 
-function toNullableNumber(value: number | null | undefined): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
 /* ============================================================================
- * 4. RAW SOURCE LOADER
- * ----------------------------------------------------------------------------
- * ROLE
- * - load CoinGecko raw market source only
- * - no provider normalization here
- * - no canonical shaping here
+ * 4. PROVIDER LOADER
  * ========================================================================== */
 
 async function fetchCoinGeckoMarkets(quote: Quote): Promise<unknown> {
@@ -252,6 +200,7 @@ async function fetchCoinGeckoMarkets(quote: Quote): Promise<unknown> {
     process.env.COINGECKO_API_BASE_URL,
     DEFAULT_API_BASE_URL,
   );
+
   const apiKey = safeStr(process.env.COINGECKO_API_KEY);
 
   const normalizedBaseUrl = `${baseUrl.replace(/\/+$/, "")}/`;
@@ -287,11 +236,7 @@ async function fetchCoinGeckoMarkets(quote: Quote): Promise<unknown> {
 }
 
 /* ============================================================================
- * 5. CANONICAL BUILDERS
- * ----------------------------------------------------------------------------
- * ROLE
- * - convert analytical outputs into snapshot-ready raw assets
- * - keep market outputs explicit
+ * 5. RAW ASSET BUILDERS
  * ========================================================================== */
 
 function buildBinanceUrl(symbol: string): string {
@@ -317,14 +262,13 @@ function toRawAssetFromEvaluation(
     identity?.symbol,
     safeUpper(mapped.canonical_symbol, "UNKNOWN"),
   );
+
   const id = safeStr(
     identity?.id,
     safeStr(mapped.canonical_id, symbol.toLowerCase()),
   );
-  const name = safeStr(
-    identity?.name,
-    safeStr(mapped.canonical_name, symbol),
-  );
+
+  const name = safeStr(identity?.name, safeStr(mapped.canonical_name, symbol));
 
   const binanceUrl = safeStr(mapped.binance_url) || buildBinanceUrl(symbol);
 
@@ -392,10 +336,6 @@ function toEmergencyRawAsset(mapped: CoinGeckoMappedAsset): RawAsset {
 
 /* ============================================================================
  * 6. MARKET EVALUATION
- * ----------------------------------------------------------------------------
- * ROLE
- * - evaluate each mapped asset through market RFS then market MCI
- * - keep warnings explicit
  * ========================================================================== */
 
 function evaluateMappedAsset(mapped: CoinGeckoMappedAsset): MarketEvaluation {
@@ -419,7 +359,9 @@ function evaluateMappedAsset(mapped: CoinGeckoMappedAsset): MarketEvaluation {
   };
 }
 
-function sortEvaluationsByPriority(items: MarketEvaluation[]): MarketEvaluation[] {
+function sortEvaluationsByPriority(
+  items: MarketEvaluation[],
+): MarketEvaluation[] {
   return [...items].sort((left, right) => {
     const leftStability = toNullableNumber(left.marketRfs.scores.stability) ?? 0;
     const rightStability =
@@ -465,77 +407,11 @@ function sortEvaluationsByPriority(items: MarketEvaluation[]): MarketEvaluation[
   });
 }
 
-function mappedMarketCap(mapped: CoinGeckoMappedAsset): number {
-  return toNullableNumber(mapped.market_cap) ?? -1;
-}
-
 /* ============================================================================
- * 7. DEGRADATION / FALLBACK
- * ----------------------------------------------------------------------------
- * ROLE
- * - quantify degradation explicitly
- * - preserve a usable universe whenever possible
+ * 7. META BUILDER
  * ========================================================================== */
 
-function readMappingReadinessScore(mappingMci: ReturnType<typeof runMappingMci>): number {
-  return clampScore(mappingMci.mapping_readiness_score);
-}
-
-function readPropagationRiskScore(mappingMci: ReturnType<typeof runMappingMci>): number {
-  return clampScore(
-    "propagation_risk_score" in mappingMci &&
-      typeof mappingMci.propagation_risk_score === "number"
-      ? mappingMci.propagation_risk_score
-      : 50,
-  );
-}
-
-function readRiskRuptureScore(mappingMci: ReturnType<typeof runMappingMci>): number {
-  return clampScore(
-    "risk_rupture_score" in mappingMci &&
-      typeof mappingMci.risk_rupture_score === "number"
-      ? mappingMci.risk_rupture_score
-      : 50,
-  );
-}
-
-function computeDegradationScore(input: {
-  providerMappedCount: number;
-  propagatedCount: number;
-  mappingReadinessScore: number;
-  propagationRiskScore: number;
-  riskRuptureScore: number;
-  sourceMode: SourceMode;
-}): number {
-  const coverageRatio =
-    input.providerMappedCount > 0
-      ? (input.propagatedCount / input.providerMappedCount) * 100
-      : 0;
-
-  const modePenalty =
-    input.sourceMode === "FULL" ? 0 : input.sourceMode === "DEGRADED" ? 20 : 40;
-
-  return clampScore(
-    (100 - coverageRatio) * 0.25 +
-      (100 - input.mappingReadinessScore) * 0.25 +
-      input.propagationRiskScore * 0.25 +
-      input.riskRuptureScore * 0.15 +
-      modePenalty * 0.1,
-  );
-}
-
-function buildMeta(input: {
-  quote: Quote;
-  sourceMode: SourceMode;
-  fallbackLevel: 0 | 1 | 2;
-  degradationScore: number;
-  providerRawCount: number;
-  providerMappedCount: number;
-  mappingRfsCount: number;
-  propagatedCount: number;
-  mappingPropagationDecision: "ALLOW" | "WATCH" | "BLOCK";
-  mappingPropagationMode: "FULL" | "DEGRADED" | "BLOCKED";
-}): NonNullable<RawAssetsResult["meta"]> {
+function buildMeta(input: BuildMetaInput): NonNullable<RawAssetsResult["meta"]> {
   return {
     quote: input.quote,
     source_mode: input.sourceMode,
@@ -550,15 +426,51 @@ function buildMeta(input: {
   };
 }
 
+function buildMappingMeta(input: {
+  quote: Quote;
+  mappingMci: ReturnType<typeof runMappingMci>;
+  providerRawCount: number;
+  providerMappedCount: number;
+  mappingRfsCount: number;
+  propagatedCount: number;
+}): NonNullable<RawAssetsResult["meta"]> {
+  return buildMeta({
+    quote: input.quote,
+    sourceMode: input.mappingMci.source_mode,
+    fallbackLevel: input.mappingMci.fallback_level,
+    degradationScore: input.mappingMci.degradation_score,
+    providerRawCount: input.providerRawCount,
+    providerMappedCount: input.providerMappedCount,
+    mappingRfsCount: input.mappingRfsCount,
+    propagatedCount: input.propagatedCount,
+    mappingPropagationDecision: input.mappingMci.mapping_propagation_decision,
+    mappingPropagationMode: input.mappingMci.mapping_propagation_mode,
+  });
+}
+
+function buildEmergencyMeta(input: {
+  quote: Quote;
+  providerRawCount: number;
+  providerMappedCount: number;
+  mappingRfsCount: number;
+  propagatedCount: number;
+}): NonNullable<RawAssetsResult["meta"]> {
+  return buildMeta({
+    quote: input.quote,
+    sourceMode: "EMERGENCY",
+    fallbackLevel: 2,
+    degradationScore: 100,
+    providerRawCount: input.providerRawCount,
+    providerMappedCount: input.providerMappedCount,
+    mappingRfsCount: input.mappingRfsCount,
+    propagatedCount: input.propagatedCount,
+    mappingPropagationDecision: "BLOCK",
+    mappingPropagationMode: "BLOCKED",
+  });
+}
+
 /* ============================================================================
  * 8. PUBLIC API
- * ----------------------------------------------------------------------------
- * ROLE
- * - fetch provider payload
- * - map provider payload through provider-mapper
- * - run mapping-rfs and mapping-mci
- * - propagate canonical raw assets when possible
- * - degrade explicitly instead of returning an empty universe
  * ========================================================================== */
 
 export async function loadRawAssets(
@@ -575,17 +487,12 @@ export async function loadRawAssets(
         data: [],
         warnings: ["coingecko_invalid_root_shape"],
         error: "coingecko_invalid_root_shape",
-        meta: buildMeta({
+        meta: buildEmergencyMeta({
           quote,
-          sourceMode: "EMERGENCY",
-          fallbackLevel: 2,
-          degradationScore: 100,
           providerRawCount: 0,
           providerMappedCount: 0,
           mappingRfsCount: 0,
           propagatedCount: 0,
-          mappingPropagationDecision: "BLOCK",
-          mappingPropagationMode: "BLOCKED",
         }),
       };
     }
@@ -607,17 +514,12 @@ export async function loadRawAssets(
           ["coingecko_provider_mapped_empty"],
         ),
         error: "coingecko_provider_mapped_empty",
-        meta: buildMeta({
+        meta: buildEmergencyMeta({
           quote,
-          sourceMode: "EMERGENCY",
-          fallbackLevel: 2,
-          degradationScore: 100,
           providerRawCount: rawSource.length,
           providerMappedCount: 0,
           mappingRfsCount: 0,
           propagatedCount: 0,
-          mappingPropagationDecision: "BLOCK",
-          mappingPropagationMode: "BLOCKED",
         }),
       };
     }
@@ -675,7 +577,7 @@ export async function loadRawAssets(
       Math.min(MAX_EMERGENCY_UNIVERSE, providerMapped.length),
     );
 
-    const emergencyAssets: RawAsset[] = providerMapped
+    const emergencyAssets = providerMapped
       .slice(0, emergencyUniverseSize)
       .map((mapped) => toEmergencyRawAsset(mapped));
 
@@ -684,22 +586,7 @@ export async function loadRawAssets(
       providerMapped.length - fullyPropagatedAssets.length,
     );
 
-    const mappingReadinessScore = readMappingReadinessScore(mappingMci);
-    const propagationRiskScore = readPropagationRiskScore(mappingMci);
-    const riskRuptureScore = readRiskRuptureScore(mappingMci);
-
-    /**
-     * LEVEL 0 — FULL
-     * - mapping decision ALLOW or WATCH
-     * - canonical propagation produced assets
-     */
-    if (
-      mappingMci.mapping_propagation_decision !== "BLOCK" &&
-      fullyPropagatedAssets.length > 0
-    ) {
-      const sourceMode: SourceMode =
-        mappingMci.mapping_propagation_mode === "FULL" ? "FULL" : "DEGRADED";
-
+    if (mappingMci.propagation_usable && fullyPropagatedAssets.length > 0) {
       return {
         ok: true,
         data: fullyPropagatedAssets,
@@ -716,37 +603,22 @@ export async function loadRawAssets(
             ? [`mapping_degraded_fields:${mappingMci.degraded_fields.join(",")}`]
             : [],
           countWarnings(marketWarningsAccumulator),
-          sourceMode === "DEGRADED" ? ["raw_assets_source_mode_degraded"] : [],
+          mappingMci.source_mode === "DEGRADED"
+            ? ["raw_assets_source_mode_degraded"]
+            : [],
         ),
         error: null,
-        meta: buildMeta({
+        meta: buildMappingMeta({
           quote,
-          sourceMode,
-          fallbackLevel: sourceMode === "FULL" ? 0 : 1,
-          degradationScore: computeDegradationScore({
-            providerMappedCount: providerMapped.length,
-            propagatedCount: fullyPropagatedAssets.length,
-            mappingReadinessScore,
-            propagationRiskScore,
-            riskRuptureScore,
-            sourceMode,
-          }),
+          mappingMci,
           providerRawCount: rawSource.length,
           providerMappedCount: providerMapped.length,
           mappingRfsCount: mappingRfs.assets.length,
           propagatedCount: fullyPropagatedAssets.length,
-          mappingPropagationDecision: mappingMci.mapping_propagation_decision,
-          mappingPropagationMode: mappingMci.mapping_propagation_mode,
         }),
       };
     }
 
-    /**
-     * LEVEL 1 — DEGRADED
-     * - mapping blocked or canonical propagation empty
-     * - but market-level evaluations still exist
-     * - preserve universe continuity with explicit degradation
-     */
     if (degradedAssetsFromEvaluations.length > 0) {
       return {
         ok: true,
@@ -768,33 +640,17 @@ export async function loadRawAssets(
           countWarnings(marketWarningsAccumulator),
         ),
         error: null,
-        meta: buildMeta({
+        meta: buildMappingMeta({
           quote,
-          sourceMode: "DEGRADED",
-          fallbackLevel: 1,
-          degradationScore: computeDegradationScore({
-            providerMappedCount: providerMapped.length,
-            propagatedCount: degradedAssetsFromEvaluations.length,
-            mappingReadinessScore,
-            propagationRiskScore,
-            riskRuptureScore,
-            sourceMode: "DEGRADED",
-          }),
+          mappingMci,
           providerRawCount: rawSource.length,
           providerMappedCount: providerMapped.length,
           mappingRfsCount: mappingRfs.assets.length,
           propagatedCount: degradedAssetsFromEvaluations.length,
-          mappingPropagationDecision: mappingMci.mapping_propagation_decision,
-          mappingPropagationMode: mappingMci.mapping_propagation_mode,
         }),
       };
     }
 
-    /**
-     * LEVEL 2 — EMERGENCY
-     * - analytical propagation unavailable
-     * - keep a minimal universe with neutral WATCH defaults
-     */
     return {
       ok: true,
       data: emergencyAssets,
@@ -808,24 +664,12 @@ export async function loadRawAssets(
         ["raw_assets_fallback_level_2_emergency_universe"],
       ),
       error: null,
-      meta: buildMeta({
+      meta: buildEmergencyMeta({
         quote,
-        sourceMode: "EMERGENCY",
-        fallbackLevel: 2,
-        degradationScore: computeDegradationScore({
-          providerMappedCount: providerMapped.length,
-          propagatedCount: emergencyAssets.length,
-          mappingReadinessScore,
-          propagationRiskScore,
-          riskRuptureScore,
-          sourceMode: "EMERGENCY",
-        }),
         providerRawCount: rawSource.length,
         providerMappedCount: providerMapped.length,
         mappingRfsCount: mappingRfs.assets.length,
         propagatedCount: emergencyAssets.length,
-        mappingPropagationDecision: mappingMci.mapping_propagation_decision,
-        mappingPropagationMode: mappingMci.mapping_propagation_mode,
       }),
     };
   } catch (error) {
@@ -839,17 +683,12 @@ export async function loadRawAssets(
       data: [],
       warnings: uniqueWarnings([`raw_assets_load_failed:${message}`]),
       error: message,
-      meta: buildMeta({
+      meta: buildEmergencyMeta({
         quote,
-        sourceMode: "EMERGENCY",
-        fallbackLevel: 2,
-        degradationScore: 100,
         providerRawCount: 0,
         providerMappedCount: 0,
         mappingRfsCount: 0,
         propagatedCount: 0,
-        mappingPropagationDecision: "BLOCK",
-        mappingPropagationMode: "BLOCKED",
       }),
     };
   }

@@ -126,6 +126,7 @@ export function mapScanItemToAsset(item: PublicScanLike): ScanAsset {
     public_activity: publicStructure.activity,
     public_sparkline_context_7d: publicStructure.sparkline_context_7d,
     public_structure_transition: publicStructure.structure_transition,
+    public_impulse_context: "Unavailable",
 
     rank: safeRank(item.rank),
     logo_url: readLogo(item),

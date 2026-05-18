@@ -9,6 +9,7 @@
  * - normalize unknown scan-like inputs into public-safe market assets
  * - preserve observable market data only
  * - produce public descriptive structure labels from observable fields only
+ * - propagate public-safe impulse context without exposing private scores
  * - prevent scoring, regime, decision, opportunity, confidence, rupture and broker leakage
  *
  * DIRECTIVES
@@ -29,6 +30,7 @@
 
 import type { ScanAsset } from "@/lib/xyvala/contracts/scan-contract";
 import type { PrivateScanAsset } from "@/lib/xyvala/contracts/scan-private-contract";
+import type { PublicImpulseContext } from "@/lib/xyvala/public/public-structure";
 
 import { buildPublicStructure } from "@/lib/xyvala/public/public-structure";
 
@@ -66,6 +68,7 @@ export type ScanTransformerItem = {
   public_activity: ScanAsset["public_activity"];
   public_sparkline_context_7d: ScanAsset["public_sparkline_context_7d"];
   public_structure_transition: ScanAsset["public_structure_transition"];
+  public_impulse_context: ScanAsset["public_impulse_context"];
 
   rank: number | null;
   logo_url: string | null;
@@ -194,7 +197,31 @@ function normalizeNumberArray(value: unknown): number[] | null {
 }
 
 /* ============================================================================
- * 4. RAW FIELD READERS
+ * 4. IMPULSE PUBLIC ADAPTER
+ * ========================================================================== */
+
+function normalizePublicImpulseContext(value: unknown): PublicImpulseContext {
+  if (value === "Compression") return "Compression";
+  if (value === "Pressure Building") return "Pressure Building";
+  if (value === "Release") return "Release";
+  if (value === "Exhaustion") return "Exhaustion";
+  if (value === "Neutral") return "Neutral";
+
+  return "Unavailable";
+}
+
+function toPublicImpulseContext(value: unknown): PublicImpulseContext {
+  if (value === "COMPRESSION") return "Compression";
+  if (value === "PRESSURE_BUILDING") return "Pressure Building";
+  if (value === "RELEASE") return "Release";
+  if (value === "EXHAUSTION") return "Exhaustion";
+  if (value === "NEUTRAL") return "Neutral";
+
+  return normalizePublicImpulseContext(value);
+}
+
+/* ============================================================================
+ * 5. RAW FIELD READERS
  * ========================================================================== */
 
 function readField(
@@ -253,8 +280,18 @@ function readLogo(asset: Record<string, unknown>): string | null {
   );
 }
 
+function readPublicImpulseContext(asset: Record<string, unknown>): PublicImpulseContext {
+  const publicValue = readField(asset, "public_impulse_context", "impulse_context");
+
+  if (publicValue !== undefined) {
+    return normalizePublicImpulseContext(publicValue);
+  }
+
+  return toPublicImpulseContext(readField(asset, "impulse_transition_state"));
+}
+
 /* ============================================================================
- * 5. STRUCTURE ADAPTERS
+ * 6. STRUCTURE ADAPTERS
  * ========================================================================== */
 
 function buildStructureFromAsset(asset: Record<string, unknown>): Structure7D {
@@ -290,7 +327,7 @@ function buildPublicStructureFromValues(input: {
 }
 
 /* ============================================================================
- * 6. PRIVATE -> PUBLIC PROJECTION
+ * 7. PRIVATE -> PUBLIC PROJECTION
  * ========================================================================== */
 
 export function privateScanAssetToPublicScanAsset(
@@ -328,6 +365,7 @@ export function privateScanAssetToPublicScanAsset(
     public_activity: publicStructure.activity,
     public_sparkline_context_7d: publicStructure.sparkline_context_7d,
     public_structure_transition: publicStructure.structure_transition,
+    public_impulse_context: toPublicImpulseContext(asset.impulse_transition_state),
 
     rank: normalizeRank(asset.rank),
     logo_url: normalizeNullableString(asset.logo_url),
@@ -341,7 +379,7 @@ export function privateScanAssetsToPublicScanAssets(
 }
 
 /* ============================================================================
- * 7. PUBLIC TRANSFORMER
+ * 8. PUBLIC TRANSFORMER
  * ========================================================================== */
 
 export function toScanServiceItem(
@@ -419,6 +457,7 @@ export function toScanServiceItem(
     public_activity: publicStructure.activity,
     public_sparkline_context_7d: publicStructure.sparkline_context_7d,
     public_structure_transition: publicStructure.structure_transition,
+    public_impulse_context: readPublicImpulseContext(input),
 
     rank: normalizeRank(readField(input, "rank")),
     logo_url: readLogo(input),
@@ -486,7 +525,7 @@ export function transformScanAssets(input: {
 }
 
 /* ============================================================================
- * 8. CONTRACT BRIDGE HELPERS
+ * 9. CONTRACT BRIDGE HELPERS
  * ========================================================================== */
 
 export function toPublicScanAsset(item: ScanTransformerItem): ScanAsset {
@@ -507,6 +546,7 @@ export function toPublicScanAsset(item: ScanTransformerItem): ScanAsset {
     public_activity: item.public_activity,
     public_sparkline_context_7d: item.public_sparkline_context_7d,
     public_structure_transition: item.public_structure_transition,
+    public_impulse_context: item.public_impulse_context,
 
     rank: item.rank,
     logo_url: item.logo_url,

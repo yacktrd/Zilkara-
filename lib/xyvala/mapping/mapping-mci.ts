@@ -1,50 +1,5 @@
 /* ============================================================================
  * FILE: lib/xyvala/mapping/mapping-mci.ts
- * ----------------------------------------------------------------------------
- * TITLE
- * - Xyvala mapping MCI propagation validator
- *
- * PARENT FILES
- * - lib/xyvala/mapping/mapping-rfs.ts
- * - lib/xyvala/services/raw-assets-service.ts
- *
- * ROLE
- * - validate whether mapping-rfs output is technically exploitable
- * - produce explicit propagation decision for raw asset construction
- * - separate mapping propagation quality from market opportunity logic
- * - keep BLOCK rare and reserved for broken technical coherence
- *
- * DIRECTIVES
- * - no provider parsing here
- * - no route logic here
- * - no snapshot shaping here
- * - no public product decision here
- * - no market opportunity logic here
- * - no reconstruction of mapping-rfs values
- * - same RFS input => same MCI output
- * - WATCH is the default degraded propagation state
- * - BLOCK only when technical propagation is critically broken
- *
- * INPUTS
- * - MappingRfsResult
- *
- * OUTPUTS
- * - MappingMciResult
- *
- * INVARIANTS
- * - technical readiness and market opportunity remain separated
- * - confidence remains secondary
- * - every decision has explicit warnings or blocking reasons
- * - score range stays in [0,100]
- *
- * CRITICAL DEPENDENCIES
- * - lib/xyvala/mapping/mapping-rfs.ts
- *
- * SENSITIVE ZONES
- * - propagation gating
- * - degraded field handling
- * - blocking reasons
- * - WATCH / ALLOW / BLOCK distribution
  * ========================================================================== */
 
 import type { MappingRfsResult } from "@/lib/xyvala/mapping/mapping-rfs";
@@ -55,6 +10,9 @@ import type { MappingRfsResult } from "@/lib/xyvala/mapping/mapping-rfs";
 
 export type MappingPropagationDecision = "ALLOW" | "WATCH" | "BLOCK";
 export type MappingPropagationMode = "FULL" | "DEGRADED" | "BLOCKED";
+
+export type MappingSourceMode = "FULL" | "DEGRADED" | "EMERGENCY";
+export type MappingFallbackLevel = 0 | 1 | 2;
 
 export type MappingDominanceState =
   | "READINESS_DOMINANT"
@@ -82,6 +40,11 @@ export type MappingMciResult = {
   mapping_propagation_decision: MappingPropagationDecision;
   mapping_propagation_mode: MappingPropagationMode;
 
+  source_mode: MappingSourceMode;
+  fallback_level: MappingFallbackLevel;
+  degradation_score: number;
+  propagation_usable: boolean;
+
   mapping_readiness_score: number;
   mapping_convergence_score: number;
   mapping_confidence_score: number;
@@ -100,34 +63,31 @@ export type MappingMciResult = {
 };
 
 /* ============================================================================
- * 2. DATA PROCESSING — SAFE HELPERS
+ * 2. SAFE HELPERS
  * ========================================================================== */
 
 function clampScore(value: number): number {
   if (!Number.isFinite(value)) return 0;
-  if (value < 0) return 0;
-  if (value > 100) return 100;
-
-  return Math.round(value * 100) / 100;
+  return Math.round(Math.max(0, Math.min(100, value)) * 100) / 100;
 }
 
 function uniqueWarnings(
   ...groups: Array<string[] | undefined | null>
 ): string[] {
-  const merged = groups.flatMap((group) => (Array.isArray(group) ? group : []));
-
   return [
     ...new Set(
-      merged.filter(
-        (item): item is string =>
-          typeof item === "string" && item.trim().length > 0,
-      ),
+      groups
+        .flatMap((group) => (Array.isArray(group) ? group : []))
+        .filter(
+          (item): item is string =>
+            typeof item === "string" && item.trim().length > 0,
+        ),
     ),
   ];
 }
 
 /* ============================================================================
- * 3. DATA PROCESSING — SIGNAL EXTRACTION
+ * 3. SIGNAL EXTRACTION
  * ========================================================================== */
 
 function buildSignals(rfs: MappingRfsResult): MappingSignals {
@@ -152,7 +112,7 @@ function buildSignals(rfs: MappingRfsResult): MappingSignals {
 }
 
 /* ============================================================================
- * 4. DECISION — SCORING ENGINE
+ * 4. SCORING
  * ========================================================================== */
 
 function computeMappingConvergenceScore(signals: MappingSignals): number {
@@ -261,7 +221,7 @@ function computeDominance(input: {
 }
 
 /* ============================================================================
- * 5. DECISION — DEGRADATION AND BLOCKING
+ * 5. DEGRADATION / BLOCKING
  * ========================================================================== */
 
 function buildDegradedFields(signals: MappingSignals): string[] {
@@ -356,6 +316,10 @@ function buildHardBlockingReasons(input: {
   return reasons;
 }
 
+/* ============================================================================
+ * 6. PROPAGATION GOVERNANCE
+ * ========================================================================== */
+
 function resolveDecision(input: {
   rfs: MappingRfsResult;
   signals: MappingSignals;
@@ -423,8 +387,50 @@ function resolveDecision(input: {
   };
 }
 
+function resolveSourceMode(input: {
+  decision: MappingPropagationDecision;
+  mode: MappingPropagationMode;
+}): MappingSourceMode {
+  if (input.decision === "ALLOW" && input.mode === "FULL") return "FULL";
+
+  if (input.decision === "BLOCK" || input.mode === "BLOCKED") {
+    return "EMERGENCY";
+  }
+
+  return "DEGRADED";
+}
+
+function resolveFallbackLevel(sourceMode: MappingSourceMode): MappingFallbackLevel {
+  if (sourceMode === "FULL") return 0;
+  if (sourceMode === "DEGRADED") return 1;
+  return 2;
+}
+
+function computeDegradationScore(input: {
+  readinessScore: number;
+  confidenceScore: number;
+  propagationRiskScore: number;
+  riskRuptureScore: number;
+  degradedFieldsCount: number;
+  blockingReasonsCount: number;
+  sourceMode: MappingSourceMode;
+}): number {
+  const modePenalty =
+    input.sourceMode === "FULL" ? 0 : input.sourceMode === "DEGRADED" ? 20 : 45;
+
+  return clampScore(
+    (100 - input.readinessScore) * 0.25 +
+      (100 - input.confidenceScore) * 0.18 +
+      input.propagationRiskScore * 0.24 +
+      input.riskRuptureScore * 0.18 +
+      Math.min(input.degradedFieldsCount * 4, 20) * 0.08 +
+      Math.min(input.blockingReasonsCount * 12, 36) * 0.04 +
+      modePenalty * 0.03,
+  );
+}
+
 /* ============================================================================
- * 6. EXECUTION — PUBLIC API
+ * 7. EXECUTION
  * ========================================================================== */
 
 export function runMappingMci(rfs: MappingRfsResult): MappingMciResult {
@@ -479,9 +485,31 @@ export function runMappingMci(rfs: MappingRfsResult): MappingMciResult {
     hardBlockingReasons,
   });
 
+  const sourceMode = resolveSourceMode({
+    decision: resolved.decision,
+    mode: resolved.mode,
+  });
+
+  const fallbackLevel = resolveFallbackLevel(sourceMode);
+
+  const degradationScore = computeDegradationScore({
+    readinessScore: mappingReadinessScore,
+    confidenceScore: mappingConfidenceScore,
+    propagationRiskScore,
+    riskRuptureScore,
+    degradedFieldsCount: degradedFields.length,
+    blockingReasonsCount: hardBlockingReasons.length,
+    sourceMode,
+  });
+
   return {
     mapping_propagation_decision: resolved.decision,
     mapping_propagation_mode: resolved.mode,
+
+    source_mode: sourceMode,
+    fallback_level: fallbackLevel,
+    degradation_score: degradationScore,
+    propagation_usable: resolved.decision !== "BLOCK",
 
     mapping_readiness_score: mappingReadinessScore,
     mapping_convergence_score: mappingConvergenceScore,

@@ -46,6 +46,7 @@ import {
   type PublicGrowthContext,
   type PublicCoreStructure,
   type PublicDecayContext,
+  type PublicImpulseContext,
 } from "@/lib/xyvala/public/public-structure";
 
 /* ============================================================================
@@ -81,6 +82,7 @@ type Asset = {
   activity: PublicActivityLabel;
   sparklineContext7D: PublicSparklineContext7D;
   transition: PublicStructureTransition;
+  impulseContext: PublicImpulseContext;
 };
 
 type Props = {
@@ -93,6 +95,7 @@ type MarketSummaryInput = {
   activity: PublicActivityLabel;
   sparkline_context_7d: PublicSparklineContext7D;
   structure_transition: PublicStructureTransition;
+  impulse_context: PublicImpulseContext;
 };
 
 /* ============================================================================
@@ -182,6 +185,7 @@ function normalizeAsset(input: AssetInput): Asset {
     activity: publicStructure.activity,
     sparklineContext7D: publicStructure.sparkline_context_7d,
     transition: publicStructure.structure_transition,
+    impulseContext: publicStructure.impulse_context,
   };
 }
 
@@ -271,26 +275,45 @@ function formatRank(value: number | null, fallback: number): string {
 
 /* ============================================================================
  * 7. VIEW COMPONENTS
+ * ----------------------------------------------------------------------------
+ * ROLE
+ * - render passive public structural market perception
+ * - expose descriptive structural context only
+ * - preserve deterministic rendering consistency
+ *
+ * DIRECTIVES
+ * - no private score exposure
+ * - no RFS recomputation
+ * - no MCI recomputation
+ * - no calibration exposure
+ * - no local structural reconstruction
+ * - no hidden analytical derivation
+ * - sparkline remains contextual only
+ * - desktop and mobile share the same public source
+ * - dynamic refresh affects observable values only
  * ========================================================================== */
 
 function ContextBand({
   marketClimate,
   dominantTransition,
-  activityContext,
   growthContext,
   coreStructure,
   decayContext,
+  pulseContext,
+  activityContext,
   assetsCount,
 }: {
   marketClimate: PublicMarketClimate;
   dominantTransition: PublicStructureTransition | "Unavailable";
-  activityContext: PublicActivityLabel;
   growthContext: PublicGrowthContext;
   coreStructure: PublicCoreStructure;
   decayContext: PublicDecayContext;
+  pulseContext: PublicImpulseContext;
+  activityContext: PublicActivityLabel;
   assetsCount: number;
-}) {
-  return (
+}) { 
+
+ return (
     <div className="contextBand">
       <div className="contextCard contextCardMain">
         <span>Market Climate</span>
@@ -306,11 +329,11 @@ function ContextBand({
         <span>Activity</span>
         <strong>{activityContext}</strong>
       </div>
- 
+
       <div className="contextCard">
         <span>Growth Context</span>
         <strong>{growthContext}</strong>
-     </div>
+      </div>
 
       <div className="contextCard">
         <span>Core Structure</span>
@@ -320,8 +343,12 @@ function ContextBand({
       <div className="contextCard">
         <span>Decay Context</span>
         <strong>{decayContext}</strong>
-     </div>
+      </div>
 
+      <div className="contextCard">
+        <span>Pulse Context</span>
+        <strong>{pulseContext}</strong>
+      </div>
 
       <div className="contextCard">
         <span>Assets Read</span>
@@ -347,7 +374,7 @@ function TransitionPanel({ assets }: { assets: Asset[] }) {
             </div>
 
             <div className="transitionCardSpark">
-              <Sparkline data={asset.sparkline} />
+              <Sparkline data={asset.sparkline} animated />
             </div>
 
             <div>
@@ -395,19 +422,28 @@ function DesktopMarketTable({
                 <div>{asset.name}</div>
               </td>
 
-              <td>{formatPrice(asset.price, quote)}</td>
+              <td className="dynamicPrice">
+                {formatPrice(asset.price, quote)}
+              </td>
 
-              <td className={resolveValueClass(asset.pct24h)}>
+              <td className={`dynamicPct24h ${resolveValueClass(asset.pct24h)}`}>
                 {formatPct(asset.pct24h)}
               </td>
 
               <td>
-                <Sparkline data={asset.sparkline} />
+                <Sparkline data={asset.sparkline} animated />
               </td>
 
               <td>{asset.activity}</td>
-              <td>{formatCompactCurrency(asset.volume24h, quote)}</td>
-              <td>{formatCompactCurrency(asset.marketCap, quote)}</td>
+
+              <td>
+                {formatCompactCurrency(asset.volume24h, quote)}
+              </td>
+
+              <td>
+                {formatCompactCurrency(asset.marketCap, quote)}
+              </td>
+
               <td>{asset.transition}</td>
             </tr>
           ))}
@@ -436,15 +472,18 @@ function MobileMarketCards({
             </div>
 
             <div className="mobileAssetPrice">
-              <strong>{formatPrice(asset.price, quote)}</strong>
-              <span className={resolveValueClass(asset.pct24h)}>
+              <strong className="dynamicPrice">
+                {formatPrice(asset.price, quote)}
+              </strong>
+
+              <span className={`dynamicPct24h ${resolveValueClass(asset.pct24h)}`}>
                 {formatPct(asset.pct24h)}
               </span>
             </div>
           </div>
 
           <div className="mobileSparkline">
-            <Sparkline data={asset.sparkline} />
+            <Sparkline data={asset.sparkline} animated />
           </div>
 
           <div className="mobileAssetMeta">
@@ -460,12 +499,16 @@ function MobileMarketCards({
 
             <div>
               <span>Volume</span>
-              <strong>{formatCompactCurrency(asset.volume24h, quote)}</strong>
+              <strong>
+                {formatCompactCurrency(asset.volume24h, quote)}
+              </strong>
             </div>
 
             <div>
               <span>Market Cap</span>
-              <strong>{formatCompactCurrency(asset.marketCap, quote)}</strong>
+              <strong>
+                {formatCompactCurrency(asset.marketCap, quote)}
+              </strong>
             </div>
           </div>
         </article>
@@ -514,6 +557,7 @@ export default function ScanTable({
       activity: asset.activity,
       sparkline_context_7d: asset.sparklineContext7D,
       structure_transition: asset.transition,
+      impulse_context: asset.impulseContext,
     }));
 
     return buildPublicMarketStructureSummary(summaryInput);
@@ -543,6 +587,7 @@ export default function ScanTable({
   coreStructure={structuralSummary.core_structure}
   decayContext={structuralSummary.decay_context}
   assetsCount={structuralSummary.assets_count}
+  pulseContext={structuralSummary.impulse_context}
 />
 
       <div className="toolbar">

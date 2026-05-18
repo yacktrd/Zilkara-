@@ -7,6 +7,8 @@ import type { Quote } from "@/lib/xyvala/snapshot";
 import type {
   PrivateCalibrationStatus,
   PrivateDecisionStatus,
+  PrivateImpulseDirectionalBias,
+  PrivateImpulseTransitionState,
   PrivateNeutralizationReason,
   PrivateNeutralizationSeverity,
   PrivateRuptureEvolutionState,
@@ -69,6 +71,17 @@ export type BuildPrivateScanAssetInput = {
   growth_layer_score?: unknown;
   core_pattern_score?: unknown;
   decay_score?: unknown;
+  growth_status?: unknown;
+  core_status?: unknown;
+  decay_status?: unknown;
+
+  impulse_pressure_score?: unknown;
+  impulse_instability_score?: unknown;
+  impulse_saturation_score?: unknown;
+  impulse_exhaustion_score?: unknown;
+  impulse_directional_bias?: unknown;
+  impulse_transition_state?: unknown;
+  impulse_status?: unknown;
 
   neutralized?: unknown;
   neutralization_reason?: unknown;
@@ -112,8 +125,8 @@ function safeString(value: unknown, fallback = ""): string {
 }
 
 function safeNullableString(value: unknown): string | null {
-  const valueString = safeString(value);
-  return valueString.length > 0 ? valueString : null;
+  const text = safeString(value);
+  return text.length > 0 ? text : null;
 }
 
 function safeNullableNumber(value: unknown): number | null {
@@ -164,7 +177,10 @@ function normalizeQuote(value: unknown): Quote {
   return "eur";
 }
 
-function normalizeScanStatus(value: unknown, score?: number | null): PrivateScanStatus {
+function normalizeScanStatus(
+  value: unknown,
+  score?: number | null,
+): PrivateScanStatus {
   if (value === "computed") return "computed";
   if (value === "partial") return "partial";
   if (value === "degraded") return "degraded";
@@ -219,6 +235,27 @@ function normalizeTripleLayerState(value: unknown): PrivateTripleLayerState {
   return "unknown";
 }
 
+function normalizeImpulseDirectionalBias(
+  value: unknown,
+): PrivateImpulseDirectionalBias {
+  if (value === "UP") return "UP";
+  if (value === "DOWN") return "DOWN";
+  if (value === "MIXED") return "MIXED";
+
+  return "NEUTRAL";
+}
+
+function normalizeImpulseTransitionState(
+  value: unknown,
+): PrivateImpulseTransitionState {
+  if (value === "COMPRESSION") return "COMPRESSION";
+  if (value === "PRESSURE_BUILDING") return "PRESSURE_BUILDING";
+  if (value === "RELEASE") return "RELEASE";
+  if (value === "EXHAUSTION") return "EXHAUSTION";
+
+  return "NEUTRAL";
+}
+
 function normalizeNeutralizationReason(
   value: unknown,
 ): PrivateNeutralizationReason {
@@ -227,7 +264,9 @@ function normalizeNeutralizationReason(
   if (value === "unstable_distribution") return "unstable_distribution";
   if (value === "excessive_decay") return "excessive_decay";
   if (value === "excessive_rupture") return "excessive_rupture";
-  if (value === "invalid_temporal_alignment") return "invalid_temporal_alignment";
+  if (value === "invalid_temporal_alignment") {
+    return "invalid_temporal_alignment";
+  }
   if (value === "low_confidence") return "low_confidence";
   if (value === "degraded_snapshot") return "degraded_snapshot";
   if (value === "corrupted_distribution") return "corrupted_distribution";
@@ -265,7 +304,9 @@ function normalizeCalibrationSource(
   return "fallback";
 }
 
-function normalizeCrashState(value: unknown): "NONE" | "RISING" | "CRASH" | "UNKNOWN" {
+function normalizeCrashState(
+  value: unknown,
+): "NONE" | "RISING" | "CRASH" | "UNKNOWN" {
   if (value === "NONE") return "NONE";
   if (value === "RISING") return "RISING";
   if (value === "CRASH") return "CRASH";
@@ -273,7 +314,9 @@ function normalizeCrashState(value: unknown): "NONE" | "RISING" | "CRASH" | "UNK
   return "UNKNOWN";
 }
 
-function normalizeTimingState(value: unknown): "GOOD" | "NEUTRAL" | "BAD" | "UNKNOWN" {
+function normalizeTimingState(
+  value: unknown,
+): "GOOD" | "NEUTRAL" | "BAD" | "UNKNOWN" {
   if (value === "GOOD") return "GOOD";
   if (value === "BAD") return "BAD";
   if (value === "NEUTRAL") return "NEUTRAL";
@@ -298,15 +341,28 @@ function normalizeTemporalBlock(value: unknown) {
       ? (value as TemporalInput)
       : {};
 
+  const stabilityScore = normalizeScore(input.stability_score);
+  const ruptureScore = normalizeScore(input.rupture_score);
+  const ruptureProbability = normalizeScore(input.rupture_probability);
+  const priceScore = normalizeScore(input.price_score);
+
   return {
-    price_score: normalizeScore(input.price_score),
+    price_score: priceScore,
     change_pct: safeNullableNumber(input.change_pct),
     slope_pct: safeNullableNumber(input.slope_pct),
-    stability_score: normalizeScore(input.stability_score),
-    rupture_score: normalizeScore(input.rupture_score),
-    rupture_probability: normalizeScore(input.rupture_probability),
-    status: normalizeScanStatus(input.status),
+    stability_score: stabilityScore,
+    rupture_score: ruptureScore,
+    rupture_probability: ruptureProbability,
+    status: normalizeScanStatus(input.status, priceScore),
   };
+}
+
+function normalizeSource(value: unknown): "scan" | "snapshot" | "runtime" | "fallback" {
+  if (value === "snapshot") return "snapshot";
+  if (value === "runtime") return "runtime";
+  if (value === "fallback") return "fallback";
+
+  return "scan";
 }
 
 export function buildPrivateScanAsset(
@@ -318,6 +374,19 @@ export function buildPrivateScanAsset(
   const stabilityScore = normalizeScore(input.stability_score);
   const opportunityScore = normalizeScore(input.opportunity_score);
   const confidenceScore = normalizeScore(input.confidence_score);
+
+  const growthScore = normalizeScore(
+    input.growth_score ?? input.growth_layer_score,
+  );
+  const corePatternScore = normalizeScore(input.core_pattern_score);
+  const decayScore = normalizeScore(input.decay_score);
+
+  const impulsePressureScore = normalizeScore(input.impulse_pressure_score);
+  const impulseInstabilityScore = normalizeScore(
+    input.impulse_instability_score,
+  );
+  const impulseSaturationScore = normalizeScore(input.impulse_saturation_score);
+  const impulseExhaustionScore = normalizeScore(input.impulse_exhaustion_score);
 
   return {
     id: safeString(input.id, symbol.toLowerCase()),
@@ -345,7 +414,7 @@ export function buildPrivateScanAsset(
     convergence_score: normalizeScore(input.convergence_score),
     duration_score: normalizeScore(input.duration_score),
     evolution_score: normalizeScore(input.evolution_score),
-    growth_layer_score: normalizeScore(input.growth_layer_score),
+    growth_score: growthScore,
 
     rupture_score: normalizeScore(input.rupture_score),
     rupture_probability: normalizeScore(input.rupture_probability),
@@ -370,12 +439,26 @@ export function buildPrivateScanAsset(
     timing_state: normalizeTimingState(input.timing_state),
 
     state: normalizeTripleLayerState(input.triple_layer_state),
-    growth_score: normalizeScore(input.growth_layer_score),
-    core_pattern_score: normalizeScore(input.core_pattern_score),
-    decay_score: normalizeScore(input.decay_score),
-    growth_status: normalizeScanStatus(input.growth_layer_score),
-    core_status: normalizeScanStatus(input.core_pattern_score),
-    decay_status: normalizeScanStatus(input.decay_score),
+    core_pattern_score: corePatternScore,
+    decay_score: decayScore,
+    growth_status: normalizeScanStatus(input.growth_status, growthScore),
+    core_status: normalizeScanStatus(input.core_status, corePatternScore),
+    decay_status: normalizeScanStatus(input.decay_status, decayScore),
+
+    impulse_pressure_score: impulsePressureScore,
+    impulse_instability_score: impulseInstabilityScore,
+    impulse_saturation_score: impulseSaturationScore,
+    impulse_exhaustion_score: impulseExhaustionScore,
+    impulse_directional_bias: normalizeImpulseDirectionalBias(
+      input.impulse_directional_bias,
+    ),
+    impulse_transition_state: normalizeImpulseTransitionState(
+      input.impulse_transition_state,
+    ),
+    impulse_status: normalizeScanStatus(
+      input.impulse_status,
+      impulsePressureScore,
+    ),
 
     neutralized: input.neutralized === true,
     neutralization_reason: normalizeNeutralizationReason(
@@ -408,13 +491,8 @@ export function buildPrivateScanAsset(
 
     governance: {
       analytical_version: safeString(input.analytical_version, "v1"),
-      generated_at: safeString(input.generated_at, new Date().toISOString()),
-      source:
-        input.source === "snapshot" ||
-        input.source === "runtime" ||
-        input.source === "fallback"
-          ? input.source
-          : "scan",
+      generated_at: safeString(input.generated_at, new Date(0).toISOString()),
+      source: normalizeSource(input.source),
       warnings: normalizeWarnings(input.warnings),
       deterministic: true,
       jurisdiction: "FR/EU",

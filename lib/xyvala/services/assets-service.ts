@@ -1,38 +1,8 @@
 /* ============================================================================
  * FILE: lib/xyvala/services/assets-service.ts
- * ----------------------------------------------------------------------------
- * TITLE
- * - Xyvala public assets service
- *
- * ROLE
- * - orchestrate public assets loading
- * - apply deterministic public query pipeline
- * - build contract-safe public assets responses
- *
- * PARENTS
- * - lib/xyvala/assets/assets-provider.ts
- * - lib/xyvala/assets/assets-query.ts
- * - lib/xyvala/assets/assets-builder.ts
- * - lib/xyvala/assets/assets-cache.ts
- * - lib/xyvala/assets/assets-contract.ts
- *
- * DIRECTIVES
- * - service orchestration only
- * - public descriptive assets only
- * - EUR is the default quote
- * - no route logic
- * - no provider internals
- * - no cache internals
- * - no UI logic
- * - no RFS recomputation
- * - no MCI recomputation
- * - no regime exposure
- * - no decision exposure
- * - no opportunity exposure
- * - no stability score exposure
- * - no broker / affiliate exposure
- * - deterministic output only
  * ========================================================================== */
+
+import type { AccessScope } from "@/lib/xyvala/access/access-types";
 
 import {
   buildAssetsCacheKey,
@@ -46,27 +16,31 @@ import {
   type AssetsResponse,
 } from "@/lib/xyvala/assets/assets-builder";
 
-import {
-  loadAssetsProvider,
-} from "@/lib/xyvala/assets/assets-provider";
+import { loadAssetsProvider } from "@/lib/xyvala/assets/assets-provider";
 
 import {
   normalizeAssetsParams,
   queryAssets,
 } from "@/lib/xyvala/assets/assets-query";
 
-import type {
-  AssetsServiceInput,
-} from "@/lib/xyvala/assets/assets-contract";
+import type { AssetsServiceInput } from "@/lib/xyvala/assets/assets-contract";
 
 /* ============================================================================
- * 1. CONFIG
+ * 1. TYPES
+ * ========================================================================== */
+
+export type GetAssetsServiceInput = AssetsServiceInput & {
+  access?: AccessScope | null;
+};
+
+/* ============================================================================
+ * 2. CONFIG
  * ========================================================================== */
 
 const CACHE_TTL_MS = 30_000;
 
 /* ============================================================================
- * 2. SAFE HELPERS
+ * 3. SAFE HELPERS
  * ========================================================================== */
 
 function uniqueWarnings(
@@ -84,29 +58,61 @@ function uniqueWarnings(
   ];
 }
 
+function resolveEffectiveLimit(input: {
+  requestedLimit: number | null;
+  access: AccessScope | null | undefined;
+}): number | null {
+  const accessLimit = input.access?.maxAssets ?? null;
+
+  if (accessLimit === null) {
+    return input.requestedLimit;
+  }
+
+  if (input.requestedLimit === null) {
+    return accessLimit;
+  }
+
+  return Math.min(input.requestedLimit, accessLimit);
+}
+
+function buildAccessWarnings(access: AccessScope | null | undefined): string[] {
+  if (!access) return [];
+
+  return [
+    `assets_access_compartment:${access.compartment}`,
+    `assets_access_max_assets:${access.maxAssets}`,
+  ];
+}
+
 /* ============================================================================
- * 3. PUBLIC SERVICE
+ * 4. PUBLIC SERVICE
  * ========================================================================== */
 
 export async function getAssetsService(
-  input: AssetsServiceInput = {},
+  input: GetAssetsServiceInput = {},
 ): Promise<AssetsResponse> {
   const params = normalizeAssetsParams(input);
+
+  const effectiveLimit = resolveEffectiveLimit({
+    requestedLimit: params.limit,
+    access: input.access,
+  });
+
+   const resolvedLimit = effectiveLimit ?? params.limit ?? 0;
+
+  const accessWarnings = buildAccessWarnings(input.access);
 
   const cacheKey = buildAssetsCacheKey({
     quote: params.quote,
     q: params.q,
     sort: params.sort,
     order: params.order,
-    limit: params.limit,
+    limit: resolvedLimit,
     cursor: params.cursor,
   });
 
   if (!params.noStore) {
-    const cached = getAssetsCache<AssetsResponse>(
-      cacheKey,
-      CACHE_TTL_MS,
-    );
+    const cached = getAssetsCache<AssetsResponse>(cacheKey, CACHE_TTL_MS);
 
     if (cached) {
       return {
@@ -115,6 +121,7 @@ export async function getAssetsService(
         meta: {
           ...cached.meta,
           cache: "hit",
+          warnings: uniqueWarnings(cached.meta.warnings, accessWarnings),
         },
       };
     }
@@ -130,13 +137,12 @@ export async function getAssetsService(
       q: params.q,
       sort: params.sort,
       order: params.order,
-      limit: params.limit,
+      limit: resolvedLimit,
       cursor: params.cursor,
       warnings: uniqueWarnings(
         provider.warnings,
-        params.unsupported_market
-          ? ["unsupported_market_forced_crypto"]
-          : [],
+        accessWarnings,
+        params.unsupported_market ? ["unsupported_market_forced_crypto"] : [],
       ),
       error: provider.error ?? "assets_provider_failed",
     });
@@ -148,7 +154,7 @@ export async function getAssetsService(
     sort: params.sort,
     order: params.order,
     cursor: params.cursor,
-    limit: params.limit,
+    limit: resolvedLimit,
   });
 
   const response = buildAssetsResponse({
@@ -158,7 +164,7 @@ export async function getAssetsService(
     q: params.q,
     sort: params.sort,
     order: params.order,
-    limit: params.limit,
+    limit: resolvedLimit,
     cursor: params.cursor,
     nextCursor: queried.nextCursor,
     cache: params.noStore ? "no-store" : "miss",
@@ -166,9 +172,8 @@ export async function getAssetsService(
     total: queried.total,
     warnings: uniqueWarnings(
       provider.warnings,
-      params.unsupported_market
-        ? ["unsupported_market_forced_crypto"]
-        : [],
+      accessWarnings,
+      params.unsupported_market ? ["unsupported_market_forced_crypto"] : [],
     ),
     error: null,
   });

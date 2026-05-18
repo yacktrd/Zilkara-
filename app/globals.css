@@ -523,6 +523,22 @@ input[type="search"]:focus {
 
 /* ==========================================================================
    10. SPARKLINES
+   ----------------------------------------------------------------------------
+   ROLE
+   - render passive public movement perception
+   - support structural context reading without analytical exposure
+   - preserve calm visual continuity across scan surfaces
+
+   DIRECTIVES
+   - no trading-signal behavior
+   - no aggressive animation
+   - no pulse / flash / glow
+   - no decision semantics
+   - no opportunity semantics
+   - no private analytical exposure
+   - movement remains contextual only
+   - deterministic rendering only
+   - stable perception before visual activity
    ========================================================================== */
 
 .sparkline {
@@ -531,11 +547,16 @@ input[type="search"]:focus {
   height: var(--spark-desktop-h);
   color: var(--spark-neutral);
   opacity: 0.96;
+  will-change: opacity, transform;
 }
 
 .sparkline polyline {
   vector-effect: non-scaling-stroke;
 }
+
+/* --------------------------------------------------------------------------
+   PUBLIC VISUAL STATES
+   -------------------------------------------------------------------------- */
 
 .sparkline-neutral {
   color: var(--spark-neutral);
@@ -553,45 +574,45 @@ input[type="search"]:focus {
   color: var(--spark-fragmentation);
 }
 
+.sparkline-positive {
+  color: var(--positive);
+}
+
+.sparkline-negative {
+  color: var(--negative);
+}
+
+/* --------------------------------------------------------------------------
+   PASSIVE DYNAMIC PERCEPTION
+   -------------------------------------------------------------------------- */
+
+.sparklineAnimated polyline {
+  transition:
+    stroke 0.25s ease,
+    opacity 0.25s ease,
+    transform 0.35s ease;
+}
+
+/* --------------------------------------------------------------------------
+   EMPTY STRUCTURAL STATE
+   -------------------------------------------------------------------------- */
+
 .sparklineEmpty {
   width: var(--spark-desktop-w);
   height: var(--spark-desktop-h);
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.035);
-}
-/* ==========================================================================
-   10B. OBSERVABLE MARKET POLARITY
-   ========================================================================== */
-
-.valuePositive {
-  color: var(--positive);
-  font-weight: 740;
-}
-
-.valueNegative {
-  color: var(--negative);
-  font-weight: 740;
-}
-
-.valueNeutral {
-  color: var(--accent);
-  font-weight: 740;
+  border: 1px solid rgba(255, 255, 255, 0.025);
 }
 
 /* --------------------------------------------------------------------------
-   Sparkline observable movement
+   ACCESSIBILITY / REDUCED MOTION
    -------------------------------------------------------------------------- */
 
-.sparkPositive {
-  color: var(--positive);
-}
-
-.sparkNegative {
-  color: var(--negative);
-}
-
-.sparkNeutral {
-  color: var(--accent);
+@media (prefers-reduced-motion: reduce) {
+  .sparklineAnimated polyline {
+    transition: none;
+  }
 }
 
 /* ==========================================================================

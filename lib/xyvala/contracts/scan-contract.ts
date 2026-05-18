@@ -49,6 +49,7 @@
 
 import type {
   PublicActivityLabel,
+  PublicImpulseContext,
   PublicSparklineContext7D,
   PublicStructureTransition,
 } from "@/lib/xyvala/public/public-structure";
@@ -80,6 +81,7 @@ export type ScanAsset = {
   public_activity: PublicActivityLabel;
   public_sparkline_context_7d: PublicSparklineContext7D;
   public_structure_transition: PublicStructureTransition;
+  public_impulse_context: PublicImpulseContext;
 
   rank: number | null;
   logo_url: string | null;

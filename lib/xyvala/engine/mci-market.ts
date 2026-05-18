@@ -1,28 +1,12 @@
 /* ============================================================================
  * FILE: lib/xyvala/engine/mci-market.ts
- * ----------------------------------------------------------------------------
- * TITLE
- * - Xyvala MCI market orchestrator
- *
- * ROLE
- * - orchestrate the MCI market decision flow
- * - preserve strict tri-block architecture
- * - execute DATA -> SCORING -> DECISION -> OUTPUT -> OBSERVABILITY
- * - propagate governance signals without recalculating RFS or MCI
- *
- * DIRECTIVES
- * - orchestrator only
- * - no scoring logic
- * - no probability reconstruction
- * - no confidence recomputation
- * - no gate logic
- * - no UI logic
- * - no API logic
- * - deterministic decision flow
- * - observability failure must never break output
  * ========================================================================== */
 
 import type {
+  MciImpulseDirectionalBias,
+  MciImpulseGovernanceState,
+  MciImpulseTransitionState,
+  MciMarketImpulseLayer,
   MciMarketResult,
   RunMciMarketInput,
 } from "./mci/mci-market-types";
@@ -41,6 +25,20 @@ type MciMarketData = ReturnType<typeof normalizeData>;
 type MciMarketScores = ReturnType<typeof computeCoreScores>;
 type MciExecutionMode = ReturnType<typeof resolveExecutionMode>;
 
+type OptionalImpulseInput = {
+  impulse_pressure_score?: number | null;
+  impulse_instability_score?: number | null;
+  impulse_saturation_score?: number | null;
+  impulse_exhaustion_score?: number | null;
+  impulse_directional_bias?: MciImpulseDirectionalBias;
+  impulse_transition_state?: MciImpulseTransitionState;
+  impulse_status?: string;
+};
+
+type ExtendedRunMciMarketInput = RunMciMarketInput & {
+  impulse?: OptionalImpulseInput | null;
+};
+
 type SafeRecordInput = {
   data: MciMarketData;
   scores: MciMarketScores;
@@ -54,8 +52,13 @@ type SafeRecordInput = {
 
 function clampScore(value: unknown): number {
   const numeric = typeof value === "number" && Number.isFinite(value) ? value : 0;
-
   return Math.round(Math.max(0, Math.min(100, numeric)) * 100) / 100;
+}
+
+function nullableScore(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value)
+    ? clampScore(value)
+    : null;
 }
 
 function resolveRuptureEvolutionState(
@@ -68,7 +71,90 @@ function resolveRuptureEvolutionState(
 }
 
 /* ============================================================================
- * 3. GOVERNANCE PROPAGATION
+ * 3. IMPULSE GOVERNANCE
+ * ========================================================================== */
+
+function resolveImpulseGovernanceState(input: {
+  impulse_transition_state: MciImpulseTransitionState;
+  impulse_pressure_score: number | null;
+  impulse_instability_score: number | null;
+  impulse_saturation_score: number | null;
+  impulse_exhaustion_score: number | null;
+  stability: number;
+  rupture: number;
+}): MciImpulseGovernanceState {
+  if (input.impulse_transition_state === "EXHAUSTION") return "defensive";
+
+  if (
+    input.impulse_transition_state === "RELEASE" &&
+    (input.rupture >= 65 || (input.impulse_instability_score ?? 0) >= 65)
+  ) {
+    return "restrictive";
+  }
+
+  if (
+    input.impulse_transition_state === "PRESSURE_BUILDING" &&
+    (input.impulse_saturation_score ?? 0) >= 70
+  ) {
+    return "defensive";
+  }
+
+  if (
+    input.impulse_transition_state === "COMPRESSION" &&
+    input.stability >= 65 &&
+    input.rupture <= 45
+  ) {
+    return "supportive";
+  }
+
+  return "neutral";
+}
+
+function buildImpulseGovernance(
+  input: ExtendedRunMciMarketInput,
+  scores: MciMarketScores,
+): Partial<MciMarketImpulseLayer> {
+  const impulse = input.impulse;
+
+  if (!impulse) {
+    return {
+      impulse_governance_state: "unavailable",
+      impulse_validity: "unavailable",
+    };
+  }
+
+  const pressure = nullableScore(impulse.impulse_pressure_score);
+  const instability = nullableScore(impulse.impulse_instability_score);
+  const saturation = nullableScore(impulse.impulse_saturation_score);
+  const exhaustion = nullableScore(impulse.impulse_exhaustion_score);
+
+  const transitionState = impulse.impulse_transition_state ?? "NEUTRAL";
+  const directionalBias = impulse.impulse_directional_bias ?? "NEUTRAL";
+
+  const governanceState = resolveImpulseGovernanceState({
+    impulse_transition_state: transitionState,
+    impulse_pressure_score: pressure,
+    impulse_instability_score: instability,
+    impulse_saturation_score: saturation,
+    impulse_exhaustion_score: exhaustion,
+    stability: clampScore(scores.stability),
+    rupture: clampScore(scores.rupture),
+  });
+
+  return {
+    impulse_pressure_score: pressure,
+    impulse_instability_score: instability,
+    impulse_saturation_score: saturation,
+    impulse_exhaustion_score: exhaustion,
+    impulse_directional_bias: directionalBias,
+    impulse_transition_state: transitionState,
+    impulse_governance_state: governanceState,
+    impulse_validity: pressure === null ? "degraded" : "computed",
+  };
+}
+
+/* ============================================================================
+ * 4. GOVERNANCE PROPAGATION
  * ========================================================================== */
 
 function buildRuptureEvolution(
@@ -80,7 +166,6 @@ function buildRuptureEvolution(
   | "rupture_acceleration_score"
 > {
   const ruptureScore = clampScore(scores.rupture);
-
   const accelerationScore = clampScore(
     scores.probabilities.risk_rupture_probability,
   );
@@ -100,6 +185,7 @@ function buildRuptureEvolution(
 
 function buildNeutralization(
   scores: MciMarketScores,
+  impulse: Partial<MciMarketImpulseLayer>,
 ): Pick<
   MciMarketResult,
   | "neutralized"
@@ -110,6 +196,30 @@ function buildNeutralization(
   const rupture = clampScore(scores.rupture);
   const confidence = clampScore(scores.confidence);
   const convergence = clampScore(scores.convergence);
+
+  if (
+    impulse.impulse_governance_state === "restrictive" &&
+    rupture >= 65
+  ) {
+    return {
+      neutralized: true,
+      neutralization_reason: "excessive_rupture",
+      neutralization_severity: rupture >= 80 ? "high" : "medium",
+      neutralization_validity: "computed",
+    };
+  }
+
+  if (
+    impulse.impulse_governance_state === "defensive" &&
+    confidence < 50
+  ) {
+    return {
+      neutralized: true,
+      neutralization_reason: "low_confidence",
+      neutralization_severity: confidence < 30 ? "high" : "medium",
+      neutralization_validity: "computed",
+    };
+  }
 
   if (confidence < 40) {
     return {
@@ -147,7 +257,7 @@ function buildNeutralization(
 }
 
 /* ============================================================================
- * 4. OBSERVABILITY — SIDE EFFECT ISOLATION
+ * 5. OBSERVABILITY
  * ========================================================================== */
 
 function safeRecordMciDecisionSample(input: SafeRecordInput): void {
@@ -175,14 +285,18 @@ function safeRecordMciDecisionSample(input: SafeRecordInput): void {
 }
 
 /* ============================================================================
- * 5. EXECUTION — PUBLIC ORCHESTRATOR
+ * 6. EXECUTION
  * ========================================================================== */
 
 export function runMciMarket(input: RunMciMarketInput): MciMarketResult {
+  const extendedInput = input as ExtendedRunMciMarketInput;
+
   const data = normalizeData(input);
   const executionMode = resolveExecutionMode(input);
 
   const scores = computeCoreScores(data.rfs);
+
+  const impulseGovernance = buildImpulseGovernance(extendedInput, scores);
 
   const decision = resolveDecision({
     stability: scores.stability,
@@ -191,7 +305,7 @@ export function runMciMarket(input: RunMciMarketInput): MciMarketResult {
   });
 
   const ruptureEvolution = buildRuptureEvolution(scores);
-  const neutralization = buildNeutralization(scores);
+  const neutralization = buildNeutralization(scores, impulseGovernance);
 
   const result: MciMarketResult = {
     ...buildOutput({
@@ -204,6 +318,9 @@ export function runMciMarket(input: RunMciMarketInput): MciMarketResult {
         `mci_market_execution_mode:${executionMode}`,
         `mci_market_decision:${decision}`,
         `mci_market_confidence:${scores.confidence}`,
+        `mci_market_impulse_governance:${
+          impulseGovernance.impulse_governance_state ?? "unavailable"
+        }`,
         ...(neutralization.neutralized
           ? [`mci_market_neutralized:${neutralization.neutralization_reason}`]
           : []),
@@ -213,6 +330,7 @@ export function runMciMarket(input: RunMciMarketInput): MciMarketResult {
 
     ...neutralization,
     ...ruptureEvolution,
+    ...impulseGovernance,
   };
 
   safeRecordMciDecisionSample({

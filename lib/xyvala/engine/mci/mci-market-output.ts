@@ -111,5 +111,14 @@ export function buildOutput(input: {
     rupture_evolution_state: "unknown",
 
     rupture_acceleration_score: 0,
-  };
+ 
+    impulse_pressure_score: null,
+    impulse_instability_score: null,
+    impulse_saturation_score: null,
+    impulse_exhaustion_score: null,
+    impulse_directional_bias: "NEUTRAL",
+    impulse_transition_state: "NEUTRAL",
+    impulse_governance_state: "unavailable",
+    impulse_validity: "degraded",
+ };
 }

@@ -94,8 +94,11 @@ const DEFAULT_MARKET: Market = "crypto";
 const DEFAULT_QUOTE: Quote = "eur";
 const DEFAULT_SORT: SortKey = "rank";
 const DEFAULT_ORDER: SortOrder = "asc";
+const DEFAULT_LIMIT: number | null = null;
+
 const MAX_LIMIT = 250;
-const DEFAULT_LIMIT = MAX_LIMIT;
+
+const PUBLIC_SCAN_LIMIT = 10;
 
 const SNAPSHOT_TTL_MS = 60_000;
 
@@ -363,15 +366,23 @@ export async function GET(req: NextRequest) {
   const noStore = parseBool(searchParams.get("noStore"));
 
   try {
+
     const snapshotKey = scanKey({
-      version: XYVALA_SNAPSHOT_VERSION,
-      market: DEFAULT_MARKET,
-      quote,
-      sort: DEFAULT_SORT,
-      order: DEFAULT_ORDER,
-      limit: MAX_LIMIT,
-      q: null,
-    });
+  version: XYVALA_SNAPSHOT_VERSION,
+  market: DEFAULT_MARKET,
+  quote,
+  sort: DEFAULT_SORT,
+  order: DEFAULT_ORDER,
+  limit: MAX_LIMIT,
+  q: null,
+});
+
+console.log("[SCAN] reading snapshot", {
+  quote,
+  noStore,
+  snapshotKey,
+});
+
 
     const snapshot = noStore
       ? null
@@ -417,9 +428,12 @@ export async function GET(req: NextRequest) {
 
     data = sortAssets(data, sort, order);
 
-    if (limit !== null) {
-      data = data.slice(0, limit);
-    }
+    const effectiveLimit =
+  limit === null
+    ? PUBLIC_SCAN_LIMIT
+    : Math.min(limit, PUBLIC_SCAN_LIMIT);
+
+data = data.slice(0, effectiveLimit);
 
     const payload = buildResponse({
       ok: true,
@@ -428,7 +442,7 @@ export async function GET(req: NextRequest) {
       q,
       sort,
       order,
-      limit,
+      limit: effectiveLimit,
       data,
       warnings,
       error: null,

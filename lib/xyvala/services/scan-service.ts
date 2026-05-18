@@ -5,31 +5,54 @@
  * - Xyvala public scan service
  *
  * ROLE
- * - orchestrate public scan asset loading
- * - use real observable market seeds when available
- * - preserve deterministic fallback when upstream source is unavailable
- * - expose public ScanAsset only through private-to-public transformer
+ * - read canonical public scan snapshot when available
+ * - fallback to observable market source when snapshot is unavailable
+ * - apply deterministic public query filtering and sorting
+ * - expose public ScanAsset data only
+ *
+ * PARENTS
+ * - lib/xyvala/cache/cache-core.ts
+ * - lib/xyvala/snapshot.ts
+ * - lib/xyvala/contracts/scan-contract.ts
+ * - lib/xyvala/services/scan-query.ts
+ * - lib/xyvala/sources/market-source.ts
+ * - lib/xyvala/public/public-structure.ts
  *
  * DIRECTIVES
  * - service orchestration only
- * - no UI logic
- * - no API logic
- * - no RFS recomputation here
- * - no MCI recomputation here
- * - no public/private leakage
+ * - public descriptive scan data only
+ * - snapshot remains preferred source of truth
+ * - market fallback is observable-data only
+ * - no fake fallback data
+ * - no RFS recomputation
+ * - no MCI recomputation
+ * - no private analytical exposure
+ * - no regime exposure
+ * - no decision exposure
+ * - no opportunity exposure
+ * - no stability score exposure
  * - no broker / affiliate exposure
- * - EUR default quote
- * - real market source first
- * - fallback only when source is empty or invalid
+ * - EUR is the default quote
+ * - deterministic output only
  * ========================================================================== */
 
-import type { Quote } from "@/lib/xyvala/snapshot";
 import type { ScanAsset } from "@/lib/xyvala/contracts/scan-contract";
 
-import { buildPrivateScanAsset } from "@/lib/xyvala/factories/scan-asset-factory";
-import { buildScanEngineResult } from "@/lib/xyvala/scan-engine";
+import {
+  getFromCache,
+  scanKey,
+} from "@/lib/xyvala/cache/cache-core";
+
+import {
+  isScanSnapshot,
+  XYVALA_SNAPSHOT_VERSION,
+  type Market,
+  type Quote,
+  type ScanSnapshot,
+} from "@/lib/xyvala/snapshot";
+
+import { buildPublicStructure } from "@/lib/xyvala/public/public-structure";
 import { getMarketAssets } from "@/lib/xyvala/sources/market-source";
-import { privateScanAssetsToPublicScanAssets } from "@/lib/xyvala/transformers/scan-private-to-public-transformer";
 
 import {
   normalizeScanQuery,
@@ -37,6 +60,10 @@ import {
   type ScanSortKey,
   type ScanSortOrder,
 } from "@/lib/xyvala/services/scan-query";
+
+/* ============================================================================
+ * 1. TYPES
+ * ========================================================================== */
 
 export type GetScanInput = {
   quote?: Quote | string | null;
@@ -55,21 +82,24 @@ export type ScanServiceResult = {
   error: string | null;
 };
 
-type AssetSeed = {
-  id: string;
-  symbol: string;
-  name: string;
-  rank: number | null;
-  logo_url: string | null;
-  price: number;
-  chg_24h_pct: number;
-  chg_7d_pct: number | null;
-  market_cap: number | null;
-  volume_24h: number | null;
-  sparkline_7d: number[];
-};
+type MarketSeed = Awaited<ReturnType<typeof getMarketAssets>>[number];
 
+/* ============================================================================
+ * 2. CONFIG
+ * ========================================================================== */
+
+const DEFAULT_MARKET: Market = "crypto";
 const DEFAULT_QUOTE: Quote = "eur";
+
+const DEFAULT_SORT: ScanSortKey = "rank";
+const DEFAULT_ORDER: ScanSortOrder = "asc";
+const DEFAULT_LIMIT = 250;
+
+const SNAPSHOT_TTL_MS = 300_000;
+
+/* ============================================================================
+ * 3. SAFE HELPERS
+ * ========================================================================== */
 
 function safeString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
@@ -99,113 +129,79 @@ function uniqueWarnings(
   ];
 }
 
-function getFallbackSeeds(): AssetSeed[] {
-  return [
-    {
-      id: "btc",
-      symbol: "BTC",
-      name: "Bitcoin",
-      rank: 1,
-      logo_url: null,
-      price: 64200,
-      chg_24h_pct: 1.2,
-      chg_7d_pct: null,
-      market_cap: 1_260_000_000_000,
-      volume_24h: 31_000_000_000,
-      sparkline_7d: [61800, 62200, 62850, 63100, 63600, 63900, 64200],
-    },
-    {
-      id: "eth",
-      symbol: "ETH",
-      name: "Ethereum",
-      rank: 2,
-      logo_url: null,
-      price: 3180,
-      chg_24h_pct: 0.7,
-      chg_7d_pct: null,
-      market_cap: 382_000_000_000,
-      volume_24h: 14_800_000_000,
-      sparkline_7d: [3050, 3070, 3095, 3110, 3140, 3165, 3180],
-    },
-    {
-      id: "bnb",
-      symbol: "BNB",
-      name: "BNB",
-      rank: 3,
-      logo_url: null,
-      price: 590,
-      chg_24h_pct: 0.3,
-      chg_7d_pct: null,
-      market_cap: 86_000_000_000,
-      volume_24h: 1_900_000_000,
-      sparkline_7d: [571, 575, 578, 581, 585, 588, 590],
-    },
-    {
-      id: "sol",
-      symbol: "SOL",
-      name: "Solana",
-      rank: 4,
-      logo_url: null,
-      price: 142,
-      chg_24h_pct: -0.6,
-      chg_7d_pct: null,
-      market_cap: 69_000_000_000,
-      volume_24h: 3_200_000_000,
-      sparkline_7d: [148, 147, 145, 144, 143, 142.5, 142],
-    },
-    {
-      id: "xrp",
-      symbol: "XRP",
-      name: "XRP",
-      rank: 5,
-      logo_url: null,
-      price: 0.61,
-      chg_24h_pct: 0.1,
-      chg_7d_pct: null,
-      market_cap: 35_000_000_000,
-      volume_24h: 1_600_000_000,
-      sparkline_7d: [0.59, 0.595, 0.6, 0.598, 0.602, 0.607, 0.61],
-    },
-  ];
+/* ============================================================================
+ * 4. SNAPSHOT HELPERS
+ * ========================================================================== */
+
+function buildCanonicalScanCacheKey(quote: Quote): string {
+  return scanKey({
+    version: XYVALA_SNAPSHOT_VERSION,
+    market: DEFAULT_MARKET,
+    quote,
+    sort: DEFAULT_SORT,
+    order: DEFAULT_ORDER,
+    limit: DEFAULT_LIMIT,
+    q: null,
+  });
 }
 
-function buildPrivateAssets(input: {
-  seeds: AssetSeed[];
-  quote: Quote;
-  source: "scan" | "fallback";
-  warning: string;
-}) {
-  const generatedAt = new Date().toISOString();
-
-  return input.seeds.map((seed) =>
-    buildPrivateScanAsset({
-      ...seed,
-      quote: input.quote,
-      source: input.source,
-      analytical_version: "scan-service-v1",
-      generated_at: generatedAt,
-      warnings: [input.warning],
-    }),
+async function readCanonicalSnapshot(
+  quote: Quote,
+): Promise<ScanSnapshot | null> {
+  const snapshot = await getFromCache<ScanSnapshot>(
+    buildCanonicalScanCacheKey(quote),
+    SNAPSHOT_TTL_MS,
   );
+
+  return isScanSnapshot(snapshot) ? snapshot : null;
 }
 
-async function loadRealSeeds(quote: Quote): Promise<AssetSeed[]> {
-  const seeds = await getMarketAssets(quote);
+/* ============================================================================
+ * 5. MARKET FALLBACK PROJECTION
+ * ========================================================================== */
 
-  return seeds.map((seed) => ({
+function marketSeedToScanAsset(seed: MarketSeed): ScanAsset {
+  const publicStructure = buildPublicStructure({
+    pct_24h: seed.chg_24h_pct,
+    pct_7d: seed.chg_7d_pct,
+    volume_24h: seed.volume_24h,
+    market_cap: seed.market_cap,
+    sparkline_7d: seed.sparkline_7d,
+  });
+
+  return {
     id: seed.id,
     symbol: seed.symbol,
     name: seed.name,
-    rank: seed.rank,
-    logo_url: seed.logo_url,
+
     price: seed.price,
     chg_24h_pct: seed.chg_24h_pct,
     chg_7d_pct: seed.chg_7d_pct,
+
     market_cap: seed.market_cap,
     volume_24h: seed.volume_24h,
+
     sparkline_7d: seed.sparkline_7d,
-  }));
+
+    public_activity: publicStructure.activity,
+    public_sparkline_context_7d: publicStructure.sparkline_context_7d,
+    public_structure_transition: publicStructure.structure_transition,
+    public_impulse_context: publicStructure.impulse_context,
+
+    rank: seed.rank,
+    logo_url: seed.logo_url,
+  };
 }
+
+async function loadMarketFallbackAssets(): Promise<ScanAsset[]> {
+  const seeds = await getMarketAssets(DEFAULT_QUOTE);
+
+  return seeds.map(marketSeedToScanAsset);
+}
+
+/* ============================================================================
+ * 6. PUBLIC SERVICE
+ * ========================================================================== */
 
 export async function getScan(
   input: GetScanInput = {},
@@ -221,46 +217,55 @@ export async function getScan(
   });
 
   try {
-    const realSeeds = await loadRealSeeds(quote);
-    const hasRealSeeds = realSeeds.length > 0;
+    const snapshot = input.noStore === true
+      ? null
+      : await readCanonicalSnapshot(quote);
 
-    const seeds = hasRealSeeds ? realSeeds : getFallbackSeeds();
-    const source: "scan" | "fallback" = hasRealSeeds ? "scan" : "fallback";
+    if (snapshot) {
+      const queried = queryScanItems(snapshot.data, query);
 
-    const privateAssets = buildPrivateAssets({
-      seeds,
-      quote,
-      source,
-      warning: hasRealSeeds
-        ? "scan_service_real_market_source"
-        : "scan_service_fallback_seed",
-    });
+      return {
+        ok: true,
+        source: "scan",
+        data: queried.data,
+        warnings: uniqueWarnings(
+          snapshot.meta?.warnings,
+          ["scan_service_snapshot_source"],
+        ),
+        error: null,
+      };
+    }
 
-    const engine = buildScanEngineResult({
-      data: privateAssets,
-      key: "stability",
-      order: "desc",
-    });
+    const fallbackAssets = await loadMarketFallbackAssets();
 
-    const publicAssets = privateScanAssetsToPublicScanAssets(engine.data);
-    const queried = queryScanItems(publicAssets, query);
+    if (fallbackAssets.length > 0) {
+      const queried = queryScanItems(fallbackAssets, query);
+
+      return {
+        ok: true,
+        source: "fallback",
+        data: queried.data,
+        warnings: uniqueWarnings([
+          "scan_service_snapshot_unavailable",
+          "scan_service_market_source_fallback",
+        ]),
+        error: null,
+      };
+    }
 
     return {
-      ok: true,
-      source,
-      data: queried.data,
-      warnings: uniqueWarnings(
-        hasRealSeeds ? ["scan_service_real_market_dataset"] : ["scan_service_fallback_dataset"],
-        engine.market_context.warnings,
-      ),
-      error: null,
+      ok: false,
+      source: "fallback",
+      data: [],
+      warnings: ["scan_service_snapshot_and_market_source_unavailable"],
+      error: "scan_snapshot_unavailable",
     };
   } catch (error) {
     return {
       ok: false,
       source: "fallback",
       data: [],
-      warnings: uniqueWarnings(["scan_service_failed"]),
+      warnings: ["scan_service_failed"],
       error:
         error instanceof Error && error.message
           ? error.message

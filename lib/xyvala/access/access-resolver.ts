@@ -74,10 +74,13 @@ export function resolveAccessScope(auth: ApiAuthSuccess): AccessScope {
 
   if (
     auth.plan === "pro" ||
-    auth.plan === "enterprise" ||
-    auth.plan === "internal"
+    auth.plan === "enterprise"
   ) {
     return ACCESS_COMPARTMENTS.full_100;
+  }
+
+  if (auth.plan === "internal") {
+    return ACCESS_COMPARTMENTS.admin_100;
   }
 
   return ACCESS_COMPARTMENTS.public_10;

@@ -1,4 +1,4 @@
- /* ============================================================================
+/* ============================================================================
  * FILE: components/sparkline.tsx
  * ----------------------------------------------------------------------------
  * TITLE
@@ -6,7 +6,7 @@
  *
  * ROLE
  * - render a passive 7D public market sparkline
- * - visually support structural transition reading
+ * - visually support observable market movement reading
  * - keep visual perception separate from analytical computation
  *
  * DIRECTIVES
@@ -26,6 +26,7 @@
  * DESIGN PRINCIPLE
  * - sparkline represents observed movement shape
  * - sparkline does not expose advice, decision or signal
+ * - movement can feel alive without becoming aggressive
  * ========================================================================== */
 
 import React from "react";
@@ -34,11 +35,13 @@ import React from "react";
  * 1. TYPES
  * ========================================================================== */
 
-type SparklineTone =
+export type SparklineTone =
   | "neutral"
   | "compression"
   | "expansion"
-  | "fragmentation";
+  | "fragmentation"
+  | "negative"
+  | "positive";
 
 type SparklineProps = {
   data: number[] | null;
@@ -46,6 +49,7 @@ type SparklineProps = {
   height?: number;
   strokeWidth?: number;
   tone?: SparklineTone;
+  animated?: boolean;
 };
 
 /* ============================================================================
@@ -78,8 +82,9 @@ function resolveTone(data: number[]): SparklineTone {
   const change = ((last - first) / first) * 100;
 
   if (amplitude >= 18) return "fragmentation";
+  if (change > 1) return "positive";
+  if (change < -1) return "negative";
   if (Math.abs(change) <= 1.2 && amplitude <= 5) return "compression";
-  if (change > 1) return "expansion";
 
   return "neutral";
 }
@@ -113,6 +118,7 @@ export function Sparkline({
   height = 28,
   strokeWidth = 2,
   tone,
+  animated = true,
 }: SparklineProps) {
   const cleanData = sanitizeData(data);
 
@@ -121,6 +127,7 @@ export function Sparkline({
   }
 
   const resolvedTone = tone ?? resolveTone(cleanData);
+
   const points = buildPoints({
     data: cleanData,
     width,
@@ -131,7 +138,13 @@ export function Sparkline({
     <svg
       width={width}
       height={height}
-      className={`sparkline sparkline-${resolvedTone}`}
+      className={[
+        "sparkline",
+        `sparkline-${resolvedTone}`,
+        animated ? "sparklineAnimated" : "",
+      ]
+        .filter(Boolean)
+        .join(" ")}
       viewBox={`0 0 ${width} ${height}`}
       role="img"
       aria-label="Observed 7D market movement"

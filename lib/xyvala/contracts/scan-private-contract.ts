@@ -194,7 +194,7 @@ export type PrivateTemporalScores = {
 export type PrivateTripleLayer = {
   state: PrivateTripleLayerState;
 
-  growth_layer_score: number | null;
+  growth_score: number | null;
   core_pattern_score: number | null;
   decay_score: number | null;
 
@@ -204,7 +204,30 @@ export type PrivateTripleLayer = {
 };
 
 /* ============================================================================
- * 6. PRIVATE NEUTRALIZATION
+ * 6. PRIVATE IMPULSE LAYER
+ * ========================================================================== */
+
+export type PrivateImpulseDirectionalBias = "UP" | "DOWN" | "MIXED" | "NEUTRAL";
+
+export type PrivateImpulseTransitionState =
+  | "COMPRESSION"
+  | "PRESSURE_BUILDING"
+  | "RELEASE"
+  | "EXHAUSTION"
+  | "NEUTRAL";
+
+export type PrivateImpulseLayer = {
+  impulse_pressure_score: number | null;
+  impulse_instability_score: number | null;
+  impulse_saturation_score: number | null;
+  impulse_exhaustion_score: number | null;
+  impulse_directional_bias: PrivateImpulseDirectionalBias;
+  impulse_transition_state: PrivateImpulseTransitionState;
+  impulse_status: PrivateScanStatus;
+};
+
+/* ============================================================================
+ * 7. PRIVATE NEUTRALIZATION
  * ========================================================================== */
 
 export type PrivateNeutralization = {
@@ -215,7 +238,7 @@ export type PrivateNeutralization = {
 };
 
 /* ============================================================================
- * 7. PRIVATE CALIBRATION
+ * 8. PRIVATE CALIBRATION
  * ========================================================================== */
 
 export type PrivateCalibration = {
@@ -226,7 +249,7 @@ export type PrivateCalibration = {
 };
 
 /* ============================================================================
- * 8. PRIVATE DECISION
+ * 9. PRIVATE DECISION
  * ========================================================================== */
 
 export type PrivateDecisionLayer = {
@@ -244,7 +267,7 @@ export type PrivateDecisionLayer = {
 };
 
 /* ============================================================================
- * 9. PRIVATE GOVERNANCE
+ * 10. PRIVATE GOVERNANCE
  * ========================================================================== */
 
 export type PrivateScanGovernance = {
@@ -260,7 +283,7 @@ export type PrivateScanGovernance = {
 };
 
 /* ============================================================================
- * 10. PRIVATE SCAN ASSET
+ * 11. PRIVATE SCAN ASSET
  * ========================================================================== */
 
 export type PrivateScanAsset =
@@ -269,6 +292,7 @@ export type PrivateScanAsset =
     PrivateStructuralScores &
     PrivateRuptureScores &
     PrivateCrashScores &
+    PrivateImpulseLayer &
     PrivateTemporalScores &
     PrivateTripleLayer &
     PrivateNeutralization &
@@ -278,7 +302,7 @@ export type PrivateScanAsset =
     };
 
 /* ============================================================================
- * 11. PRIVATE SNAPSHOT
+ * 12. PRIVATE SNAPSHOT
  * ========================================================================== */
 
 export type PrivateScanSnapshotMeta = {
@@ -301,7 +325,7 @@ export type PrivateScanSnapshot = {
 };
 
 /* ============================================================================
- * 12. PRIVATE CONTEXT
+ * 13. PRIVATE CONTEXT
  * ========================================================================== */
 
 export type PrivateMarketContext = {
@@ -322,7 +346,7 @@ export type PrivateMarketContext = {
 };
 
 /* ============================================================================
- * 13. PRIVATE HELPERS CONTRACTS
+ * 14. PRIVATE HELPERS CONTRACTS
  * ========================================================================== */
 
 export type PrivateScanAssetInput = Partial<PrivateScanAsset>;
