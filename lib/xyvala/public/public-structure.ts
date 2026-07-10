@@ -6,11 +6,12 @@
  *
  * ROLE
  * - derive public descriptive market structure labels from observable data only
- * - centralize public transition, activity, market climate and Triple Layer context
+ * - centralize public transition, activity, impulse, market climate and Triple Layer context
  * - keep UI components passive and deterministic
  *
  * PARENTS
  * - lib/xyvala/contracts/scan-contract.ts
+ * - lib/xyvala/services/scan-transformer.ts
  * - lib/xyvala/services/scan-service.ts
  * - components/scan-table.tsx
  *
@@ -32,11 +33,13 @@
  *
  * INPUTS
  * - observable public asset fields
+ * - public-safe impulse transition labels
  *
  * OUTPUTS
  * - activity label
  * - 7D sparkline context
  * - structure transition label
+ * - public impulse context
  * - market climate summary
  * - public Triple Layer context
  *
@@ -48,9 +51,14 @@
  * - no numerical private scoring
  * - UI must display these values, not rebuild them
  *
+ * CRITICAL DEPENDENCIES
+ * - scan-contract.ts
+ * - scan-transformer.ts
+ *
  * SENSITIVE ZONES
  * - public/private boundary
  * - legal wording
+ * - impulse context must remain descriptive and non-advisory
  * - transition labels must remain non-advisory
  * - Triple Layer context must remain descriptive and public-safe
  * ========================================================================== */
@@ -79,6 +87,14 @@ export type PublicStructureTransition =
   | "Active Expansion"
   | "Neutral Structure";
 
+export type PublicImpulseContext =
+  | "Compression"
+  | "Pressure Building"
+  | "Release"
+  | "Exhaustion"
+  | "Neutral"
+  | "Unavailable";
+
 export type PublicMarketClimate =
   | "Calm Market"
   | "Active Market"
@@ -105,20 +121,16 @@ export type PublicDecayContext =
   | "Elevated"
   | "Unavailable";
 
-export type PublicImpulseContext =
-  | "Compression"
-  | "Pressure Building"
-  | "Release"
-  | "Exhaustion"
-  | "Neutral"
-  | "Unavailable";
-
 export type PublicStructureInput = {
   pct_24h: number | null;
   pct_7d: number | null;
   volume_24h: number | null;
   market_cap: number | null;
   sparkline_7d: number[] | null;
+
+  impulse_transition_state?: unknown;
+  public_impulse_context?: unknown;
+  impulse_context?: unknown;
 };
 
 export type PublicStructureResult = {
@@ -139,11 +151,11 @@ export type PublicMarketStructureSummary = {
   market_climate: PublicMarketClimate;
   dominant_transition: PublicStructureTransition | "Unavailable";
   activity_context: PublicActivityLabel;
+  impulse_context: PublicImpulseContext;
 
   growth_context: PublicGrowthContext;
   core_structure: PublicCoreStructure;
   decay_context: PublicDecayContext;
-  impulse_context: PublicImpulseContext;
 
   assets_count: number;
   expansion_count: number;
@@ -175,7 +187,68 @@ function abs(value: number | null): number {
   return Math.abs(value ?? 0);
 }
 
-function resolveImpulseContext(
+/* ============================================================================
+ * 3. PUBLIC IMPULSE CONTEXT
+ * ========================================================================== */
+
+export function toPublicImpulseContext(value: unknown): PublicImpulseContext {
+  switch (value) {
+    case "COMPRESSION":
+    case "Compression":
+    case "compression":
+      return "Compression";
+
+    case "PRESSURE_BUILDING":
+    case "Pressure Building":
+    case "pressure_building":
+      return "Pressure Building";
+
+    case "RELEASE":
+    case "Release":
+    case "release":
+      return "Release";
+
+    case "EXHAUSTION":
+    case "Exhaustion":
+    case "exhaustion":
+      return "Exhaustion";
+
+    case "NEUTRAL":
+    case "Neutral":
+    case "neutral":
+      return "Neutral";
+
+    case "Unavailable":
+    case "UNAVAILABLE":
+    case "unavailable":
+      return "Unavailable";
+
+    default:
+      return "Unavailable";
+  }
+}
+
+function resolvePublicImpulseContext(input: {
+  public_impulse_context?: unknown;
+  impulse_context?: unknown;
+  impulse_transition_state?: unknown;
+}): PublicImpulseContext {
+  const publicContext = toPublicImpulseContext(input.public_impulse_context);
+
+  if (publicContext !== "Unavailable") {
+    return publicContext;
+  }
+
+  const impulseContext = toPublicImpulseContext(input.impulse_context);
+
+  if (impulseContext !== "Unavailable") {
+    return impulseContext;
+  }
+
+  return toPublicImpulseContext(input.impulse_transition_state);
+}
+
+function resolveDominantImpulseContext(
   assets: readonly PublicMarketStructureAsset[],
 ): PublicImpulseContext {
   if (assets.length === 0) return "Unavailable";
@@ -190,30 +263,26 @@ function resolveImpulseContext(
   };
 
   for (const asset of assets) {
-    counts[asset.impulse_context] += 1;
+    counts[toPublicImpulseContext(asset.impulse_context)] += 1;
   }
 
-  const availableTotal =
-    counts.Compression +
-    counts["Pressure Building"] +
-    counts.Release +
-    counts.Exhaustion +
-    counts.Neutral;
+  const ordered: PublicImpulseContext[] = [
+    "Exhaustion",
+    "Release",
+    "Pressure Building",
+    "Compression",
+    "Neutral",
+  ];
 
-  if (availableTotal === 0) return "Unavailable";
+  const dominant = ordered.reduce<PublicImpulseContext>((best, current) => {
+    return counts[current] > counts[best] ? current : best;
+  }, "Neutral");
 
-  if (counts.Exhaustion / availableTotal >= 0.3) return "Exhaustion";
-  if (counts.Release / availableTotal >= 0.3) return "Release";
-  if (counts["Pressure Building"] / availableTotal >= 0.3) {
-    return "Pressure Building";
-  }
-  if (counts.Compression / availableTotal >= 0.3) return "Compression";
-
-  return "Neutral";
+  return counts[dominant] > 0 ? dominant : "Unavailable";
 }
 
 /* ============================================================================
- * 3. OBSERVABLE SHAPE READERS
+ * 4. OBSERVABLE SHAPE READERS
  * ========================================================================== */
 
 export function computePublicAmplitude7D(points: number[] | null): number {
@@ -225,9 +294,7 @@ export function computePublicAmplitude7D(points: number[] | null): number {
   const max = Math.max(...clean);
   const last = clean.at(-1);
 
-  if (!isFiniteNumber(last) || last <= 0) {
-    return 0;
-  }
+  if (!isFiniteNumber(last) || last <= 0) return 0;
 
   return ((max - min) / last) * 100;
 }
@@ -271,8 +338,47 @@ export function computePublicSparklineChange7D(
   return ((last - first) / first) * 100;
 }
 
+export function computePublicDirectionChanges7D(
+  points: number[] | null,
+): number {
+  const clean = normalizeSparkline(points);
+
+  if (!clean || clean.length < 3) return 0;
+
+  let changes = 0;
+  let previousDirection: "up" | "down" | "flat" = "flat";
+
+  for (let index = 1; index < clean.length; index += 1) {
+    const previous = clean[index - 1];
+    const current = clean[index];
+
+    if (!isFiniteNumber(previous) || !isFiniteNumber(current) || previous <= 0) {
+      continue;
+    }
+
+    const deltaPct = ((current - previous) / previous) * 100;
+
+    const direction =
+      deltaPct > 0.15 ? "up" : deltaPct < -0.15 ? "down" : "flat";
+
+    if (
+      previousDirection !== "flat" &&
+      direction !== "flat" &&
+      direction !== previousDirection
+    ) {
+      changes += 1;
+    }
+
+    if (direction !== "flat") {
+      previousDirection = direction;
+    }
+  }
+
+  return changes;
+}
+
 /* ============================================================================
- * 4. PUBLIC ACTIVITY
+ * 5. PUBLIC ACTIVITY
  * ========================================================================== */
 
 export function resolvePublicActivity(input: {
@@ -295,7 +401,7 @@ export function resolvePublicActivity(input: {
 }
 
 /* ============================================================================
- * 5. PUBLIC 7D SPARKLINE CONTEXT
+ * 6. PUBLIC 7D SPARKLINE CONTEXT
  * ========================================================================== */
 
 export function resolvePublicSparklineContext7D(input: {
@@ -307,16 +413,20 @@ export function resolvePublicSparklineContext7D(input: {
   const pct7d = normalizeNullableNumber(input.pct_7d) ?? 0;
   const sparkline = normalizeSparkline(input.sparkline_7d);
 
-  if (!sparkline) {
-    return "Unavailable";
-  }
+  if (!sparkline) return "Unavailable";
 
   const abs24h = Math.abs(pct24h);
   const abs7d = Math.abs(pct7d);
   const amplitude = computePublicAmplitude7D(sparkline);
   const direction = computePublicSparklineDirection7D(sparkline);
+  const directionChanges = computePublicDirectionChanges7D(sparkline);
 
-  if (abs24h >= 7 || abs7d >= 18 || amplitude >= 18) {
+  if (
+    abs24h >= 6 ||
+    abs7d >= 14 ||
+    amplitude >= 14 ||
+    directionChanges >= 8
+  ) {
     return "Fragmented";
   }
 
@@ -328,11 +438,21 @@ export function resolvePublicSparklineContext7D(input: {
     return "Recovery";
   }
 
-  if (abs24h <= 0.2 && abs7d <= 0.8 && amplitude <= 1.5) {
+  if (
+    abs24h <= 0.25 &&
+    abs7d <= 1 &&
+    amplitude <= 2 &&
+    directionChanges <= 2
+  ) {
     return "Compression";
   }
 
-  if (abs24h <= 1.5 && abs7d <= 5 && amplitude <= 8) {
+  if (
+    abs24h <= 1.2 &&
+    abs7d <= 4 &&
+    amplitude <= 6 &&
+    directionChanges <= 4
+  ) {
     return "Stable";
   }
 
@@ -340,7 +460,7 @@ export function resolvePublicSparklineContext7D(input: {
 }
 
 /* ============================================================================
- * 6. PUBLIC STRUCTURE TRANSITION
+ * 7. PUBLIC STRUCTURE TRANSITION
  * ========================================================================== */
 
 export function resolvePublicStructureTransition(input: {
@@ -363,8 +483,14 @@ export function resolvePublicStructureTransition(input: {
   const abs7d = abs(pct7d);
   const amplitude = computePublicAmplitude7D(sparkline);
   const direction = computePublicSparklineDirection7D(sparkline);
+  const directionChanges = computePublicDirectionChanges7D(sparkline);
 
-  if (abs24h >= 7 || abs7d >= 18 || amplitude >= 18) {
+  if (
+    abs24h >= 6 ||
+    abs7d >= 14 ||
+    amplitude >= 14 ||
+    directionChanges >= 8
+  ) {
     return "Fragmentation Detected";
   }
 
@@ -386,15 +512,21 @@ export function resolvePublicStructureTransition(input: {
   }
 
   if (
-    abs24h <= 0.2 &&
-    abs7d <= 0.8 &&
-    amplitude <= 1.5 &&
-    direction === "flat"
+    abs24h <= 0.25 &&
+    abs7d <= 1 &&
+    amplitude <= 2 &&
+    direction === "flat" &&
+    directionChanges <= 2
   ) {
     return "Compression Phase";
   }
 
-  if (abs24h <= 1.5 && abs7d <= 5 && amplitude <= 8) {
+  if (
+    abs24h <= 1.2 &&
+    abs7d <= 4 &&
+    amplitude <= 6 &&
+    directionChanges <= 4
+  ) {
     return "Stable Structure";
   }
 
@@ -410,7 +542,12 @@ export function buildPublicStructure(
     volume_24h: normalizeNullableNumber(input.volume_24h),
     market_cap: normalizeNullableNumber(input.market_cap),
     sparkline_7d: normalizeSparkline(input.sparkline_7d),
- };
+    impulse_context: resolvePublicImpulseContext({
+      public_impulse_context: input.public_impulse_context,
+      impulse_context: input.impulse_context,
+      impulse_transition_state: input.impulse_transition_state,
+    }),
+  };
 
   return {
     activity: resolvePublicActivity({
@@ -431,18 +568,13 @@ export function buildPublicStructure(
       market_cap: normalizedInput.market_cap,
       sparkline_7d: normalizedInput.sparkline_7d,
     }),
-      impulse_context: "Unavailable",
+
+    impulse_context: normalizedInput.impulse_context,
   };
 }
 
 /* ============================================================================
- * 7. PUBLIC TRIPLE LAYER CONTEXT
- * ----------------------------------------------------------------------------
- * ROLE
- * - expose descriptive market context only
- * - no scoring
- * - no prediction
- * - no investment recommendation
+ * 8. PUBLIC TRIPLE LAYER CONTEXT
  * ========================================================================== */
 
 export function resolveGrowthContext(
@@ -509,7 +641,7 @@ export function resolveDecayContext(
 }
 
 /* ============================================================================
- * 8. PUBLIC MARKET SUMMARY
+ * 9. PUBLIC MARKET SUMMARY
  * ========================================================================== */
 
 function countByTransition(
@@ -611,11 +743,11 @@ export function buildPublicMarketStructureSummary(
     market_climate: resolvePublicMarketClimate(assets),
     dominant_transition: resolveDominantTransition(assets),
     activity_context: resolveActivityContext(assets),
+    impulse_context: resolveDominantImpulseContext(assets),
 
     growth_context: resolveGrowthContext(assets),
     core_structure: resolveCoreStructure(assets),
     decay_context: resolveDecayContext(assets),
-    impulse_context: resolveImpulseContext(assets),
 
     assets_count: assets.length,
     expansion_count: expansionCount,

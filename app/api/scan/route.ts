@@ -6,14 +6,23 @@
  *
  * ROLE
  * - expose public ScanAsset payloads only
- * - read canonical scan snapshot from cache-core
+ * - read the canonical scan snapshot through scan-snapshot-service
  * - preserve deterministic filtering and public sorting
+ *
+ * PARENTS
+ * - app/api/summary/route.ts
+ * - scan-snapshot-service
+ * - scan-contract
+ * - snapshot
  *
  * DIRECTIVES
  * - FR / EU compatible public output
  * - EUR is the default quote
+ * - public API only
  * - no RFS recomputation
  * - no MCI recomputation
+ * - no calibration recomputation
+ * - no snapshot reconstruction
  * - no regime exposure
  * - no decision exposure
  * - no opportunity exposure
@@ -24,21 +33,15 @@
 
 import { NextRequest, NextResponse } from "next/server";
 
-import { getFromCache, scanKey } from "@/lib/xyvala/cache/cache-core";
-
-import {
-  isScanSnapshot,
-  XYVALA_SNAPSHOT_VERSION,
-  type Market,
-  type Quote,
-  type ScanSnapshot,
-} from "@/lib/xyvala/snapshot";
+import { readScanSnapshot } from "@/lib/xyvala/services/scan-snapshot-service";
 
 import type { ScanAsset } from "@/lib/xyvala/contracts/scan-contract";
 
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
-export const revalidate = 0;
+import {
+  XYVALA_SNAPSHOT_VERSION,
+  type Market,
+  type Quote,
+} from "@/lib/xyvala/snapshot";
 
 /* ============================================================================
  * 1. TYPES
@@ -92,15 +95,13 @@ type ScanRouteResponse = {
 
 const DEFAULT_MARKET: Market = "crypto";
 const DEFAULT_QUOTE: Quote = "eur";
+
 const DEFAULT_SORT: SortKey = "rank";
 const DEFAULT_ORDER: SortOrder = "asc";
+
 const DEFAULT_LIMIT: number | null = null;
-
-const MAX_LIMIT = 250;
-
-const PUBLIC_SCAN_LIMIT = 10;
-
-const SNAPSHOT_TTL_MS = 60_000;
+const DEFAULT_PUBLIC_SCAN_LIMIT = 10;
+const MAX_PUBLIC_SCAN_LIMIT = 250;
 
 /* ============================================================================
  * 3. SAFE HELPERS
@@ -130,6 +131,7 @@ function safeRank(value: unknown): number {
 
 function clamp(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) return min;
+
   return Math.max(min, Math.min(max, value));
 }
 
@@ -163,6 +165,7 @@ function normalizeQuote(value: string | null): Quote {
 
 function normalizeSearch(value: string | null): string | null {
   const q = safeLower(value);
+
   return q.length > 0 ? q : null;
 }
 
@@ -186,7 +189,9 @@ function normalizeOrder(value: string | null): SortOrder {
 }
 
 function normalizeLimit(value: string | null): number | null {
-  if (value === null || value.trim() === "") return DEFAULT_LIMIT;
+  if (value === null || value.trim() === "") {
+    return DEFAULT_LIMIT;
+  }
 
   const parsed = Number(value);
 
@@ -194,7 +199,7 @@ function normalizeLimit(value: string | null): number | null {
     return DEFAULT_LIMIT;
   }
 
-  return clamp(Math.trunc(parsed), 1, MAX_LIMIT);
+  return clamp(Math.trunc(parsed), 1, MAX_PUBLIC_SCAN_LIMIT);
 }
 
 function parseBool(value: string | null): boolean {
@@ -322,11 +327,10 @@ function buildResponse(input: {
   order: SortOrder;
   limit: number | null;
   data: ScanAsset[];
+  total: number;
   warnings: string[];
   error: string | null;
 }): ScanRouteResponse {
-  const count = input.data.length;
-
   return {
     ok: input.ok,
     ts: nowIso(),
@@ -334,8 +338,8 @@ function buildResponse(input: {
     source: input.source,
     market: DEFAULT_MARKET,
     quote: input.quote,
-    count,
-    total: count,
+    count: input.data.length,
+    total: Math.max(0, input.total),
     data: input.data,
     context: computeContext(input.data),
     warnings: input.warnings,
@@ -366,29 +370,13 @@ export async function GET(req: NextRequest) {
   const noStore = parseBool(searchParams.get("noStore"));
 
   try {
-
-    const snapshotKey = scanKey({
-  version: XYVALA_SNAPSHOT_VERSION,
-  market: DEFAULT_MARKET,
-  quote,
-  sort: DEFAULT_SORT,
-  order: DEFAULT_ORDER,
-  limit: MAX_LIMIT,
-  q: null,
-});
-
-console.log("[SCAN] reading snapshot", {
-  quote,
-  noStore,
-  snapshotKey,
-});
-
-
-    const snapshot = noStore
+    const snapshotResult = noStore
       ? null
-      : await getFromCache<ScanSnapshot>(snapshotKey, SNAPSHOT_TTL_MS);
+      : await readScanSnapshot({ quote });
 
-    if (!snapshot || !isScanSnapshot(snapshot)) {
+    const snapshot = snapshotResult?.snapshot ?? null;
+
+    if (!snapshotResult?.ok || snapshot === null) {
       const payload = buildResponse({
         ok: false,
         source: "fallback",
@@ -398,6 +386,7 @@ console.log("[SCAN] reading snapshot", {
         order,
         limit,
         data: [],
+        total: 0,
         warnings: uniqueWarnings(["scan_snapshot_unavailable"]),
         error: "scan_snapshot_unavailable",
       });
@@ -414,7 +403,11 @@ console.log("[SCAN] reading snapshot", {
     }
 
     let data = [...snapshot.data];
-    const warnings = uniqueWarnings(snapshot.meta?.warnings);
+
+    const warnings = uniqueWarnings(
+      snapshot.meta?.warnings,
+      snapshotResult.warnings,
+    );
 
     if (q) {
       data = data.filter((asset) => {
@@ -426,14 +419,16 @@ console.log("[SCAN] reading snapshot", {
       });
     }
 
+    const total = data.length;
+
     data = sortAssets(data, sort, order);
 
     const effectiveLimit =
-  limit === null
-    ? PUBLIC_SCAN_LIMIT
-    : Math.min(limit, PUBLIC_SCAN_LIMIT);
+      limit === null
+        ? DEFAULT_PUBLIC_SCAN_LIMIT
+        : Math.min(limit, MAX_PUBLIC_SCAN_LIMIT);
 
-data = data.slice(0, effectiveLimit);
+    data = data.slice(0, effectiveLimit);
 
     const payload = buildResponse({
       ok: true,
@@ -444,6 +439,7 @@ data = data.slice(0, effectiveLimit);
       order,
       limit: effectiveLimit,
       data,
+      total,
       warnings,
       error: null,
     });
@@ -467,6 +463,7 @@ data = data.slice(0, effectiveLimit);
       order,
       limit,
       data: [],
+      total: 0,
       warnings: uniqueWarnings(["scan_route_error"]),
       error:
         error instanceof Error && error.message

@@ -1,10 +1,46 @@
 /* ============================================================================
  * FILE: lib/xyvala/factories/scan-asset-factory.ts
+ * ----------------------------------------------------------------------------
+ * TITLE
+ * - Xyvala private scan asset factory
+ *
+ * ROLE
+ * - build normalized PrivateScanAsset objects
+ * - enforce private scan contract completeness
+ * - normalize market, structural, rupture, temporal, triple layer, impulse,
+ *   neutralization, calibration and decision fields
+ *
+ * DIRECTIVES
+ * - private factory only
+ * - no API logic
+ * - no UI logic
+ * - no RFS recomputation
+ * - no MCI recomputation
+ * - no calibration recomputation
+ * - no public projection
+ * - no persistence
+ * - no mutation
+ * - deterministic normalization only
+ * - EUR remains the default monetary reference
+ *
+ * INPUTS
+ * - BuildPrivateScanAssetInput
+ *
+ * OUTPUTS
+ * - PrivateScanAsset
+ *
+ * INVARIANTS
+ * - every PrivateScanAsset field is initialized
+ * - null means explicitly unavailable
+ * - WATCH remains defensive default
+ * - NEUTRAL remains impulse fallback
+ * - private analytical fields remain private
  * ========================================================================== */
 
 import type { Quote } from "@/lib/xyvala/snapshot";
 
 import type {
+  PrivateAggregatedContext,
   PrivateCalibrationStatus,
   PrivateDecisionStatus,
   PrivateImpulseDirectionalBias,
@@ -18,6 +54,10 @@ import type {
   PrivateScanStatus,
   PrivateTripleLayerState,
 } from "@/lib/xyvala/contracts/scan-private-contract";
+
+/* ============================================================================
+ * 1. INPUT TYPES
+ * ========================================================================== */
 
 export type BuildPrivateScanAssetInput = {
   id?: unknown;
@@ -76,6 +116,8 @@ export type BuildPrivateScanAssetInput = {
   decay_status?: unknown;
 
   impulse_pressure_score?: unknown;
+  impulse_acceleration_score?: unknown;
+  impulse_alignment_score?: unknown;
   impulse_instability_score?: unknown;
   impulse_saturation_score?: unknown;
   impulse_exhaustion_score?: unknown;
@@ -102,6 +144,21 @@ export type BuildPrivateScanAssetInput = {
   confidence_status?: unknown;
   continuity_probability?: unknown;
 
+    structural_context?: unknown;
+  transition_context?: unknown;
+  risk_context?: unknown;
+  temporal_context?: unknown;
+
+  decision_score?: unknown;
+
+  calibration_allow_threshold?: unknown;
+  calibration_watch_threshold?: unknown;
+  calibration_block_threshold?: unknown;
+
+  public_impulse_context?: unknown;
+  public_structure_transition?: unknown;
+  ui_stability_label?: unknown;
+
   analytical_version?: unknown;
   generated_at?: unknown;
   source?: unknown;
@@ -117,6 +174,10 @@ type TemporalInput = {
   rupture_probability?: unknown;
   status?: unknown;
 };
+
+/* ============================================================================
+ * 2. SAFE HELPERS
+ * ========================================================================== */
 
 function safeString(value: unknown, fallback = ""): string {
   return typeof value === "string" && value.trim().length > 0
@@ -167,6 +228,10 @@ function normalizeWarnings(value: unknown): string[] {
     ),
   ];
 }
+
+/* ============================================================================
+ * 3. ENUM NORMALIZERS
+ * ========================================================================== */
 
 function normalizeQuote(value: unknown): Quote {
   const quote = safeString(value).toLowerCase();
@@ -324,6 +389,18 @@ function normalizeTimingState(
   return "UNKNOWN";
 }
 
+function normalizeSource(value: unknown): "scan" | "snapshot" | "runtime" | "fallback" {
+  if (value === "snapshot") return "snapshot";
+  if (value === "runtime") return "runtime";
+  if (value === "fallback") return "fallback";
+
+  return "scan";
+}
+
+/* ============================================================================
+ * 4. STRUCTURE NORMALIZERS
+ * ========================================================================== */
+
 function normalizeSparkline(value: unknown): number[] | null {
   if (!Array.isArray(value)) return null;
 
@@ -341,10 +418,10 @@ function normalizeTemporalBlock(value: unknown) {
       ? (value as TemporalInput)
       : {};
 
+  const priceScore = normalizeScore(input.price_score);
   const stabilityScore = normalizeScore(input.stability_score);
   const ruptureScore = normalizeScore(input.rupture_score);
   const ruptureProbability = normalizeScore(input.rupture_probability);
-  const priceScore = normalizeScore(input.price_score);
 
   return {
     price_score: priceScore,
@@ -357,13 +434,25 @@ function normalizeTemporalBlock(value: unknown) {
   };
 }
 
-function normalizeSource(value: unknown): "scan" | "snapshot" | "runtime" | "fallback" {
-  if (value === "snapshot") return "snapshot";
-  if (value === "runtime") return "runtime";
-  if (value === "fallback") return "fallback";
+function normalizeAggregatedContext(
+  value: unknown,
+): PrivateAggregatedContext | null {
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
 
-  return "scan";
+  const input = value as Partial<PrivateAggregatedContext>;
+
+  return {
+    state: safeString(input.state, "unknown"),
+    status: normalizeScanStatus(input.status),
+    reason: safeNullableString(input.reason),
+  };
 }
+
+/* ============================================================================
+ * 5. FACTORY
+ * ========================================================================== */
 
 export function buildPrivateScanAsset(
   input: BuildPrivateScanAssetInput,
@@ -382,6 +471,10 @@ export function buildPrivateScanAsset(
   const decayScore = normalizeScore(input.decay_score);
 
   const impulsePressureScore = normalizeScore(input.impulse_pressure_score);
+  const impulseAccelerationScore = normalizeScore(
+    input.impulse_acceleration_score,
+  );
+  const impulseAlignmentScore = normalizeScore(input.impulse_alignment_score);
   const impulseInstabilityScore = normalizeScore(
     input.impulse_instability_score,
   );
@@ -405,6 +498,7 @@ export function buildPrivateScanAsset(
 
     stability_score: stabilityScore,
     stability_status: normalizeScanStatus(input.stability_status, stabilityScore),
+
     structure_score: normalizeScore(input.structure_score),
     market_score: normalizeScore(input.market_score),
     coherence_score: normalizeScore(input.coherence_score),
@@ -414,7 +508,7 @@ export function buildPrivateScanAsset(
     convergence_score: normalizeScore(input.convergence_score),
     duration_score: normalizeScore(input.duration_score),
     evolution_score: normalizeScore(input.evolution_score),
-    growth_score: growthScore,
+   
 
     rupture_score: normalizeScore(input.rupture_score),
     rupture_probability: normalizeScore(input.rupture_probability),
@@ -439,13 +533,15 @@ export function buildPrivateScanAsset(
     timing_state: normalizeTimingState(input.timing_state),
 
     state: normalizeTripleLayerState(input.triple_layer_state),
-    core_pattern_score: corePatternScore,
-    decay_score: decayScore,
-    growth_status: normalizeScanStatus(input.growth_status, growthScore),
-    core_status: normalizeScanStatus(input.core_status, corePatternScore),
-    decay_status: normalizeScanStatus(input.decay_status, decayScore),
-
+growth_score: growthScore,
+core_pattern_score: corePatternScore,
+decay_score: decayScore,
+growth_status: normalizeScanStatus(input.growth_status, growthScore),
+core_status: normalizeScanStatus(input.core_status, corePatternScore),
+decay_status: normalizeScanStatus(input.decay_status, decayScore),
     impulse_pressure_score: impulsePressureScore,
+    impulse_acceleration_score: impulseAccelerationScore,
+    impulse_alignment_score: impulseAlignmentScore,
     impulse_instability_score: impulseInstabilityScore,
     impulse_saturation_score: impulseSaturationScore,
     impulse_exhaustion_score: impulseExhaustionScore,
@@ -478,6 +574,12 @@ export function buildPrivateScanAsset(
     decision: normalizeDecision(input.decision),
     decision_status: normalizeDecisionStatus(input.decision_status),
 
+    decision_score: normalizeScore(input.decision_score),
+
+    calibration_allow_threshold: normalizeScore(input.calibration_allow_threshold),
+calibration_watch_threshold: normalizeScore(input.calibration_watch_threshold),
+calibration_block_threshold: normalizeScore(input.calibration_block_threshold),
+
     opportunity_score: opportunityScore,
     opportunity_status: normalizeScanStatus(
       input.opportunity_status,
@@ -487,16 +589,42 @@ export function buildPrivateScanAsset(
     confidence_score: confidenceScore,
     confidence_status: normalizeScanStatus(input.confidence_status, confidenceScore),
 
-    continuity_probability: normalizeScore(input.continuity_probability),
+         continuity_probability: normalizeScore(input.continuity_probability),
+
+        structural_context: normalizeAggregatedContext(input.structural_context),
+transition_context: normalizeAggregatedContext(input.transition_context),
+risk_context: normalizeAggregatedContext(input.risk_context),
+temporal_context: normalizeAggregatedContext(input.temporal_context),
 
     governance: {
       analytical_version: safeString(input.analytical_version, "v1"),
-      generated_at: safeString(input.generated_at, new Date(0).toISOString()),
+      generated_at: safeString(
+        input.generated_at,
+        new Date(0).toISOString(),
+      ),
+
       source: normalizeSource(input.source),
       warnings: normalizeWarnings(input.warnings),
+
       deterministic: true,
       jurisdiction: "FR/EU",
       default_currency: "EUR",
+
+      lineage_status: "valid",
+      source_layer: "MARKET_TRACEABILITY_ADAPTER",
+      source_contract: "PrivateScanAsset",
+
+      propagation_path: [
+        "MARKET_EVALUATION",
+        "MARKET_TRACEABILITY_ADAPTER",
+        "PRIVATE_SCAN_ASSET",
+        "TRACEABILITY_STORE_ORCHESTRATOR",
+      ],
+
+      last_valid_boundary:
+        "MARKET_TRACEABILITY_ADAPTER_TO_PRIVATE_SCAN_ASSET",
+
+            first_invalid_boundary: null,
     },
   };
 }

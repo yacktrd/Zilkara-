@@ -1,8 +1,52 @@
 /* ============================================================================
  * FILE: lib/xyvala/services/raw-assets-service.ts
+ * ----------------------------------------------------------------------------
+ * TITLE
+ * - Xyvala canonical raw assets orchestration service
+ *
+ * ROLE
+ * - load provider assets
+ * - normalize provider payloads
+ * - evaluate private market structure internally
+ * - project evaluated assets into public ScanAsset contracts
+ * - expose deterministic public-safe scan assets only
+ *
+ * DIRECTIVES
+ * - orchestration service only
+ * - no API logic
+ * - no cache logic
+ * - no UI logic
+ * - no snapshot logic
+ * - no public/private contract mixing
+ * - no broker exposure
+ * - no affiliate exposure
+ * - no regime exposure
+ * - no decision exposure
+ * - no opportunity exposure
+ * - no confidence exposure
+ * - no rupture exposure
+ * - no calibration exposure
+ * - RFS/MCI remain internal only
+ * - ScanAsset is the only public output contract
+ * - deterministic output only
+ * - same input => same output
+ *
+ * INVARIANTS
+ * - EUR remains default quote
+ * - snapshot layer remains passive
+ * - public layers never reconstruct analytical states
+ * - null means unavailable
+ * - undefined must never leak
  * ========================================================================== */
 
 import type { Quote } from "@/lib/xyvala/snapshot";
+import type { ScanAsset } from "@/lib/xyvala/contracts/scan-contract";
+
+import { buildPublicStructure } from "@/lib/xyvala/public/public-structure";
+
+import {
+  runTraceabilityRuntimeTest,
+} from "@/lib/xyvala/governance/traceability-runtime-test";
 
 import {
   mapCoinGeckoAsset,
@@ -11,45 +55,28 @@ import {
 
 import { runMappingRfs } from "@/lib/xyvala/mapping/mapping-rfs";
 import { runMappingMci } from "@/lib/xyvala/mapping/mapping-mci";
+
 import { runRfsMarket } from "@/lib/xyvala/engine/rfs-market";
 import { runMciMarket } from "@/lib/xyvala/engine/mci-market";
+
+import { adaptMarketEvaluationsToPrivateScanAssets } from "@/lib/xyvala/stores/market-traceability-adapter";
+
+import { recordScanTraceability } from "@/lib/xyvala/stores/traceability-store-orchestrator";
+
+import {
+  orchestrateImpulseCalibration,
+} from "@/lib/xyvala/calibration/impulse-calibration-orchestrator";
 
 /* ============================================================================
  * 1. TYPES
  * ========================================================================== */
 
-export type RawAsset = {
-  id: string;
-  symbol: string;
-  name: string;
-
-  price: number | null;
-  chg_24h_pct: number | null;
-  chg_7d_pct: number | null;
-
-  stability_score: number | null;
-  opportunity_score: number | null;
-
-  regime: "STABLE" | "TRANSITION" | "VOLATILE" | null;
-  decision: "ALLOW" | "WATCH" | "BLOCK" | null;
-
-  market_cap: number | null;
-  volume_24h: number | null;
-
-  sparkline_7d: number[] | null;
-
-  rank: number | null;
-  logo_url: string | null;
-
-  binance_url: string;
-  affiliate_url: string;
-};
-
 export type RawAssetsResult = {
   ok: boolean;
-  data: RawAsset[];
+  data: ScanAsset[];
   warnings: string[];
   error: string | null;
+
   meta?: {
     quote: Quote;
     source_mode: "FULL" | "DEGRADED" | "EMERGENCY";
@@ -59,7 +86,6 @@ export type RawAssetsResult = {
     provider_mapped_count: number;
     mapping_rfs_count: number;
     propagated_count: number;
-    mapping_propagation_decision: "ALLOW" | "WATCH" | "BLOCK";
     mapping_propagation_mode: "FULL" | "DEGRADED" | "BLOCKED";
   };
 };
@@ -68,23 +94,6 @@ type MarketEvaluation = {
   mapped: CoinGeckoMappedAsset;
   marketRfs: ReturnType<typeof runRfsMarket>;
   marketMci: ReturnType<typeof runMciMarket>;
-};
-
-type BuildMetaInput = {
-  quote: Quote;
-  sourceMode: NonNullable<RawAssetsResult["meta"]>["source_mode"];
-  fallbackLevel: NonNullable<RawAssetsResult["meta"]>["fallback_level"];
-  degradationScore: number;
-  providerRawCount: number;
-  providerMappedCount: number;
-  mappingRfsCount: number;
-  propagatedCount: number;
-  mappingPropagationDecision: NonNullable<
-    RawAssetsResult["meta"]
-  >["mapping_propagation_decision"];
-  mappingPropagationMode: NonNullable<
-    RawAssetsResult["meta"]
-  >["mapping_propagation_mode"];
 };
 
 /* ============================================================================
@@ -97,22 +106,32 @@ const DEFAULT_PER_PAGE = 250;
 const DEFAULT_PAGE = 1;
 const REQUEST_TIMEOUT_MS = 12_000;
 
-const MIN_EMERGENCY_UNIVERSE = 20;
-const MAX_EMERGENCY_UNIVERSE = 50;
-
 /* ============================================================================
  * 3. SAFE HELPERS
  * ========================================================================== */
 
-function safeStr(value: unknown, fallback = ""): string {
+function safeString(value: unknown, fallback = ""): string {
   return typeof value === "string" && value.trim().length > 0
     ? value.trim()
     : fallback;
 }
 
+function sanitizePublicWarnings(warnings: string[]): string[] {
+  return warnings.filter(
+    (warning) =>
+      !warning.includes("decision") &&
+      !warning.includes("allow") &&
+      !warning.includes("watch") &&
+      !warning.includes("block"),
+  );
+}
+
 function safeUpper(value: unknown, fallback = ""): string {
-  const text = safeStr(value, fallback);
-  return text ? text.toUpperCase() : "";
+  return safeString(value, fallback).toUpperCase();
+}
+
+function safeNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 function normalizeQuote(value: Quote | string | null | undefined): Quote {
@@ -120,10 +139,6 @@ function normalizeQuote(value: Quote | string | null | undefined): Quote {
   if (value === "usdt") return "usdt";
 
   return DEFAULT_QUOTE;
-}
-
-function buildAbortSignal(timeoutMs: number): AbortSignal {
-  return AbortSignal.timeout(timeoutMs);
 }
 
 function uniqueWarnings(
@@ -141,22 +156,7 @@ function uniqueWarnings(
   ];
 }
 
-function countWarnings(warnings: string[]): string[] {
-  const counts = new Map<string, number>();
-
-  for (const warning of warnings) {
-    const key = safeStr(warning);
-    if (!key) continue;
-
-    counts.set(key, (counts.get(key) ?? 0) + 1);
-  }
-
-  return [...counts.entries()]
-    .sort((left, right) => left[0].localeCompare(right[0]))
-    .map(([warning, count]) => `${warning}:${count}`);
-}
-
-function normalizeArrayOfNumbers(value: unknown): number[] | null {
+function normalizeSparkline(value: unknown): number[] | null {
   if (!Array.isArray(value)) return null;
 
   const points = value.filter(
@@ -164,31 +164,11 @@ function normalizeArrayOfNumbers(value: unknown): number[] | null {
       typeof item === "number" && Number.isFinite(item),
   );
 
-  return points.length > 1 ? points : null;
-}
-
-function toNullableNumber(value: number | null | undefined): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
+  return points.length >= 2 ? points : null;
 }
 
 function mappedMarketCap(mapped: CoinGeckoMappedAsset): number {
-  return toNullableNumber(mapped.market_cap) ?? -1;
-}
-
-function regimeRank(value: "STABLE" | "TRANSITION" | "VOLATILE" | null): number {
-  if (value === "STABLE") return 3;
-  if (value === "TRANSITION") return 2;
-  if (value === "VOLATILE") return 1;
-
-  return 0;
-}
-
-function decisionRank(value: "ALLOW" | "WATCH" | "BLOCK" | null): number {
-  if (value === "ALLOW") return 3;
-  if (value === "WATCH") return 2;
-  if (value === "BLOCK") return 1;
-
-  return 0;
+  return safeNumber(mapped.market_cap) ?? -1;
 }
 
 /* ============================================================================
@@ -196,14 +176,14 @@ function decisionRank(value: "ALLOW" | "WATCH" | "BLOCK" | null): number {
  * ========================================================================== */
 
 async function fetchCoinGeckoMarkets(quote: Quote): Promise<unknown> {
-  const baseUrl = safeStr(
+  const baseUrl = safeString(
     process.env.COINGECKO_API_BASE_URL,
     DEFAULT_API_BASE_URL,
   );
 
-  const apiKey = safeStr(process.env.COINGECKO_API_KEY);
-
+  const apiKey = safeString(process.env.COINGECKO_API_KEY);
   const normalizedBaseUrl = `${baseUrl.replace(/\/+$/, "")}/`;
+
   const url = new URL("coins/markets", normalizedBaseUrl);
 
   url.searchParams.set("vs_currency", quote);
@@ -225,7 +205,7 @@ async function fetchCoinGeckoMarkets(quote: Quote): Promise<unknown> {
     method: "GET",
     headers,
     cache: "no-store",
-    signal: buildAbortSignal(REQUEST_TIMEOUT_MS),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
 
   if (!response.ok) {
@@ -236,109 +216,15 @@ async function fetchCoinGeckoMarkets(quote: Quote): Promise<unknown> {
 }
 
 /* ============================================================================
- * 5. RAW ASSET BUILDERS
+ * 5. PRIVATE MARKET EVALUATION
  * ========================================================================== */
 
-function buildBinanceUrl(symbol: string): string {
-  return `https://www.binance.com/en/trade/${symbol.toUpperCase()}_USDT`;
-}
-
-function buildAffiliateUrl(url: string): string {
-  const ref = safeStr(process.env.BINANCE_REF);
-  return ref ? `${url}?ref=${ref}` : url;
-}
-
-function toRawAssetFromEvaluation(
-  evaluation: MarketEvaluation,
-  identity?: {
-    id?: string;
-    symbol?: string;
-    name?: string;
-  },
-): RawAsset {
-  const { mapped, marketRfs, marketMci } = evaluation;
-
-  const symbol = safeUpper(
-    identity?.symbol,
-    safeUpper(mapped.canonical_symbol, "UNKNOWN"),
-  );
-
-  const id = safeStr(
-    identity?.id,
-    safeStr(mapped.canonical_id, symbol.toLowerCase()),
-  );
-
-  const name = safeStr(identity?.name, safeStr(mapped.canonical_name, symbol));
-
-  const binanceUrl = safeStr(mapped.binance_url) || buildBinanceUrl(symbol);
-
-  return {
-    id,
-    symbol,
-    name,
-
-    price: mapped.price,
-    chg_24h_pct: mapped.chg_24h_pct,
-    chg_7d_pct: mapped.chg_7d_pct,
-
-    stability_score: toNullableNumber(marketRfs.scores.stability),
-    opportunity_score: toNullableNumber(marketMci.opportunity_score),
-
-    regime: marketRfs.states.regime,
-    decision: marketMci.decision,
-
-    market_cap: mapped.market_cap,
-    volume_24h: mapped.volume_24h,
-
-    sparkline_7d: normalizeArrayOfNumbers(mapped.sparkline_7d),
-
-    rank: mapped.rank,
-    logo_url: mapped.logo_url,
-
-    binance_url: binanceUrl,
-    affiliate_url: safeStr(mapped.affiliate_url) || buildAffiliateUrl(binanceUrl),
-  };
-}
-
-function toEmergencyRawAsset(mapped: CoinGeckoMappedAsset): RawAsset {
-  const symbol = safeUpper(mapped.canonical_symbol, "UNKNOWN");
-  const id = safeStr(mapped.canonical_id, symbol.toLowerCase());
-  const name = safeStr(mapped.canonical_name, symbol);
-  const binanceUrl = safeStr(mapped.binance_url) || buildBinanceUrl(symbol);
-
-  return {
-    id,
-    symbol,
-    name,
-
-    price: mapped.price,
-    chg_24h_pct: mapped.chg_24h_pct,
-    chg_7d_pct: mapped.chg_7d_pct,
-
-    stability_score: 50,
-    opportunity_score: 35,
-
-    regime: "TRANSITION",
-    decision: "WATCH",
-
-    market_cap: mapped.market_cap,
-    volume_24h: mapped.volume_24h,
-
-    sparkline_7d: normalizeArrayOfNumbers(mapped.sparkline_7d),
-
-    rank: mapped.rank,
-    logo_url: mapped.logo_url,
-
-    binance_url: binanceUrl,
-    affiliate_url: safeStr(mapped.affiliate_url) || buildAffiliateUrl(binanceUrl),
-  };
-}
-
-/* ============================================================================
- * 6. MARKET EVALUATION
- * ========================================================================== */
-
-function evaluateMappedAsset(mapped: CoinGeckoMappedAsset): MarketEvaluation {
+function evaluateMappedAsset(
+  mapped: CoinGeckoMappedAsset,
+  adaptivePolicy?: ReturnType<
+    typeof orchestrateImpulseCalibration
+  >["policy"],
+): MarketEvaluation {
   const marketRfs = runRfsMarket({
     price: mapped.price,
     chg_24h_pct: mapped.chg_24h_pct,
@@ -346,6 +232,10 @@ function evaluateMappedAsset(mapped: CoinGeckoMappedAsset): MarketEvaluation {
     sparkline_7d: mapped.sparkline_7d,
     market_cap: mapped.market_cap,
     volume_24h: mapped.volume_24h,
+
+    ...(adaptivePolicy !== undefined
+      ? { adaptive_policy: adaptivePolicy }
+      : {}),
   });
 
   const marketMci = runMciMarket({
@@ -359,13 +249,78 @@ function evaluateMappedAsset(mapped: CoinGeckoMappedAsset): MarketEvaluation {
   };
 }
 
-function sortEvaluationsByPriority(
-  items: MarketEvaluation[],
+function buildImpulseCalibrationSample(
+  evaluation: MarketEvaluation,
+) {
+  const impulse = evaluation.marketRfs.impulse;
+
+  if (
+    impulse.impulse_status !== "computed" ||
+    impulse.impulse_pressure_score === null ||
+    impulse.impulse_acceleration_score === null ||
+    impulse.impulse_alignment_score === null ||
+    impulse.impulse_instability_score === null ||
+    impulse.impulse_saturation_score === null ||
+    impulse.impulse_exhaustion_score === null
+  ) {
+    return null;
+  }
+
+  return {
+    pressure_score: impulse.impulse_pressure_score,
+    acceleration_score: impulse.impulse_acceleration_score,
+    alignment_score: impulse.impulse_alignment_score,
+    instability_score: impulse.impulse_instability_score,
+    saturation_score: impulse.impulse_saturation_score,
+    exhaustion_score: impulse.impulse_exhaustion_score,
+
+    growth_score: null,
+    core_score: null,
+    decay_score: null,
+
+    transition_state: impulse.impulse_transition_state,
+  };
+}
+
+function buildImpulseCalibrationSamples(
+  evaluations: readonly MarketEvaluation[],
+) {
+  return evaluations
+    .map(buildImpulseCalibrationSample)
+    .filter((sample): sample is NonNullable<typeof sample> => sample !== null);
+}
+
+function evaluateMappedAssets(
+  mappedAssets: readonly CoinGeckoMappedAsset[],
 ): MarketEvaluation[] {
+  const firstPassEvaluations = mappedAssets.map((mapped) =>
+    evaluateMappedAsset(mapped),
+  );
+
+  const samples = buildImpulseCalibrationSamples(firstPassEvaluations);
+
+  const calibration = orchestrateImpulseCalibration({
+    samples,
+    write_store: false,
+  });
+
+  return mappedAssets.map((mapped) =>
+    evaluateMappedAsset(mapped, calibration.policy),
+  );
+}
+
+function regimeRank(value: unknown): number {
+  if (value === "STABLE") return 3;
+  if (value === "TRANSITION") return 2;
+  if (value === "VOLATILE") return 1;
+
+  return 0;
+}
+
+function sortEvaluations(items: MarketEvaluation[]): MarketEvaluation[] {
   return [...items].sort((left, right) => {
-    const leftStability = toNullableNumber(left.marketRfs.scores.stability) ?? 0;
-    const rightStability =
-      toNullableNumber(right.marketRfs.scores.stability) ?? 0;
+    const leftStability = safeNumber(left.marketRfs.scores.stability) ?? 0;
+    const rightStability = safeNumber(right.marketRfs.scores.stability) ?? 0;
 
     if (leftStability !== rightStability) {
       return rightStability - leftStability;
@@ -378,99 +333,117 @@ function sortEvaluationsByPriority(
       return rightRegime - leftRegime;
     }
 
-    const leftOpportunity =
-      toNullableNumber(left.marketMci.opportunity_score) ?? 0;
-    const rightOpportunity =
-      toNullableNumber(right.marketMci.opportunity_score) ?? 0;
+    const marketCapDelta =
+      mappedMarketCap(right.mapped) - mappedMarketCap(left.mapped);
 
-    if (leftOpportunity !== rightOpportunity) {
-      return rightOpportunity - leftOpportunity;
+    if (marketCapDelta !== 0) {
+      return marketCapDelta;
     }
 
-    const leftDecision = decisionRank(left.marketMci.decision);
-    const rightDecision = decisionRank(right.marketMci.decision);
-
-    if (leftDecision !== rightDecision) {
-      return rightDecision - leftDecision;
-    }
-
-    const leftMarketCap = mappedMarketCap(left.mapped);
-    const rightMarketCap = mappedMarketCap(right.mapped);
-
-    if (leftMarketCap !== rightMarketCap) {
-      return rightMarketCap - leftMarketCap;
-    }
-
-    return safeStr(left.mapped.canonical_id).localeCompare(
-      safeStr(right.mapped.canonical_id),
+    return safeString(left.mapped.canonical_id).localeCompare(
+      safeString(right.mapped.canonical_id),
     );
   });
 }
 
 /* ============================================================================
- * 7. META BUILDER
+ * 6. PRIVATE EVALUATION → PUBLIC SAFE PROJECTION
  * ========================================================================== */
 
-function buildMeta(input: BuildMetaInput): NonNullable<RawAssetsResult["meta"]> {
+function buildPublicScanAsset(
+  evaluation: MarketEvaluation,
+): ScanAsset {
+  const { mapped, marketMci } = evaluation;
+
+  const symbol = safeUpper(mapped.canonical_symbol, "UNKNOWN");
+  const id = safeString(mapped.canonical_id, symbol.toLowerCase());
+  const name = safeString(mapped.canonical_name, symbol);
+
+  const price = safeNumber(mapped.price);
+  const chg24hPct = safeNumber(mapped.chg_24h_pct);
+  const chg7dPct = safeNumber(mapped.chg_7d_pct);
+  const marketCap = safeNumber(mapped.market_cap);
+  const volume24h = safeNumber(mapped.volume_24h);
+  const sparkline7d = normalizeSparkline(mapped.sparkline_7d);
+
+  const publicLabels = buildPublicStructure({
+    pct_24h: chg24hPct,
+    pct_7d: chg7dPct,
+    volume_24h: volume24h,
+    market_cap: marketCap,
+    sparkline_7d: sparkline7d,
+    impulse_transition_state: marketMci.impulse_transition_state ?? null,
+  });
+
   return {
-    quote: input.quote,
-    source_mode: input.sourceMode,
-    fallback_level: input.fallbackLevel,
-    degradation_score: input.degradationScore,
-    provider_raw_count: input.providerRawCount,
-    provider_mapped_count: input.providerMappedCount,
-    mapping_rfs_count: input.mappingRfsCount,
-    propagated_count: input.propagatedCount,
-    mapping_propagation_decision: input.mappingPropagationDecision,
-    mapping_propagation_mode: input.mappingPropagationMode,
+    id,
+    symbol,
+    name,
+
+    price,
+    chg_24h_pct: chg24hPct,
+    chg_7d_pct: chg7dPct,
+
+    market_cap: marketCap,
+    volume_24h: volume24h,
+
+    sparkline_7d: sparkline7d,
+
+    public_activity: publicLabels.activity,
+    public_sparkline_context_7d: publicLabels.sparkline_context_7d,
+    public_structure_transition: publicLabels.structure_transition,
+    public_impulse_context: publicLabels.impulse_context,
+
+    rank: safeNumber(mapped.rank),
+    logo_url: safeString(mapped.logo_url) || null,
   };
 }
 
-function buildMappingMeta(input: {
-  quote: Quote;
-  mappingMci: ReturnType<typeof runMappingMci>;
-  providerRawCount: number;
-  providerMappedCount: number;
-  mappingRfsCount: number;
-  propagatedCount: number;
-}): NonNullable<RawAssetsResult["meta"]> {
-  return buildMeta({
-    quote: input.quote,
-    sourceMode: input.mappingMci.source_mode,
-    fallbackLevel: input.mappingMci.fallback_level,
-    degradationScore: input.mappingMci.degradation_score,
-    providerRawCount: input.providerRawCount,
-    providerMappedCount: input.providerMappedCount,
-    mappingRfsCount: input.mappingRfsCount,
-    propagatedCount: input.propagatedCount,
-    mappingPropagationDecision: input.mappingMci.mapping_propagation_decision,
-    mappingPropagationMode: input.mappingMci.mapping_propagation_mode,
-  });
-}
-
-function buildEmergencyMeta(input: {
-  quote: Quote;
-  providerRawCount: number;
-  providerMappedCount: number;
-  mappingRfsCount: number;
-  propagatedCount: number;
-}): NonNullable<RawAssetsResult["meta"]> {
-  return buildMeta({
-    quote: input.quote,
-    sourceMode: "EMERGENCY",
-    fallbackLevel: 2,
-    degradationScore: 100,
-    providerRawCount: input.providerRawCount,
-    providerMappedCount: input.providerMappedCount,
-    mappingRfsCount: input.mappingRfsCount,
-    propagatedCount: input.propagatedCount,
-    mappingPropagationDecision: "BLOCK",
-    mappingPropagationMode: "BLOCKED",
-  });
+function buildPublicAssetsFromEvaluations(
+  evaluations: readonly MarketEvaluation[],
+): ScanAsset[] {
+  return evaluations.map(buildPublicScanAsset);
 }
 
 /* ============================================================================
- * 8. PUBLIC API
+ * 7. PUBLIC API
+ * ============================================================================
+ *
+ * TRACEABILITY GOVERNANCE
+ * ----------------------------------------------------------------------------
+ * RESPONSIBILITY
+ * - orchestrate provider → mapping → evaluation → traceability → projection
+ *
+ * OFFICIAL CHAIN
+ * - provider acquisition
+ * - provider mapping
+ * - mapping governance
+ * - private market evaluation
+ * - private traceability adaptation
+ * - traceability validation
+ * - traceability persistence
+ * - public projection
+ * - public contract exposure
+ *
+ * FIRST DIVERGENCE RULE
+ * - every critical boundary is observable
+ * - every propagation rupture must be localizable
+ * - every traceability failure must expose its first failing stage
+ *
+ * PUBLIC PROTECTION
+ * - traceability remains private
+ * - public ScanAsset contract remains isolated
+ * - traceability failures never expose private analytical payloads
+ *
+ * DEGRADATION POLICY
+ * - traceability failure does not invalidate public projection
+ * - public projection failure remains blocking
+ *
+ * COMPUTE / OBSERVE / MUTATE
+ * - evaluation              => COMPUTE
+ * - runtime validation      => OBSERVE
+ * - traceability persistence => MUTATE
+ * - public projection       => COMPUTE
  * ========================================================================== */
 
 export async function loadRawAssets(
@@ -479,6 +452,11 @@ export async function loadRawAssets(
   const quote = normalizeQuote(inputQuote);
 
   try {
+    /* -----------------------------------------------------------------------
+     * STAGE 1
+     * PROVIDER ACQUISITION
+     * --------------------------------------------------------------------- */
+
     const rawSource = await fetchCoinGeckoMarkets(quote);
 
     if (!Array.isArray(rawSource)) {
@@ -487,209 +465,278 @@ export async function loadRawAssets(
         data: [],
         warnings: ["coingecko_invalid_root_shape"],
         error: "coingecko_invalid_root_shape",
-        meta: buildEmergencyMeta({
-          quote,
-          providerRawCount: 0,
-          providerMappedCount: 0,
-          mappingRfsCount: 0,
-          propagatedCount: 0,
-        }),
       };
     }
 
-    const providerMapped = rawSource
+    /* -----------------------------------------------------------------------
+     * STAGE 2
+     * PROVIDER MAPPING
+     * --------------------------------------------------------------------- */
+
+    const mappedAssets = rawSource
       .map((item) => mapCoinGeckoAsset(item, quote))
-      .filter((item): item is CoinGeckoMappedAsset => item !== null);
+      .filter(
+        (item): item is CoinGeckoMappedAsset =>
+          item !== null,
+      );
 
-    const providerRejectedCount = rawSource.length - providerMapped.length;
+    if (mappedAssets.length === 0) {
+      return {
+        ok: false,
+        data: [],
+        warnings: ["coingecko_provider_mapped_empty"],
+        error: "coingecko_provider_mapped_empty",
+      };
+    }
 
-    if (providerMapped.length === 0) {
+    /* -----------------------------------------------------------------------
+     * STAGE 3
+     * MAPPING GOVERNANCE
+     * --------------------------------------------------------------------- */
+
+    const mappingRfs = runMappingRfs(mappedAssets);
+    const mappingMci = runMappingMci(mappingRfs);
+
+    /* -----------------------------------------------------------------------
+     * STAGE 4
+     * PRIVATE MARKET EVALUATION
+     * --------------------------------------------------------------------- */
+
+    const evaluations = sortEvaluations(
+      evaluateMappedAssets(mappedAssets),
+    );
+
+    if (process.env.NODE_ENV !== "production") {
+      console.log("XYVALA_TRACE_STAGE_1_EVALUATIONS_OK", {
+        evaluations_count: evaluations.length,
+      });
+    }
+
+    /* -----------------------------------------------------------------------
+     * STAGE 5
+     * PRIVATE TRACEABILITY ADAPTATION
+     * --------------------------------------------------------------------- */
+
+    let traceabilityAdapter:
+      | ReturnType<
+          typeof adaptMarketEvaluationsToPrivateScanAssets
+        >
+      | null = null;
+
+    try {
+      if (process.env.NODE_ENV !== "production") {
+        console.log(
+          "XYVALA_TRACE_STAGE_2_BEFORE_ADAPTER",
+        );
+      }
+
+      traceabilityAdapter =
+        adaptMarketEvaluationsToPrivateScanAssets(
+          evaluations,
+        );
+
+      if (process.env.NODE_ENV !== "production") {
+        console.log("XYVALA_TRACE_STAGE_3_ADAPTER_OK", {
+          private_assets_count:
+            traceabilityAdapter.assets.length,
+        });
+      }
+    } catch (error) {
+      if (process.env.NODE_ENV !== "production") {
+        console.log(
+          "XYVALA_TRACE_STAGE_ADAPTER_FAILED",
+          error instanceof Error
+            ? error.message
+            : "unknown_error",
+        );
+      }
+    }
+
+    /* -----------------------------------------------------------------------
+     * STAGE 6
+     * TRACEABILITY VALIDATION
+     * --------------------------------------------------------------------- */
+
+    if (
+      process.env.NODE_ENV !== "production" &&
+      traceabilityAdapter &&
+      traceabilityAdapter.assets.length > 0
+    ) {
+      try {
+        console.log(
+          "XYVALA_TRACE_STAGE_4_BEFORE_RUNTIME_TEST",
+        );
+
+        const traceabilityRuntimeTest =
+          runTraceabilityRuntimeTest({
+            assets: traceabilityAdapter.assets,
+          });
+
+        console.log(
+          "XYVALA_TRACE_STAGE_5_RUNTIME_TEST_OK",
+          {
+            ok: traceabilityRuntimeTest.ok,
+            status: traceabilityRuntimeTest.status,
+            asset_count:
+              traceabilityRuntimeTest.asset_count,
+            trace_count:
+              traceabilityRuntimeTest.trace_count,
+            governor_ok:
+              traceabilityRuntimeTest.governor_ok,
+            coverage_ok:
+              traceabilityRuntimeTest.coverage_ok,
+            registry_audit_ok:
+              traceabilityRuntimeTest.registry_audit_ok,
+            governance_runtime_ok:
+              traceabilityRuntimeTest.governance_runtime_ok,
+            warnings:
+              traceabilityRuntimeTest.warnings,
+          },
+        );
+      } catch (error) {
+        console.log(
+          "XYVALA_TRACE_STAGE_RUNTIME_TEST_FAILED",
+          error instanceof Error
+            ? error.message
+            : "unknown_error",
+        );
+      }
+    }
+
+    /* -----------------------------------------------------------------------
+     * STAGE 7
+     * TRACEABILITY PERSISTENCE
+     * --------------------------------------------------------------------- */
+
+    if (
+      traceabilityAdapter &&
+      traceabilityAdapter.assets.length > 0
+    ) {
+      try {
+        if (process.env.NODE_ENV !== "production") {
+          console.log(
+            "XYVALA_TRACE_STAGE_6_BEFORE_RECORD",
+          );
+        }
+
+        const traceabilityResult =
+          recordScanTraceability({
+            assets: traceabilityAdapter.assets,
+            snapshot_version:
+              "market-traceability-v1",
+            analytical_version:
+              "market-traceability-v1",
+          });
+
+        if (process.env.NODE_ENV !== "production") {
+          console.log(
+            "XYVALA_TRACE_STAGE_7_RECORD_OK",
+            {
+              status: traceabilityResult.status,
+              count: traceabilityResult.count,
+              recorded_count:
+                traceabilityResult.recorded_count,
+              partial_count:
+                traceabilityResult.partial_count,
+              invalid_count:
+                traceabilityResult.invalid_count,
+              warnings:
+                traceabilityResult.warnings,
+            },
+          );
+        }
+      } catch (error) {
+        if (process.env.NODE_ENV !== "production") {
+          console.log(
+            "XYVALA_TRACE_STAGE_RECORD_FAILED",
+            error instanceof Error
+              ? error.message
+              : "unknown_error",
+          );
+        }
+      }
+    }
+
+    /* -----------------------------------------------------------------------
+     * STAGE 8
+     * PUBLIC PROJECTION
+     * --------------------------------------------------------------------- */
+
+    if (process.env.NODE_ENV !== "production") {
+      console.log(
+        "XYVALA_TRACE_STAGE_8_BEFORE_PUBLIC_PROJECTION",
+      );
+    }
+
+    const publicAssets =
+      buildPublicAssetsFromEvaluations(evaluations);
+
+    if (publicAssets.length === 0) {
       return {
         ok: false,
         data: [],
         warnings: uniqueWarnings(
-          providerRejectedCount > 0
-            ? [`coingecko_provider_assets_rejected:${providerRejectedCount}`]
-            : [],
-          ["coingecko_provider_mapped_empty"],
-        ),
-        error: "coingecko_provider_mapped_empty",
-        meta: buildEmergencyMeta({
-          quote,
-          providerRawCount: rawSource.length,
-          providerMappedCount: 0,
-          mappingRfsCount: 0,
-          propagatedCount: 0,
-        }),
-      };
-    }
-
-    const mappingRfs = runMappingRfs(providerMapped);
-    const mappingMci = runMappingMci(mappingRfs);
-
-    const evaluations = sortEvaluationsByPriority(
-      providerMapped.map((mapped) => evaluateMappedAsset(mapped)),
-    );
-
-    const evaluationByCanonicalId = new Map(
-      evaluations
-        .filter((item) => safeStr(item.mapped.canonical_id).length > 0)
-        .map((item) => [safeStr(item.mapped.canonical_id), item]),
-    );
-
-    const marketWarningsAccumulator: string[] = [];
-
-    const fullyPropagatedAssets: RawAsset[] = mappingRfs.assets
-      .map((rfsAsset) => {
-        const source = evaluationByCanonicalId.get(
-          safeStr(rfsAsset.identity.canonical_id),
-        );
-
-        if (!source) {
-          marketWarningsAccumulator.push("mapping_source_not_found");
-          return null;
-        }
-
-        marketWarningsAccumulator.push(...source.marketRfs.warnings);
-        marketWarningsAccumulator.push(...source.marketMci.warnings);
-
-        return toRawAssetFromEvaluation(source, {
-          id: rfsAsset.identity.canonical_id,
-          symbol: rfsAsset.identity.canonical_symbol,
-          name: rfsAsset.identity.canonical_name,
-        });
-      })
-      .filter((item): item is RawAsset => item !== null);
-
-    const degradedAssetsFromEvaluations: RawAsset[] = evaluations.map((item) => {
-      marketWarningsAccumulator.push(...item.marketRfs.warnings);
-      marketWarningsAccumulator.push(...item.marketMci.warnings);
-
-      return toRawAssetFromEvaluation(item, {
-        id: safeStr(item.mapped.canonical_id),
-        symbol: safeUpper(item.mapped.canonical_symbol),
-        name: safeStr(item.mapped.canonical_name),
-      });
-    });
-
-    const emergencyUniverseSize = Math.max(
-      MIN_EMERGENCY_UNIVERSE,
-      Math.min(MAX_EMERGENCY_UNIVERSE, providerMapped.length),
-    );
-
-    const emergencyAssets = providerMapped
-      .slice(0, emergencyUniverseSize)
-      .map((mapped) => toEmergencyRawAsset(mapped));
-
-    const finalRejectedCount = Math.max(
-      0,
-      providerMapped.length - fullyPropagatedAssets.length,
-    );
-
-    if (mappingMci.propagation_usable && fullyPropagatedAssets.length > 0) {
-      return {
-        ok: true,
-        data: fullyPropagatedAssets,
-        warnings: uniqueWarnings(
-          providerRejectedCount > 0
-            ? [`coingecko_provider_assets_rejected:${providerRejectedCount}`]
-            : [],
-          finalRejectedCount > 0
-            ? [`mapping_assets_not_propagated:${finalRejectedCount}`]
-            : [],
           mappingRfs.warnings,
           mappingMci.warnings,
-          mappingMci.degraded_fields.length > 0
-            ? [`mapping_degraded_fields:${mappingMci.degraded_fields.join(",")}`]
-            : [],
-          countWarnings(marketWarningsAccumulator),
-          mappingMci.source_mode === "DEGRADED"
-            ? ["raw_assets_source_mode_degraded"]
-            : [],
+          ["public_assets_empty"],
         ),
-        error: null,
-        meta: buildMappingMeta({
-          quote,
-          mappingMci,
-          providerRawCount: rawSource.length,
-          providerMappedCount: providerMapped.length,
-          mappingRfsCount: mappingRfs.assets.length,
-          propagatedCount: fullyPropagatedAssets.length,
-        }),
+        error: "public_assets_empty",
       };
     }
 
-    if (degradedAssetsFromEvaluations.length > 0) {
-      return {
-        ok: true,
-        data: degradedAssetsFromEvaluations,
-        warnings: uniqueWarnings(
-          providerRejectedCount > 0
-            ? [`coingecko_provider_assets_rejected:${providerRejectedCount}`]
-            : [],
-          finalRejectedCount > 0
-            ? [`mapping_assets_not_propagated:${finalRejectedCount}`]
-            : [],
-          mappingRfs.warnings,
-          mappingMci.warnings,
-          mappingMci.blocking_reasons,
-          mappingMci.degraded_fields.length > 0
-            ? [`mapping_degraded_fields:${mappingMci.degraded_fields.join(",")}`]
-            : [],
-          ["raw_assets_fallback_level_1_degraded_universe"],
-          countWarnings(marketWarningsAccumulator),
-        ),
-        error: null,
-        meta: buildMappingMeta({
-          quote,
-          mappingMci,
-          providerRawCount: rawSource.length,
-          providerMappedCount: providerMapped.length,
-          mappingRfsCount: mappingRfs.assets.length,
-          propagatedCount: degradedAssetsFromEvaluations.length,
-        }),
-      };
-    }
+    /* -----------------------------------------------------------------------
+     * STAGE 9
+     * PUBLIC CONTRACT EXPOSURE
+     * --------------------------------------------------------------------- */
 
     return {
       ok: true,
-      data: emergencyAssets,
-      warnings: uniqueWarnings(
-        providerRejectedCount > 0
-          ? [`coingecko_provider_assets_rejected:${providerRejectedCount}`]
-          : [],
-        mappingRfs.warnings,
-        mappingMci.warnings,
-        mappingMci.blocking_reasons,
-        ["raw_assets_fallback_level_2_emergency_universe"],
+      data: publicAssets,
+      warnings: sanitizePublicWarnings(
+        uniqueWarnings(
+          mappingRfs.warnings,
+          mappingMci.warnings,
+        ),
       ),
       error: null,
-      meta: buildEmergencyMeta({
+      meta: {
         quote,
-        providerRawCount: rawSource.length,
-        providerMappedCount: providerMapped.length,
-        mappingRfsCount: mappingRfs.assets.length,
-        propagatedCount: emergencyAssets.length,
-      }),
+        source_mode: mappingMci.source_mode,
+        fallback_level: mappingMci.fallback_level,
+        degradation_score:
+          mappingMci.degradation_score,
+        provider_raw_count: rawSource.length,
+        provider_mapped_count: mappedAssets.length,
+        mapping_rfs_count: mappingRfs.assets.length,
+        propagated_count: publicAssets.length,
+        mapping_propagation_mode:
+          mappingMci.mapping_propagation_mode,
+      },
     };
   } catch (error) {
     const message =
       error instanceof Error && error.message
         ? error.message
-        : "coingecko_unknown_error";
+        : "raw_assets_unknown_error";
 
     return {
       ok: false,
       data: [],
-      warnings: uniqueWarnings([`raw_assets_load_failed:${message}`]),
+      warnings: uniqueWarnings([
+        `raw_assets_load_failed:${message}`,
+      ]),
       error: message,
-      meta: buildEmergencyMeta({
+      meta: {
         quote,
-        providerRawCount: 0,
-        providerMappedCount: 0,
-        mappingRfsCount: 0,
-        propagatedCount: 0,
-      }),
+        source_mode: "EMERGENCY",
+        fallback_level: 2,
+        degradation_score: 100,
+        provider_raw_count: 0,
+        provider_mapped_count: 0,
+        mapping_rfs_count: 0,
+        propagated_count: 0,
+        mapping_propagation_mode: "BLOCKED",
+      },
     };
   }
 }

@@ -37,6 +37,7 @@ export type StateAsset = Pick<
   | "name"
   | "logo_url"
   | "price"
+  | "public_impulse_context"
   | "chg_24h_pct"
   | "chg_7d_pct"
   | "market_cap"
@@ -65,6 +66,7 @@ function buildStateAsset(input: {
   sparkline_7d: number[] | null;
 }): ScanAsset {
   const publicStructure = buildPublicStructure({
+
     pct_24h: input.chg_24h_pct,
     pct_7d: input.chg_7d_pct,
     volume_24h: input.volume_24h,
@@ -73,12 +75,12 @@ function buildStateAsset(input: {
   });
 
   return {
-    ...input,
-    public_activity: publicStructure.activity,
-    public_sparkline_context_7d: publicStructure.sparkline_context_7d,
-    public_structure_transition: publicStructure.structure_transition,
-    public_impulse_context: "Unavailable", 
- };
+  ...input,
+  public_activity: publicStructure.activity,
+  public_sparkline_context_7d: publicStructure.sparkline_context_7d,
+  public_structure_transition: publicStructure.structure_transition,
+  public_impulse_context: publicStructure.impulse_context,
+};
 }
 
 /* ============================================================================
@@ -114,6 +116,7 @@ export async function getStateData(): Promise<StateAsset[]> {
     name: asset.name,
     logo_url: asset.logo_url,
     price: asset.price,
+    public_impulse_context: asset.public_impulse_context,
     chg_24h_pct: asset.chg_24h_pct,
     chg_7d_pct: asset.chg_7d_pct,
     market_cap: asset.market_cap,

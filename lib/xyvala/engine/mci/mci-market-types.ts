@@ -1,5 +1,43 @@
 /* ============================================================================
  * FILE: lib/xyvala/engine/mci/mci-market-types.ts
+ * ----------------------------------------------------------------------------
+ * TITLE
+ * - Xyvala private MCI market type contracts
+ *
+ * ROLE
+ * - define private MCI market input and output contracts
+ * - preserve RFS structural truth compatibility
+ * - expose private MCI decision, neutralization, rupture evolution, impulse and triple layer fields
+ * - keep analytical outputs private and traceability-ready
+ *
+ * PARENT FILES
+ * - lib/xyvala/engine/mci-market.ts
+ * - lib/xyvala/engine/rfs-market.ts
+ * - lib/xyvala/stores/market-traceability-adapter.ts
+ *
+ * DIRECTIVES
+ * - private contract only
+ * - no UI logic
+ * - no API logic
+ * - no snapshot shaping
+ * - no public exposure
+ * - no score computation
+ * - no decision computation
+ * - no calibration computation
+ * - no prediction
+ * - no investment semantics
+ * - RFS remains the structural source of truth
+ * - MCI remains the private orchestration layer
+ * - Triple Layer remains contextual and subordinate to RFS / rupture / stability
+ * - Impulse Layer remains contextual and subordinate to RFS / rupture / stability
+ * - null means explicitly unavailable
+ * - undefined must never be used as analytical absence
+ *
+ * INVARIANTS
+ * - stability > regime > rupture > rupture evolution > neutralization > triple layer > impulse > opportunity > confidence > decision
+ * - RFS structural truth must not be recomputed here
+ * - MCI result can contain private fields but must never be exposed publicly without a public-safe transformer
+ * - traceability stores may consume this contract privately
  * ========================================================================== */
 
 import type { RfsMarketResult } from "@/lib/xyvala/engine/rfs-market";
@@ -140,19 +178,48 @@ export type MciMarketImpulseLayer = {
 };
 
 /* ============================================================================
- * 7. DIAGNOSTICS
+ * 7. TRIPLE LAYER PRIVATE EXTENSION
+ * ========================================================================== */
+
+export type MciTripleLayerState =
+  | "growth_dominant"
+  | "core_dominant"
+  | "decay_dominant"
+  | "mixed"
+  | "unknown";
+
+export type MciTripleLayerStatus =
+  | "computed"
+  | "partial"
+  | "unavailable";
+
+export type MciMarketTripleLayer = {
+  triple_layer_state: MciTripleLayerState;
+
+  growth_score: number | null;
+  core_pattern_score: number | null;
+  decay_score: number | null;
+
+  growth_status: MciTripleLayerStatus;
+  core_status: MciTripleLayerStatus;
+  decay_status: MciTripleLayerStatus;
+};
+
+/* ============================================================================
+ * 8. DIAGNOSTICS
  * ========================================================================== */
 
 export type MciMarketDiagnostics = Record<string, number | boolean | string>;
 
 /* ============================================================================
- * 8. MARKET RESULT
+ * 9. MARKET RESULT
  * ========================================================================== */
 
 export type MciMarketResult =
   MciMarketNeutralization &
   MciMarketRuptureEvolution &
-  Partial<MciMarketImpulseLayer> & {
+  Partial<MciMarketImpulseLayer> &
+  Partial<MciMarketTripleLayer> & {
     decision: MarketDecision;
 
     opportunity_score: number;

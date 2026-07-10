@@ -5,70 +5,62 @@
  * - Xyvala internal calibration preview route
  *
  * ROLE
- * - expose private calibration preview data
- * - read stored DecisionSample entries
- * - build decision distribution policy
- * - build readable calibration state
- * - expose bounded sample preview and store stats
+ * - expose deterministic calibration preview
+ * - read calibration samples
+ * - execute calibration orchestrator
+ * - expose readable runtime calibration state
+ * - expose internal calibration observability
  *
  * DIRECTIVES
  * - private internal route only
- * - FR/EU compliance by default
- * - EUR monetary reference by default
- * - no personalized financial advice
- * - no public exploitable trading decision
- * - no provider parsing here
- * - no UI logic here
- * - no RFS recomputation here
- * - no MCI recomputation here
- * - no calibration mutation here
- * - no store mutation here
- * - no sample normalization here
- * - no policy mapping here
- * - deterministic outputs only
+ * - no RFS recomputation
+ * - no MCI recomputation
+ * - no market reconstruction
+ * - no UI logic
+ * - no calibration mutation
+ * - no local calibration rebuilding
+ * - orchestrator is the single runtime source
+ * - deterministic output only
+ * - FR/EU compliant
+ * - EUR reference by default
+ *
+ * INVARIANTS
+ * - same samples => same response
+ * - route never recalculates calibration logic
+ * - route only orchestrates exposure
+ * - runtime state comes from orchestrator only
  * ========================================================================== */
 
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { timingSafeEqual } from "node:crypto";
 import { NextResponse } from "next/server";
 
-import { buildDecisionDistributionPolicy } from "@/lib/xyvala/calibration/decision-distribution-core";
-import { buildDecisionCalibrationState } from "@/lib/xyvala/calibration/decision-calibration-state";
+import {
+  buildCalibrationOrchestratorResult,
+} from "@/lib/xyvala/calibration/calibration-orchestrator";
 
 import {
   getDecisionDistributionStoreStats,
   readDecisionDistributionSamples,
-} from "@/lib/xyvala/calibration/decision-distribution-store";
+
+} from "@/lib/xyvala/calibration/store/decision-distribution-store";
 
 import type {
-  DecisionSample,
+  DecisionDistribution,
   EvaluationHorizon,
-  PolicyResult,
 } from "@/lib/xyvala/calibration/calibration-contracts";
 
 /* ============================================================================
  * 1. CONFIG
  * ========================================================================== */
 
-const ROUTE_VERSION = "v1";
-
 const DEFAULT_ANALYTICAL_VERSION = "v8";
+
 const DEFAULT_HORIZON: EvaluationHorizon = "7D";
 
-const DEFAULT_PREVIEW_LIMIT = 12;
-const MAX_PREVIEW_LIMIT = 50;
-const STORE_READ_LIMIT = 250;
+const DEFAULT_SAMPLE_LIMIT = 1000;
 
 /* ============================================================================
- * 2. TYPES
- * ========================================================================== */
-
-type RequestContext = {
-  trace_id: string;
-  started_at: number;
-};
-
-/* ============================================================================
- * 3. INTERNAL ACCESS
+ * 2. INTERNAL ACCESS
  * ========================================================================== */
 
 function isInternalDebugEnabled(): boolean {
@@ -76,64 +68,102 @@ function isInternalDebugEnabled(): boolean {
 }
 
 function getInternalDebugToken(): string | null {
-  const value = process.env.XYVALA_INTERNAL_DEBUG_TOKEN?.trim();
-  return value && value.length > 0 ? value : null;
+  const value =
+    process.env.XYVALA_INTERNAL_DEBUG_TOKEN?.trim();
+
+  return value && value.length > 0
+    ? value
+    : null;
 }
 
-function extractProvidedToken(request: Request): string | null {
+function extractProvidedToken(
+  request: Request,
+): string | null {
   const headerToken =
-    request.headers.get("x-xyvala-internal-token")?.trim() ?? null;
+    request.headers
+      .get("x-xyvala-internal-token")
+      ?.trim() ?? null;
 
-  if (headerToken) return headerToken;
-
-  const authorization = request.headers.get("authorization")?.trim() ?? "";
-  const bearerPrefix = "Bearer ";
-
-  if (authorization.startsWith(bearerPrefix)) {
-    const bearerToken = authorization.slice(bearerPrefix.length).trim();
-    return bearerToken.length > 0 ? bearerToken : null;
+  if (headerToken) {
+    return headerToken;
   }
 
-  return null;
+  const authorization =
+    request.headers
+      .get("authorization")
+      ?.trim() ?? "";
+
+  const bearerPrefix = "Bearer ";
+
+  if (
+    !authorization.startsWith(
+      bearerPrefix,
+    )
+  ) {
+    return null;
+  }
+
+  const token = authorization
+    .slice(bearerPrefix.length)
+    .trim();
+
+  return token.length > 0
+    ? token
+    : null;
 }
 
 function safeCompareSecrets(
   provided: string | null,
   expected: string | null,
 ): boolean {
-  if (typeof provided !== "string" || typeof expected !== "string") {
+  if (
+    typeof provided !== "string" ||
+    typeof expected !== "string"
+  ) {
     return false;
   }
 
-  const providedBuffer = Buffer.from(provided, "utf8");
-  const expectedBuffer = Buffer.from(expected, "utf8");
+  const providedBuffer = Buffer.from(
+    provided,
+    "utf8",
+  );
 
-  if (providedBuffer.length !== expectedBuffer.length) {
+  const expectedBuffer = Buffer.from(
+    expected,
+    "utf8",
+  );
+
+  if (
+    providedBuffer.length !==
+    expectedBuffer.length
+  ) {
     return false;
   }
 
-  return timingSafeEqual(providedBuffer, expectedBuffer);
+  return timingSafeEqual(
+    providedBuffer,
+    expectedBuffer,
+  );
 }
 
 function unauthorized(
   message: string,
-  context: RequestContext,
   status = 403,
-) {
+): NextResponse {
   return NextResponse.json(
     {
       ok: false,
       error: message,
       ts: Date.now(),
-      version: ROUTE_VERSION,
+      version: "v1",
+
       meta: {
         internal: true,
-        trace_id: context.trace_id,
-        duration_ms: Date.now() - context.started_at,
       },
     },
     {
       status,
+
       headers: {
         "Cache-Control": "no-store",
       },
@@ -142,20 +172,37 @@ function unauthorized(
 }
 
 /* ============================================================================
- * 4. PARAM HELPERS
+ * 3. SAFE HELPERS
  * ========================================================================== */
 
-function parseSearchParam(request: Request, key: string): string | null {
-  const { searchParams } = new URL(request.url);
-  const raw = searchParams.get(key)?.trim();
-  return raw && raw.length > 0 ? raw : null;
+function safeString(
+  value: unknown,
+  fallback = "",
+): string {
+  return typeof value === "string" &&
+    value.trim().length > 0
+    ? value.trim()
+    : fallback;
 }
 
-function normalizeAnalyticalVersion(value: string | null): string {
-  return value && value.length > 0 ? value : DEFAULT_ANALYTICAL_VERSION;
+function parseSearchParam(
+  request: Request,
+  key: string,
+): string | null {
+  const { searchParams } =
+    new URL(request.url);
+
+  const raw =
+    searchParams.get(key)?.trim();
+
+  return raw && raw.length > 0
+    ? raw
+    : null;
 }
 
-function isEvaluationHorizon(value: unknown): value is EvaluationHorizon {
+function isEvaluationHorizon(
+  value: unknown,
+): value is EvaluationHorizon {
   return (
     value === "24H" ||
     value === "7D" ||
@@ -165,212 +212,271 @@ function isEvaluationHorizon(value: unknown): value is EvaluationHorizon {
   );
 }
 
-function normalizeHorizon(value: string | null): EvaluationHorizon {
-  return isEvaluationHorizon(value) ? value : DEFAULT_HORIZON;
+function normalizeAnalyticalVersion(
+  value: string | null,
+): string {
+  return safeString(
+    value,
+    DEFAULT_ANALYTICAL_VERSION,
+  );
 }
 
-function normalizeLimit(value: string | null): number {
-  const parsed = Number(value);
+function normalizeHorizon(
+  value: string | null,
+): EvaluationHorizon {
+  return isEvaluationHorizon(value)
+    ? value
+    : DEFAULT_HORIZON;
+}
 
-  if (!Number.isFinite(parsed)) {
-    return DEFAULT_PREVIEW_LIMIT;
+function toPercent(
+  value: unknown,
+): number {
+  if (
+    typeof value !== "number" ||
+    !Number.isFinite(value)
+  ) {
+    return 0;
   }
 
-  return Math.max(1, Math.min(MAX_PREVIEW_LIMIT, Math.trunc(parsed)));
+  return Math.round(
+    value <= 1
+      ? value * 100
+      : value,
+  );
 }
 
 /* ============================================================================
- * 5. STATE / PREVIEW HELPERS
+ * 4. SAMPLE ACCESS
  * ========================================================================== */
 
-function buildReadableStateFromPolicyResult(
-  policyResult: PolicyResult,
-): ReturnType<typeof buildDecisionCalibrationState> {
-  return buildDecisionCalibrationState({
-    policy: policyResult.policy,
-    policy_source: policyResult.policy_source,
-    sample_size: policyResult.sample_size,
-    effective_sample_size: policyResult.effective_sample_size,
-    observed_distribution: policyResult.observed_distribution,
-    regime_distribution: policyResult.regime_distribution,
-    warnings: policyResult.warnings,
-  });
-}
+function loadDecisionDistributionSamples(
+  input: {
+    analytical_version: string;
+    horizon: EvaluationHorizon;
+  },
+) {
+  return readDecisionDistributionSamples({
+    analytical_version:
+      input.analytical_version,
 
-function buildScoreSamplesPreview(samples: DecisionSample[], limit: number) {
-  return samples
-    .slice(-limit)
-    .reverse()
-    .map((sample) => ({
-      observed_ts: sample.observed_ts,
-      observed_horizon: sample.observed_horizon,
-      observed_analytical_version: sample.observed_analytical_version,
+    horizon: input.horizon,
 
-      asset_id: sample.asset_id,
-      symbol: sample.symbol,
-
-      observed_regime: sample.observed_regime,
-      observed_decision: sample.observed_decision,
-      observed_reason: sample.observed_reason ?? null,
-      observed_reliability: sample.observed_reliability ?? null,
-
-      mci_decision_score: sample.mci_decision_score,
-      mci_allow_raw_score: sample.mci_allow_raw_score,
-      mci_block_raw_score: sample.mci_block_raw_score,
-      mci_risk_rupture_probability:
-        sample.mci_risk_rupture_probability,
-      mci_decision_support_probability:
-        sample.mci_decision_support_probability,
-      mci_final_decision: sample.mci_final_decision,
-      mci_decision_reason: sample.mci_decision_reason ?? null,
-
-      stability: sample.stability ?? null,
-      opportunity: sample.opportunity ?? null,
-      convergence: sample.convergence ?? null,
-      confidence: sample.confidence ?? null,
-
-      recovery_probability: sample.recovery_probability ?? null,
-      recovery_rupture_dominance:
-        sample.recovery_rupture_dominance ?? null,
-
-      dominance_state: sample.dominance_state ?? null,
-
-      hard_block: sample.hard_block ?? false,
-      hard_allow_candidate: sample.hard_allow_candidate ?? false,
-    }));
+    limit: DEFAULT_SAMPLE_LIMIT,
+  }).samples;
 }
 
 /* ============================================================================
- * 6. PUBLIC ROUTE
+ * 5. READABLE VIEWS
  * ========================================================================== */
 
-export async function GET(request: Request) {
-  const context: RequestContext = {
-    trace_id: randomUUID(),
-    started_at: Date.now(),
+function buildDistributionSimple(
+  distribution: DecisionDistribution,
+) {
+  return {
+    ALLOW: toPercent(
+      distribution.allow,
+    ),
+
+    WATCH: toPercent(
+      distribution.watch,
+    ),
+
+    BLOCK: toPercent(
+      distribution.block,
+    ),
   };
+}
 
+function buildRegimeDistributionSimple(
+  input: {
+    STABLE: DecisionDistribution;
+    TRANSITION: DecisionDistribution;
+    VOLATILE: DecisionDistribution;
+  },
+) {
+  return {
+    STABLE:
+      buildDistributionSimple(
+        input.STABLE,
+      ),
+
+    TRANSITION:
+      buildDistributionSimple(
+        input.TRANSITION,
+      ),
+
+    VOLATILE:
+      buildDistributionSimple(
+        input.VOLATILE,
+      ),
+  };
+}
+
+/* ============================================================================
+ * 6. ROUTE HANDLER
+ * ========================================================================== */
+
+export async function GET(
+  request: Request,
+): Promise<NextResponse> {
   try {
-    if (!isInternalDebugEnabled()) {
-      return unauthorized("xyvala_internal_debug_disabled", context, 404);
+    if (
+      !isInternalDebugEnabled()
+    ) {
+      return unauthorized(
+        "xyvala_internal_debug_disabled",
+        404,
+      );
     }
 
-    const configuredToken = getInternalDebugToken();
-    const providedToken = extractProvidedToken(request);
+    const configuredToken =
+      getInternalDebugToken();
+
+    const providedToken =
+      extractProvidedToken(
+        request,
+      );
 
     if (!configuredToken) {
       return unauthorized(
         "xyvala_internal_debug_token_missing",
-        context,
         500,
       );
     }
 
-    if (!safeCompareSecrets(providedToken, configuredToken)) {
+    if (
+      !safeCompareSecrets(
+        providedToken,
+        configuredToken,
+      )
+    ) {
       return unauthorized(
         "xyvala_internal_debug_unauthorized",
-        context,
         401,
       );
     }
 
-    const analyticalVersion = normalizeAnalyticalVersion(
-      parseSearchParam(request, "analytical_version"),
-    );
+    const analyticalVersion =
+      normalizeAnalyticalVersion(
+        parseSearchParam(
+          request,
+          "analytical_version",
+        ),
+      );
 
-    const horizon = normalizeHorizon(parseSearchParam(request, "horizon"));
-    const limit = normalizeLimit(parseSearchParam(request, "limit"));
+    const horizon =
+      normalizeHorizon(
+        parseSearchParam(
+          request,
+          "horizon",
+        ),
+      );
 
-    const readResult = readDecisionDistributionSamples({
-      analytical_version: analyticalVersion,
-      horizon,
-      limit: STORE_READ_LIMIT,
-    });
+    const samples =
+      loadDecisionDistributionSamples(
+        {
+          analytical_version:
+            analyticalVersion,
 
-    const samples = readResult.samples;
+          horizon,
+        },
+      );
 
-    const decisionDistributionPolicy = buildDecisionDistributionPolicy({
-      samples,
-      analytical_version: analyticalVersion,
-      horizon,
-    });
+    const calibrationResult =
+      buildCalibrationOrchestratorResult(
+        {
+          samples,
 
-    const decisionCalibrationState = buildReadableStateFromPolicyResult(
-      decisionDistributionPolicy,
-    );
+          analytical_version:
+            analyticalVersion,
 
-    const scoreSamplesPreview = buildScoreSamplesPreview(samples, limit);
+          horizon,
 
-    const storeStats = getDecisionDistributionStoreStats();
+          persist_state: false,
+        },
+      );
 
     return NextResponse.json(
       {
         ok: true,
+
         ts: Date.now(),
-        version: ROUTE_VERSION,
+
+        version: "v1",
 
         data: {
-          decision_distribution_policy: decisionDistributionPolicy,
-          decision_calibration_state: decisionCalibrationState,
-          score_samples_preview: scoreSamplesPreview,
-          store_stats: storeStats,
+          calibration_result:
+            calibrationResult,
 
-          diagnostics: {
-            trace_id: context.trace_id,
-            duration_ms: Date.now() - context.started_at,
-            policy_source: decisionDistributionPolicy.policy_source,
-            sample_size: decisionDistributionPolicy.sample_size,
-            effective_sample_size:
-              decisionDistributionPolicy.effective_sample_size,
-            store_total: readResult.total,
-            store_returned: readResult.returned,
-            fallback_active:
-              decisionCalibrationState.flags.fallback_active,
-            global_outside_tolerance:
-              decisionCalibrationState.flags.global_outside_tolerance,
-            stable_outside_tolerance:
-              decisionCalibrationState.flags.stable_outside_tolerance,
-            transition_outside_tolerance:
-              decisionCalibrationState.flags.transition_outside_tolerance,
-            volatile_outside_tolerance:
-              decisionCalibrationState.flags.volatile_outside_tolerance,
-          },
+          decision_calibration_state:
+            calibrationResult.state,
+
+          distribution_simple:
+            buildDistributionSimple(
+              calibrationResult.observed_distribution,
+            ),
+
+          regime_distribution_simple:
+            buildRegimeDistributionSimple(
+              calibrationResult.regime_distribution,
+            ),
+
+          store_stats:
+            getDecisionDistributionStoreStats(),
         },
 
         meta: {
           internal: true,
-          trace_id: context.trace_id,
-          analytical_version: analyticalVersion,
+
+          analytical_version:
+            analyticalVersion,
+
           horizon,
-          preview_limit: limit,
-          sample_count: samples.length,
-          duration_ms: Date.now() - context.started_at,
+
+          sample_count:
+            samples.length,
+
+          effective_sample_size:
+            calibrationResult.effective_sample_size,
         },
       },
       {
         status: 200,
+
         headers: {
-          "Cache-Control": "no-store",
+          "Cache-Control":
+            "no-store",
         },
       },
     );
-  } catch {
+  } catch (error) {
     return NextResponse.json(
       {
         ok: false,
-        error: "xyvala_internal_calibration_preview_failed",
+
+        error:
+          "xyvala_internal_calibration_preview_failed",
+
         ts: Date.now(),
-        version: ROUTE_VERSION,
+
+        version: "v1",
+
         meta: {
           internal: true,
-          trace_id: context.trace_id,
-          duration_ms: Date.now() - context.started_at,
+
+          details:
+            error instanceof Error
+              ? error.message
+              : "unknown_internal_error",
         },
       },
       {
         status: 500,
+
         headers: {
-          "Cache-Control": "no-store",
+          "Cache-Control":
+            "no-store",
         },
       },
     );

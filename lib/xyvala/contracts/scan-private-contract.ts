@@ -121,6 +121,8 @@ export type PrivateScanMarketData = {
   sparkline_7d: number[] | null;
 };
 
+
+
 /* ============================================================================
  * 3. PRIVATE STRUCTURAL SCORES
  * ========================================================================== */
@@ -218,9 +220,12 @@ export type PrivateImpulseTransitionState =
 
 export type PrivateImpulseLayer = {
   impulse_pressure_score: number | null;
+  impulse_acceleration_score: number | null;
+  impulse_alignment_score: number | null;
   impulse_instability_score: number | null;
   impulse_saturation_score: number | null;
   impulse_exhaustion_score: number | null;
+
   impulse_directional_bias: PrivateImpulseDirectionalBias;
   impulse_transition_state: PrivateImpulseTransitionState;
   impulse_status: PrivateScanStatus;
@@ -238,7 +243,30 @@ export type PrivateNeutralization = {
 };
 
 /* ============================================================================
- * 8. PRIVATE CALIBRATION
+ * 8. PRIVATE ANALYTICAL AGGREGATION CONTEXTS
+ * ========================================================================== */
+
+export type PrivateAggregatedContextStatus =
+  | "computed"
+  | "partial"
+  | "degraded"
+  | "unavailable";
+
+export type PrivateAggregatedContext = {
+  state: string | null;
+  status: PrivateAggregatedContextStatus;
+  reason: string | null;
+};
+
+export type PrivateAnalyticalAggregationContexts = {
+  structural_context: PrivateAggregatedContext | null;
+  transition_context: PrivateAggregatedContext | null;
+  risk_context: PrivateAggregatedContext | null;
+  temporal_context: PrivateAggregatedContext | null;
+};
+
+/* ============================================================================
+ * 9. PRIVATE CALIBRATION
  * ========================================================================== */
 
 export type PrivateCalibration = {
@@ -246,16 +274,22 @@ export type PrivateCalibration = {
   calibration_version: string | null;
   calibration_source: "fallback" | "bootstrap" | "calibrated" | "degraded";
   calibration_warnings: string[];
+
+  calibration_allow_threshold: number | null;
+  calibration_watch_threshold: number | null;
+  calibration_block_threshold: number | null;
 };
 
 /* ============================================================================
- * 9. PRIVATE DECISION
+ * 10. PRIVATE DECISION
  * ========================================================================== */
 
 export type PrivateDecisionLayer = {
   regime: PrivateScanRegime;
   decision: PrivateScanDecision;
   decision_status: PrivateDecisionStatus;
+
+  decision_score: number | null;
 
   opportunity_score: number | null;
   opportunity_status: PrivateScanStatus;
@@ -267,8 +301,14 @@ export type PrivateDecisionLayer = {
 };
 
 /* ============================================================================
- * 10. PRIVATE GOVERNANCE
+ * 11. PRIVATE GOVERNANCE
  * ========================================================================== */
+
+export type PrivateLineageStatus =
+  | "valid"
+  | "partial"
+  | "invalid"
+  | "unavailable";
 
 export type PrivateScanGovernance = {
   analytical_version: string;
@@ -280,10 +320,18 @@ export type PrivateScanGovernance = {
   deterministic: true;
   jurisdiction: "FR/EU";
   default_currency: "EUR";
+
+  lineage_status: PrivateLineageStatus;
+  source_layer: string;
+  source_contract: string;
+  propagation_path: string[];
+
+  last_valid_boundary: string | null;
+  first_invalid_boundary: string | null;
 };
 
 /* ============================================================================
- * 11. PRIVATE SCAN ASSET
+ * 12. PRIVATE SCAN ASSET
  * ========================================================================== */
 
 export type PrivateScanAsset =
@@ -292,17 +340,18 @@ export type PrivateScanAsset =
     PrivateStructuralScores &
     PrivateRuptureScores &
     PrivateCrashScores &
-    PrivateImpulseLayer &
     PrivateTemporalScores &
     PrivateTripleLayer &
+    PrivateImpulseLayer &
     PrivateNeutralization &
+    PrivateAnalyticalAggregationContexts &
     PrivateCalibration &
     PrivateDecisionLayer & {
       governance: PrivateScanGovernance;
     };
 
 /* ============================================================================
- * 12. PRIVATE SNAPSHOT
+ * 13. PRIVATE SNAPSHOT
  * ========================================================================== */
 
 export type PrivateScanSnapshotMeta = {
@@ -325,7 +374,7 @@ export type PrivateScanSnapshot = {
 };
 
 /* ============================================================================
- * 13. PRIVATE CONTEXT
+ * 14 PRIVATE CONTEXT
  * ========================================================================== */
 
 export type PrivateMarketContext = {
@@ -346,7 +395,7 @@ export type PrivateMarketContext = {
 };
 
 /* ============================================================================
- * 14. PRIVATE HELPERS CONTRACTS
+ * 15. PRIVATE HELPERS CONTRACTS
  * ========================================================================== */
 
 export type PrivateScanAssetInput = Partial<PrivateScanAsset>;

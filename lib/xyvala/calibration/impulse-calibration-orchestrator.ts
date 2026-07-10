@@ -248,7 +248,20 @@ export function orchestrateImpulseCalibration(input: {
   timestamp?: number;
   write_store?: boolean;
 }): ImpulseCalibrationOrchestratorResult {
+  console.error("XYVALA_ORCHESTRATOR_INPUT", {
+    samples: input.samples.length,
+    timestamp: input.timestamp ?? null,
+    write_store: input.write_store ?? true,
+  });
+
   const policy = buildImpulseAdaptivePolicy(input.samples);
+
+  console.error("XYVALA_ORCHESTRATOR_POLICY", {
+    source: policy.source,
+    sample_size: policy.sample_size,
+    state_sample_size: policy.state_sample_size,
+    warnings: policy.warnings,
+  });
 
   const snapshotInput: {
     samples: readonly ImpulseAdaptiveSample[];

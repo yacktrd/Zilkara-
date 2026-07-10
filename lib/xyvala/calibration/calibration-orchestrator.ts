@@ -1,38 +1,13 @@
 /* ============================================================================
  * FILE: lib/xyvala/calibration/calibration-orchestrator.ts
- * ----------------------------------------------------------------------------
- * TITLE
- * - Xyvala calibration orchestrator
- *
- * ROLE
- * - orchestrate calibration workflow only
- * - consume normalized calibration samples
- * - consume calibration policy results
- * - assemble runtime calibration outputs
- * - persist readable calibration state
- *
- * DIRECTIVES
- * - orchestration only
- * - no heavy analytical reconstruction
- * - no sample normalization
- * - no validation logic
- * - no UI logic
- * - no API logic
- * - no RFS recomputation
- * - no MCI recomputation
- * - same input => same output
- *
- * INVARIANTS
- * - WATCH remains defensive default
- * - runtime state is deterministic
- * - orchestration never mutates samples
- * - orchestration only propagates governance
  * ========================================================================== */
 
-import { buildDecisionDistributionPolicy } from "@/lib/xyvala/calibration/decision-distribution-core";
+import {
+  buildDecisionDistributionPolicy,
+  computeDecisionPressure,
+} from "@/lib/xyvala/calibration/decision-distribution-core";
 
 import { setCalibrationState } from "@/lib/xyvala/calibration/decision-calibration-state";
-
 import { readDecisionDistributionSamples } from "@/lib/xyvala/calibration/store/decision-distribution-store";
 
 import type {
@@ -42,13 +17,11 @@ import type {
   CalibrationPolicy,
   CalibrationPolicySource,
   DecisionDistribution,
-  DecisionPressure,
   DecisionSample,
   EvaluationHorizon,
   NeutralizationSignals,
   OrchestratorInput,
   OrchestratorResult,
-  PressureState,
   ReadableState,
   ReadableThresholds,
   RecoveryPressure,
@@ -63,15 +36,12 @@ import type {
  * 1. CONFIG
  * ========================================================================== */
 
-const DEFAULT_ANALYTICAL_VERSION = "unknown";
-
-const DEFAULT_HORIZON: EvaluationHorizon = "default";
+const DEFAULT_ANALYTICAL_VERSION = "v8";
+const DEFAULT_HORIZON: EvaluationHorizon = "7D";
 
 const DEFAULT_MIN_SAMPLE_SIZE = 80;
-
 const BOOTSTRAP_MIN_SAMPLE_SIZE = 30;
-
-const MIN_CONFIDENCE_SCORE = 40;
+const MIN_CONFIDENCE_SCORE = 0;
 
 const TARGET_DISTRIBUTION: DecisionDistribution = {
   allow: 15,
@@ -87,12 +57,11 @@ const FALLBACK_POLICY: CalibrationPolicy = {
 };
 
 /* ============================================================================
- * 2. SAFE HELPERS
+ * 2. HELPERS
  * ========================================================================== */
 
 function clamp(value: number, min = 0, max = 100): number {
   if (!Number.isFinite(value)) return min;
-
   return Math.max(min, Math.min(max, value));
 }
 
@@ -101,9 +70,7 @@ function clampScore(value: number): number {
 }
 
 function safeNumber(value: unknown, fallback = 0): number {
-  return typeof value === "number" && Number.isFinite(value)
-    ? value
-    : fallback;
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
 function safeString(value: unknown, fallback = ""): string {
@@ -114,11 +81,7 @@ function safeString(value: unknown, fallback = ""): string {
 
 function average(values: number[]): number {
   if (values.length === 0) return 0;
-
-  return (
-    values.reduce((sum, value) => sum + value, 0) /
-    values.length
-  );
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
 function uniqueWarnings(
@@ -127,20 +90,17 @@ function uniqueWarnings(
   return [
     ...new Set(
       groups
-        .flatMap((group) =>
-          Array.isArray(group) ? group : [],
-        )
+        .flatMap((group) => (Array.isArray(group) ? group : []))
         .filter(
           (warning): warning is string =>
-            typeof warning === "string" &&
-            warning.trim().length > 0,
+            typeof warning === "string" && warning.trim().length > 0,
         ),
     ),
   ];
 }
 
 /* ============================================================================
- * 3. SAMPLE FILTERING
+ * 3. SAMPLE ACCESS
  * ========================================================================== */
 
 function readSamples(
@@ -148,17 +108,13 @@ function readSamples(
   analyticalVersion: string,
   horizon: EvaluationHorizon,
 ): DecisionSample[] {
-  if (Array.isArray(input.samples)) {
-    return input.samples;
-  }
+  if (Array.isArray(input.samples)) return input.samples;
 
-  const result = readDecisionDistributionSamples({
+  return readDecisionDistributionSamples({
     analytical_version: analyticalVersion,
     horizon,
     limit: 1000,
-  });
-
-  return result.samples;
+  }).samples;
 }
 
 function sanitizeSamples(
@@ -189,9 +145,13 @@ function sanitizeSamples(
 
     if (
       !Number.isFinite(sample.confidence_score) ||
-      (sample.confidence_score ?? 0) <
-        MIN_CONFIDENCE_SCORE
+      (sample.confidence_score ?? 0) < MIN_CONFIDENCE_SCORE
     ) {
+
+      console.log(
+  "[CONFIDENCE_REJECT_KEYS]",
+  Object.keys(sample),
+);
       confidenceRejected += 1;
       return false;
     }
@@ -199,73 +159,64 @@ function sanitizeSamples(
     return true;
   });
 
-  const warnings: string[] = [];
-
-  if (rejected > 0) {
-    warnings.push(
-      `calibration_samples_rejected:${rejected}`,
-    );
-  }
-
-  if (confidenceRejected > 0) {
-    warnings.push(
-      `calibration_confidence_rejected:${confidenceRejected}`,
-    );
-  }
-
   return {
     samples: valid,
-    warnings,
+    warnings: uniqueWarnings(
+      rejected > 0 ? [`calibration_samples_rejected:${rejected}`] : [],
+      confidenceRejected > 0
+        ? [`calibration_confidence_rejected:${confidenceRejected}`]
+        : [],
+    ),
   };
 }
 
 /* ============================================================================
- * 4. STRUCTURAL SCORING
+ * 4. LIGHT GOVERNANCE COMPUTATION
  * ========================================================================== */
+
+function resolveMaturity(
+  effectiveSampleSize: number,
+  minSampleSize: number,
+): CalibrationMaturity {
+  if (effectiveSampleSize < BOOTSTRAP_MIN_SAMPLE_SIZE) {
+    return "INSUFFICIENT_SAMPLES";
+  }
+
+  if (effectiveSampleSize < minSampleSize) {
+    return "BOOTSTRAP_ACTIVE";
+  }
+
+  return "CALIBRATED_ACTIVE";
+}
+
+function computeValidity(status: CalibrationMaturity): ValidityState {
+  if (status === "INSUFFICIENT_SAMPLES") return "insufficient_data";
+  if (status === "BOOTSTRAP_ACTIVE") return "degraded";
+  return "computed";
+}
 
 function computeStructuralScores(
   samples: DecisionSample[],
   distribution: DecisionDistribution,
 ): StructuralScores {
-  const occurrence = clampScore(
-    (samples.length / DEFAULT_MIN_SAMPLE_SIZE) * 100,
-  );
+  const occurrence = clampScore((samples.length / DEFAULT_MIN_SAMPLE_SIZE) * 100);
 
   const frequency = clampScore(
     100 -
-      (Math.abs(
-        distribution.allow -
-          TARGET_DISTRIBUTION.allow,
-      ) *
-        0.35 +
-        Math.abs(
-          distribution.watch -
-            TARGET_DISTRIBUTION.watch,
-        ) *
-          0.4 +
-        Math.abs(
-          distribution.block -
-            TARGET_DISTRIBUTION.block,
-        ) *
-          0.25),
+      (Math.abs(distribution.allow - TARGET_DISTRIBUTION.allow) * 0.35 +
+        Math.abs(distribution.watch - TARGET_DISTRIBUTION.watch) * 0.4 +
+        Math.abs(distribution.block - TARGET_DISTRIBUTION.block) * 0.25),
   );
 
   const convergence = clampScore(
-    average(
-      samples.map((sample) =>
-        safeNumber(sample.convergence_score, 50),
-      ),
-    ),
+    average(samples.map((sample) => safeNumber(sample.convergence_score, 50))),
   );
 
   const correlation = clampScore(
     average(
       samples.map((sample) => {
-        const support =
-          sample.mci_decision_support_probability;
-
-        const risk =
-          sample.mci_risk_rupture_probability;
+        const support = sample.mci_decision_support_probability;
+        const risk = sample.mci_risk_rupture_probability;
 
         if (
           sample.mci_final_decision === "ALLOW" &&
@@ -275,10 +226,7 @@ function computeStructuralScores(
           return 100;
         }
 
-        if (
-          sample.mci_final_decision === "BLOCK" &&
-          risk >= 60
-        ) {
+        if (sample.mci_final_decision === "BLOCK" && risk >= 60) {
           return 100;
         }
 
@@ -287,9 +235,7 @@ function computeStructuralScores(
     ),
   );
 
-  const duration = clampScore(
-    Math.min(samples.length, 30) * 3.33,
-  );
+  const duration = clampScore(Math.min(samples.length, 30) * 3.33);
 
   return {
     occurrence,
@@ -300,89 +246,14 @@ function computeStructuralScores(
   };
 }
 
-function computeAggregatedScore(
-  structural: StructuralScores,
-  rupturePressure: RupturePressure,
-  validity: ValidityState,
-): AggregatedScore {
-  const base =
-    structural.occurrence * 0.2 +
-    structural.frequency * 0.2 +
-    structural.convergence * 0.25 +
-    structural.correlation * 0.2 +
-    structural.duration * 0.15;
-
-  const rupturePenalty =
-    rupturePressure.rupture_pressure_score * 0.25;
-
-  return {
-    aggregated_score: clampScore(
-      base - rupturePenalty,
-    ),
-    validity,
-  };
-}
-
-/* ============================================================================
- * 5. PRESSURE SYSTEMS
- * ========================================================================== */
-
-function pressureState(
-  score: number,
-): PressureState {
+function pressureState(score: number): "LOW" | "NORMAL" | "ELEVATED" | "EXCESSIVE" {
   if (score < 20) return "LOW";
   if (score < 45) return "NORMAL";
   if (score < 70) return "ELEVATED";
-
   return "EXCESSIVE";
 }
 
-function computeDecisionPressure(
-  distribution: DecisionDistribution,
-): DecisionPressure {
-  const allowPressure = clampScore(
-    Math.max(
-      0,
-      distribution.allow -
-        TARGET_DISTRIBUTION.allow,
-    ) * 4,
-  );
-
-  const watchPressure = clampScore(
-    Math.max(
-      0,
-      distribution.watch -
-        TARGET_DISTRIBUTION.watch,
-    ) * 3,
-  );
-
-  const blockPressure = clampScore(
-    Math.max(
-      0,
-      distribution.block -
-        TARGET_DISTRIBUTION.block,
-    ) * 4,
-  );
-
-  return {
-    allow_pressure_score: allowPressure,
-    watch_pressure_score: watchPressure,
-    block_pressure_score: blockPressure,
-
-    allow_pressure_state:
-      pressureState(allowPressure),
-
-    watch_pressure_state:
-      pressureState(watchPressure),
-
-    block_pressure_state:
-      pressureState(blockPressure),
-  };
-}
-
-function computeRupturePressure(
-  samples: DecisionSample[],
-): RupturePressure {
+function computeRupturePressure(samples: DecisionSample[]): RupturePressure {
   if (samples.length === 0) {
     return {
       rupture_pressure_score: 0,
@@ -408,27 +279,17 @@ function computeRupturePressure(
       sample.rfs_rupture_detected === true,
   ).length;
 
-  const pressure = clampScore(
-    average(ruptureScores),
-  );
+  const pressure = clampScore(average(ruptureScores));
 
   return {
     rupture_pressure_score: pressure,
-
-    rupture_pressure_state:
-      pressureState(pressure),
-
+    rupture_pressure_state: pressureState(pressure),
     rupture_detected_count: ruptureDetected,
-
-    rupture_sample_ratio: clampScore(
-      (ruptureDetected / samples.length) * 100,
-    ),
+    rupture_sample_ratio: clampScore((ruptureDetected / samples.length) * 100),
   };
 }
 
-function computeRecoveryPressure(
-  samples: DecisionSample[],
-): RecoveryPressure {
+function computeRecoveryPressure(samples: DecisionSample[]): RecoveryPressure {
   if (samples.length === 0) {
     return {
       recovery_pressure_score: 0,
@@ -442,34 +303,22 @@ function computeRecoveryPressure(
     clampScore(
       average([
         safeNumber(sample.recovery_probability),
-        safeNumber(
-          sample.recovery_rupture_dominance,
-        ),
+        safeNumber(sample.recovery_rupture_dominance),
       ]),
     ),
   );
 
   const dominant = samples.filter(
-    (sample) =>
-      sample.dominance_state ===
-      "recovery_dominant",
+    (sample) => sample.dominance_state === "recovery_dominant",
   ).length;
 
-  const pressure = clampScore(
-    average(recoveryScores),
-  );
+  const pressure = clampScore(average(recoveryScores));
 
   return {
     recovery_pressure_score: pressure,
-
-    recovery_pressure_state:
-      pressureState(pressure),
-
+    recovery_pressure_state: pressureState(pressure),
     recovery_dominant_count: dominant,
-
-    recovery_sample_ratio: clampScore(
-      (dominant / samples.length) * 100,
-    ),
+    recovery_sample_ratio: clampScore((dominant / samples.length) * 100),
   };
 }
 
@@ -477,59 +326,39 @@ function computeRuptureComparator(
   rupture: RupturePressure,
   recovery: RecoveryPressure,
 ): RuptureComparator {
-  const gap =
-    recovery.recovery_pressure_score -
-    rupture.rupture_pressure_score;
+  const gap = recovery.recovery_pressure_score - rupture.rupture_pressure_score;
 
   return {
     rupture_pressure: rupture,
     recovery_pressure: recovery,
-
     dominant_side:
       gap > 10
         ? "recovery_dominant"
         : gap < -10
           ? "rupture_dominant"
           : "balanced",
-
     comparator_validity: "computed",
   };
 }
 
-/* ============================================================================
- * 6. GOVERNANCE
- * ========================================================================== */
+function computeAggregatedScore(
+  structural: StructuralScores,
+  rupturePressure: RupturePressure,
+  validity: ValidityState,
+): AggregatedScore {
+  const base =
+    structural.occurrence * 0.2 +
+    structural.frequency * 0.2 +
+    structural.convergence * 0.25 +
+    structural.correlation * 0.2 +
+    structural.duration * 0.15;
 
-function resolveMaturity(
-  effectiveSampleSize: number,
-  minSampleSize: number,
-): CalibrationMaturity {
-  if (
-    effectiveSampleSize <
-    BOOTSTRAP_MIN_SAMPLE_SIZE
-  ) {
-    return "INSUFFICIENT_SAMPLES";
-  }
-
-  if (effectiveSampleSize < minSampleSize) {
-    return "BOOTSTRAP_ACTIVE";
-  }
-
-  return "CALIBRATED_ACTIVE";
-}
-
-function computeValidity(
-  status: CalibrationMaturity,
-): ValidityState {
-  if (status === "INSUFFICIENT_SAMPLES") {
-    return "insufficient_data";
-  }
-
-  if (status === "BOOTSTRAP_ACTIVE") {
-    return "degraded";
-  }
-
-  return "computed";
+  return {
+    aggregated_score: clampScore(
+      base - rupturePressure.rupture_pressure_score * 0.25,
+    ),
+    validity,
+  };
 }
 
 function makeReadableThresholds(
@@ -540,46 +369,102 @@ function makeReadableThresholds(
     block: clampScore(policy.block),
     risk: clampScore(policy.risk),
     support: clampScore(policy.support),
-
     allow_raw_score: clampScore(policy.allow),
-
     block_raw_score: clampScore(policy.block),
-
-    risk_rupture_probability:
-      clampScore(policy.risk),
-
-    decision_support_probability:
-      clampScore(policy.support),
+    risk_rupture_probability: clampScore(policy.risk),
+    decision_support_probability: clampScore(policy.support),
   };
 }
 
 function buildNeutralizationSignals(
   samples: DecisionSample[],
 ): NeutralizationSignals {
-  const neutralized = samples.some(
-    (sample) => sample.neutralized === true,
-  );
+  const neutralized = samples.some((sample) => sample.neutralized === true);
 
   return {
     neutralized,
-
-    neutralization_reason: neutralized
-      ? "low_confidence"
-      : "none",
-
-    neutralization_severity: neutralized
-      ? "medium"
-      : "none",
-
+    neutralization_reason: neutralized ? "low_confidence" : "none",
+    neutralization_severity: neutralized ? "medium" : "none",
     neutralization_validity: "computed",
   };
 }
 
 /* ============================================================================
- * 7. PUBLIC ORCHESTRATOR
+ * 5. READABLE STATE BUILDER
  * ========================================================================== */
 
-export function runCalibrationOrchestrator(
+function buildReadableState(input: {
+  thresholds: ReadableThresholds;
+  policySource: CalibrationPolicySource;
+  sampleCount: number;
+  effectiveSampleSize: number;
+  observedDistribution: OrchestratorResult["observed_distribution"];
+  regimeDistribution: OrchestratorResult["regime_distribution"];
+  reasonDistribution: OrchestratorResult["reason_distribution"];
+  aggregatedScore: AggregatedScore;
+  ruptureComparator: RuptureComparator;
+  rupturePressure: RupturePressure;
+  recoveryPressure: RecoveryPressure;
+  neutralizationSignals: NeutralizationSignals;
+  structuralFrequencyScore: number;
+  status: CalibrationMaturity;
+  explosiveRuptureDetected: boolean;
+  warnings: string[];
+}): ReadableState {
+  return {
+    thresholds: input.thresholds,
+
+    summary: {
+      source: input.policySource,
+      sample_size: input.sampleCount,
+      effective_sample_size: input.effectiveSampleSize,
+    },
+
+    targets: {
+      distribution: { ...TARGET_DISTRIBUTION },
+    },
+
+    observed_distribution: input.observedDistribution,
+    regime_distribution: input.regimeDistribution,
+    reason_distribution: input.reasonDistribution,
+
+    aggregated_score: input.aggregatedScore,
+    rupture_comparator: input.ruptureComparator,
+    neutralization_signals: input.neutralizationSignals,
+
+    flags: {
+      fallback_active: input.status === "INSUFFICIENT_SAMPLES",
+      global_outside_tolerance: input.structuralFrequencyScore < 45,
+      stable_outside_tolerance: false,
+      transition_outside_tolerance: false,
+      volatile_outside_tolerance: false,
+
+      rupture_pressure_elevated:
+        input.rupturePressure.rupture_pressure_state === "ELEVATED",
+
+      rupture_pressure_excessive:
+        input.rupturePressure.rupture_pressure_state === "EXCESSIVE",
+
+      recovery_pressure_elevated:
+        input.recoveryPressure.recovery_pressure_state === "ELEVATED",
+
+      neutralization_active: input.neutralizationSignals.neutralized,
+      explosive_rupture_detected: input.explosiveRuptureDetected,
+
+      defensive_mode_active:
+        input.neutralizationSignals.neutralized ||
+        input.rupturePressure.rupture_pressure_state === "EXCESSIVE",
+    },
+
+    warnings: input.warnings,
+  };
+}
+
+/* ============================================================================
+ * 6. PURE ORCHESTRATION
+ * ========================================================================== */
+
+export function buildCalibrationOrchestratorResult(
   input: OrchestratorInput = {},
 ): OrchestratorResult {
   const analyticalVersion = safeString(
@@ -587,24 +472,14 @@ export function runCalibrationOrchestrator(
     DEFAULT_ANALYTICAL_VERSION,
   );
 
-  const horizon =
-    input.horizon ?? DEFAULT_HORIZON;
+  const horizon = input.horizon ?? DEFAULT_HORIZON;
 
   const minSampleSize = Math.max(
     1,
-    Math.trunc(
-      safeNumber(
-        input.min_sample_size,
-        DEFAULT_MIN_SAMPLE_SIZE,
-      ),
-    ),
+    Math.trunc(safeNumber(input.min_sample_size, DEFAULT_MIN_SAMPLE_SIZE)),
   );
 
-  const rawSamples = readSamples(
-    input,
-    analyticalVersion,
-    horizon,
-  );
+  const rawSamples = readSamples(input, analyticalVersion, horizon);
 
   const sanitized = sanitizeSamples(
     rawSamples,
@@ -615,59 +490,45 @@ export function runCalibrationOrchestrator(
   const samples = sanitized.samples;
 
   const sampleCount = rawSamples.length;
-
   const effectiveSampleSize = samples.length;
 
-  const policyResult =
-    buildDecisionDistributionPolicy({
-      samples,
-      analytical_version: analyticalVersion,
-      horizon,
-    });
+  const policyResult = buildDecisionDistributionPolicy({
+    samples,
+    analytical_version: analyticalVersion,
+    horizon,
+  });
 
-  const status = resolveMaturity(
-    effectiveSampleSize,
-    minSampleSize,
-  );
-
+  const status = resolveMaturity(effectiveSampleSize, minSampleSize);
   const validity = computeValidity(status);
 
-  const structuralScores =
-    computeStructuralScores(
-      samples,
-      policyResult.observed_distribution,
-    );
+  const structuralScores = computeStructuralScores(
+    samples,
+    policyResult.observed_distribution,
+  );
 
-  const decisionPressure =
-    computeDecisionPressure(
-      policyResult.observed_distribution,
-    );
+  const decisionPressure = computeDecisionPressure(
+    policyResult.observed_distribution,
+  );
 
-  const rupturePressure =
-    computeRupturePressure(samples);
+  const rupturePressure = computeRupturePressure(samples);
+  const recoveryPressure = computeRecoveryPressure(samples);
 
-  const recoveryPressure =
-    computeRecoveryPressure(samples);
+  const ruptureComparator = computeRuptureComparator(
+    rupturePressure,
+    recoveryPressure,
+  );
 
-  const ruptureComparator =
-    computeRuptureComparator(
-      rupturePressure,
-      recoveryPressure,
-    );
+  const aggregatedScore = computeAggregatedScore(
+    structuralScores,
+    rupturePressure,
+    validity,
+  );
 
-  const aggregatedScore =
-    computeAggregatedScore(
-      structuralScores,
-      rupturePressure,
-      validity,
-    );
-
-  const derivedThresholds =
-    makeReadableThresholds(
-      status === "INSUFFICIENT_SAMPLES"
-        ? FALLBACK_POLICY
-        : policyResult.policy,
-    );
+  const derivedThresholds = makeReadableThresholds(
+    status === "INSUFFICIENT_SAMPLES"
+      ? FALLBACK_POLICY
+      : policyResult.policy,
+  );
 
   const policy: CalibrationPolicy = {
     allow: derivedThresholds.allow,
@@ -676,8 +537,7 @@ export function runCalibrationOrchestrator(
     support: derivedThresholds.support,
   };
 
-  const neutralizationSignals =
-    buildNeutralizationSignals(samples);
+  const neutralizationSignals = buildNeutralizationSignals(samples);
 
   const policySource: CalibrationPolicySource =
     status === "INSUFFICIENT_SAMPLES"
@@ -691,103 +551,6 @@ export function runCalibrationOrchestrator(
     policyResult.warnings,
   );
 
-  const readableState: ReadableState = {
-    thresholds: derivedThresholds,
-
-    summary: {
-      source: policySource,
-      sample_size: sampleCount,
-      effective_sample_size:
-        effectiveSampleSize,
-    },
-
-    targets: {
-      distribution: {
-        ...TARGET_DISTRIBUTION,
-      },
-    },
-
-    observed_distribution:
-      policyResult.observed_distribution,
-
-    regime_distribution:
-      policyResult.regime_distribution,
-
-    reason_distribution:
-      policyResult.reason_distribution,
-
-    aggregated_score: aggregatedScore,
-
-    rupture_comparator:
-      ruptureComparator,
-
-    neutralization_signals:
-      neutralizationSignals,
-
-    flags: {
-      fallback_active:
-        status === "INSUFFICIENT_SAMPLES",
-
-      global_outside_tolerance:
-        structuralScores.frequency < 45,
-
-      stable_outside_tolerance: false,
-
-      transition_outside_tolerance:
-        false,
-
-      volatile_outside_tolerance:
-        false,
-
-      rupture_pressure_elevated:
-        rupturePressure.rupture_pressure_state ===
-        "ELEVATED",
-
-      rupture_pressure_excessive:
-        rupturePressure.rupture_pressure_state ===
-        "EXCESSIVE",
-
-      recovery_pressure_elevated:
-        recoveryPressure.recovery_pressure_state ===
-        "ELEVATED",
-
-      neutralization_active:
-        neutralizationSignals.neutralized,
-
-      explosive_rupture_detected:
-        samples.some(
-          (sample) =>
-            sample.rupture_evolution_state ===
-            "explosive",
-        ),
-
-      defensive_mode_active:
-        neutralizationSignals.neutralized ||
-        rupturePressure.rupture_pressure_state ===
-          "EXCESSIVE",
-    },
-
-    warnings,
-  };
-
-  let statePersisted = false;
-
-  if (input.persist_state !== false) {
-    try {
-      setCalibrationState({
-        policy,
-        state: readableState,
-        last_updated_ts: Date.now(),
-      });
-
-      statePersisted = true;
-    } catch {
-      warnings.push(
-        "calibration_state_persist_failed",
-      );
-    }
-  }
-
   const runtimeState: RuntimeState = {
     thresholds: policy,
     status,
@@ -797,100 +560,145 @@ export function runCalibrationOrchestrator(
 
   const meta: CalibrationMeta = {
     analytical_version: analyticalVersion,
-
     horizon,
-
     policy_source: policySource,
-
-    sufficient_samples:
-      effectiveSampleSize >= minSampleSize,
-
-    fallback_active:
-      status === "INSUFFICIENT_SAMPLES",
-
-    state_persisted: statePersisted,
+    sufficient_samples: effectiveSampleSize >= minSampleSize,
+    fallback_active: status === "INSUFFICIENT_SAMPLES",
+    state_persisted: false,
 
     aggregated_score: aggregatedScore,
-
-    derived_thresholds:
-      derivedThresholds,
-
-    resolved_thresholds:
-      derivedThresholds,
+    derived_thresholds: derivedThresholds,
+    resolved_thresholds: derivedThresholds,
 
     rupture_pressure: rupturePressure,
-
-    recovery_pressure:
-      recoveryPressure,
-
-    rupture_comparator:
-      ruptureComparator,
-
-    neutralization_signals:
-      neutralizationSignals,
+    recovery_pressure: recoveryPressure,
+    rupture_comparator: ruptureComparator,
+    neutralization_signals: neutralizationSignals,
   };
 
   return {
     ok: true,
 
     status,
-
     aggregated_score: aggregatedScore,
 
     sample_count: sampleCount,
-
-    effective_sample_size:
-      effectiveSampleSize,
-
+    effective_sample_size: effectiveSampleSize,
     min_sample_size: minSampleSize,
 
-    observed_distribution:
-      policyResult.observed_distribution,
+    observed_distribution: policyResult.observed_distribution,
+    regime_distribution: policyResult.regime_distribution,
+    reason_distribution: policyResult.reason_distribution,
 
-    regime_distribution:
-      policyResult.regime_distribution,
+    structural_occurrence_score: structuralScores.occurrence,
+    structural_frequency_score: structuralScores.frequency,
+    structural_convergence_score: structuralScores.convergence,
+    structural_correlation_score: structuralScores.correlation,
+    structural_duration_score: structuralScores.duration,
 
-    reason_distribution:
-      policyResult.reason_distribution,
-
-    structural_occurrence_score:
-      structuralScores.occurrence,
-
-    structural_frequency_score:
-      structuralScores.frequency,
-
-    structural_convergence_score:
-      structuralScores.convergence,
-
-    structural_correlation_score:
-      structuralScores.correlation,
-
-    structural_duration_score:
-      structuralScores.duration,
-
-    decision_pressure:
-      decisionPressure,
+    decision_pressure: decisionPressure,
 
     rupture_pressure: rupturePressure,
+    recovery_pressure: recoveryPressure,
+    rupture_comparator: ruptureComparator,
+    neutralization_signals: neutralizationSignals,
 
-    recovery_pressure:
-      recoveryPressure,
-
-    rupture_comparator:
-      ruptureComparator,
-
-    derived_thresholds:
-      derivedThresholds,
-
-    resolved_thresholds:
-      derivedThresholds,
+    derived_thresholds: derivedThresholds,
+    resolved_thresholds: derivedThresholds,
 
     policy,
-
     state: runtimeState,
-
     meta,
-
     warnings,
   };
+}
+
+/* ============================================================================
+ * 7. EXPLICIT MUTATION — STATE PERSISTENCE
+ * ========================================================================== */
+
+export function persistCalibrationOrchestratorResult(
+  result: OrchestratorResult,
+): OrchestratorResult {
+  const warnings = [...result.warnings];
+
+  const rupturePressure = result.meta.rupture_pressure;
+  const recoveryPressure = result.meta.recovery_pressure;
+  const ruptureComparator = result.meta.rupture_comparator;
+  const neutralizationSignals = result.meta.neutralization_signals;
+
+  if (
+    !rupturePressure ||
+    !recoveryPressure ||
+    !ruptureComparator ||
+    !neutralizationSignals
+  ) {
+    return {
+      ...result,
+      meta: {
+        ...result.meta,
+        state_persisted: false,
+      },
+      warnings: uniqueWarnings(warnings, [
+        "calibration_state_persist_missing_runtime_meta",
+      ]),
+    };
+  }
+
+  try {
+    setCalibrationState({
+      policy: result.policy,
+      state: buildReadableState({
+        thresholds: result.derived_thresholds,
+        policySource: result.meta.policy_source,
+        sampleCount: result.sample_count,
+        effectiveSampleSize: result.effective_sample_size,
+        observedDistribution: result.observed_distribution,
+        regimeDistribution: result.regime_distribution,
+        reasonDistribution: result.reason_distribution,
+        aggregatedScore: result.aggregated_score,
+        ruptureComparator,
+        rupturePressure,
+        recoveryPressure,
+        neutralizationSignals,
+        structuralFrequencyScore: result.structural_frequency_score,
+        status: result.status,
+        explosiveRuptureDetected: false,
+        warnings,
+      }),
+      last_updated_ts: Date.now(),
+    });
+
+    return {
+      ...result,
+      meta: {
+        ...result.meta,
+        state_persisted: true,
+      },
+      warnings,
+    };
+  } catch {
+    return {
+      ...result,
+      meta: {
+        ...result.meta,
+        state_persisted: false,
+      },
+      warnings: uniqueWarnings(warnings, ["calibration_state_persist_failed"]),
+    };
+  }
+}
+
+/* ============================================================================
+ * 8. BACKWARD-COMPATIBLE WRAPPER
+ * ========================================================================== */
+
+export function runCalibrationOrchestrator(
+  input: OrchestratorInput = {},
+): OrchestratorResult {
+  const result = buildCalibrationOrchestratorResult(input);
+
+  if (input.persist_state === false) return result;
+
+  return persistCalibrationOrchestratorResult(result);
 }

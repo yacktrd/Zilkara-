@@ -122,11 +122,15 @@ export function mapScanItemToAsset(item: PublicScanLike): ScanAsset {
     volume_24h: volume24h,
 
     sparkline_7d: sparkline7d,
-
-    public_activity: publicStructure.activity,
+ 
+        public_activity: publicStructure.activity,
     public_sparkline_context_7d: publicStructure.sparkline_context_7d,
     public_structure_transition: publicStructure.structure_transition,
-    public_impulse_context: "Unavailable",
+    public_impulse_context:
+      typeof item.public_impulse_context === "string" &&
+      item.public_impulse_context.trim().length > 0
+        ? item.public_impulse_context
+        : publicStructure.impulse_context,
 
     rank: safeRank(item.rank),
     logo_url: readLogo(item),

@@ -1,0 +1,29 @@
+{
+    "ok": false,
+    "ts": "2026-06-28T13:29:15.949Z",
+    "version": "v1",
+    "source": "fallback",
+    "market": "crypto",
+    "quote": "eur",
+    "count": 0,
+    "total": 0,
+    "data": [],
+    "context": {
+        "asset_count": 0,
+        "priced_asset_count": 0,
+        "market_cap_available_count": 0,
+        "volume_available_count": 0
+    },
+    "warnings": [
+        "scan_snapshot_unavailable"
+    ],
+    "meta": {
+        "q": null,
+        "sort": "rank",
+        "order": "asc",
+        "limit": null,
+        "region": "EU",
+        "currency": "EUR"
+    },
+    "error": "scan_snapshot_unavailable"
+}

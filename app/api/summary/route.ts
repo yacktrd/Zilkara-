@@ -25,7 +25,11 @@
 
 import { NextRequest, NextResponse } from "next/server";
 
-import { getScan } from "@/lib/xyvala/services/scan-service";
+import { readScanSnapshot }
+from "@/lib/xyvala/services/scan-snapshot-service";
+
+
+
 
 import type { ScanAsset } from "@/lib/xyvala/contracts/scan-contract";
 
@@ -263,36 +267,87 @@ export async function GET(req: NextRequest) {
   const noStore = parseBool(searchParams.get("noStore"));
 
   try {
-    const service = await getScan({
-      quote,
-      q,
-      sort: "rank",
-      order: "asc",
-      limit,
-      noStore,
-    });
+    const snapshotResult = await readScanSnapshot({ quote });
 
-    const payload: SummaryResponse = {
-      ok: service.ok,
-      ts: nowIso(),
-      version: XYVALA_SNAPSHOT_VERSION,
-      market: "crypto",
-      quote,
-      source: service.source,
-      count: service.data.length,
-      summary: buildSummary(service.data),
-      meta: {
-        region: "EU",
-        currency: quoteToCurrency(quote),
-        q,
-        limit,
-        warnings: service.warnings,
-      },
-      error: service.error,
-    };
+const snapshot = snapshotResult.ok
+  ? snapshotResult.snapshot
+  : null;
+
+console.log("SUMMARY_ROUTE_AUDIT", {
+  noStore,
+  quote,
+  snapshot_ok: snapshotResult?.ok ?? null,
+  snapshot_count: snapshotResult?.snapshot?.count ?? null,
+  snapshot_error: snapshotResult?.error ?? null,
+  snapshot_warnings: snapshotResult?.warnings ?? [],
+});
+
+if (snapshot === null) {
+
+  const payload: SummaryResponse = {
+    ok: false,
+    ts: nowIso(),
+    version: XYVALA_SNAPSHOT_VERSION,
+    market: "crypto",
+    quote,
+    source: "fallback",
+    count: 0,
+    summary: buildSummary([]),
+    meta: {
+      region: "EU",
+      currency: quoteToCurrency(quote),
+      q,
+      limit,
+      warnings: ["summary_snapshot_unavailable"],
+    },
+    error: "summary_snapshot_unavailable",
+  };
+
+  return NextResponse.json(payload, {
+    status: 503,
+    headers: {
+      "cache-control": "no-store",
+      "x-xyvala-version": XYVALA_SNAPSHOT_VERSION,
+      "x-xyvala-endpoint": "/api/summary",
+    },
+  });
+}
+
+let data = [...snapshot.data];
+
+if (q) {
+  data = data.filter((asset) => {
+    const symbol = asset.symbol.toLowerCase();
+    const name = asset.name.toLowerCase();
+    const id = asset.id.toLowerCase();
+
+    return symbol.includes(q) || name.includes(q) || id.includes(q);
+  });
+}
+
+data = sortByRank(data).slice(0, limit);
+
+const payload: SummaryResponse = {
+  ok: true,
+  ts: nowIso(),
+  version: XYVALA_SNAPSHOT_VERSION,
+  market: "crypto",
+  quote,
+  source: "scan",
+  count: data.length,
+  summary: buildSummary(data),
+  meta: {
+    region: "EU",
+    currency: quoteToCurrency(quote),
+    q,
+    limit,
+    warnings: snapshotResult.warnings,
+  },
+  error: null,
+};
 
     return NextResponse.json(payload, {
-      status: service.ok ? 200 : 503,
+      status: 200,
       headers: {
         "cache-control": "no-store",
         "x-xyvala-version": XYVALA_SNAPSHOT_VERSION,

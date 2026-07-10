@@ -300,26 +300,27 @@ export function normalizeRuptureEvolutionState(
 
 /* ============================================================================
  * 5. SAMPLE NORMALIZATION
+ * ----------------------------------------------------------------------------
+ * RULES
+ * - canonical fields are the single source of truth
+ * - legacy fields are compatibility mirrors only
+ * - normalization never invents analytical truth
+ * - normalization stabilizes structure only
+ * - validator remains responsible for rejecting insufficient data
  * ========================================================================== */
 
 export function normalizeSample(
   input: DecisionSampleInput,
 ): DecisionSample {
+  /**
+   * --------------------------------------------------------------------------
+   * TEMPORAL / IDENTIFIERS
+   * --------------------------------------------------------------------------
+   */
+
   const observedTs = normalizeTs(
     input.observed_ts ?? input.ts,
   );
-
-  const observedDecision =
-    normalizeDecision(
-      input.observed_decision ??
-        input.final_decision,
-    );
-
-  const observedRegime =
-    normalizeRegime(
-      input.observed_regime ??
-        input.regime,
-    );
 
   const observedHorizon =
     normalizeEvaluationHorizon(
@@ -339,19 +340,85 @@ export function normalizeSample(
     analyticalVersion,
   );
 
+  /**
+   * --------------------------------------------------------------------------
+   * STRUCTURAL GOVERNANCE
+   * --------------------------------------------------------------------------
+   */
+
+  const observedDecision =
+    normalizeDecision(
+      input.observed_decision ??
+        input.mci_final_decision ??
+        input.final_decision,
+    );
+
+  const observedRegime =
+    normalizeRegime(
+      input.observed_regime ??
+        input.regime,
+    );
+
   const decisionReason = safeStr(
     input.observed_reason ??
       input.mci_decision_reason ??
-      input.decision_reason,
+      input.decision_reason ??
+      input.reason,
     "unknown",
   );
 
   const reliability =
     normalizeReliability(
-      input.reliability ??
+      input.observed_reliability ??
         input.sample_reliability ??
-        input.observed_reliability,
+        input.reliability,
     );
+
+  /**
+   * --------------------------------------------------------------------------
+   * CANONICAL MCI FIELDS
+   * ----------------------------------------------------------------------------
+   * IMPORTANT
+   * - canonical fields are normalized first
+   * - legacy fields mirror canonical values afterward
+   * --------------------------------------------------------------------------
+   */
+
+  const mciDecisionScore =
+    clampScore(
+      input.mci_decision_score ??
+        input.decision_score,
+    );
+
+  const mciAllowRawScore =
+    clampScore(
+      input.mci_allow_raw_score ??
+        input.allow_raw_score,
+    );
+
+  const mciBlockRawScore =
+    clampScore(
+      input.mci_block_raw_score ??
+        input.block_raw_score,
+    );
+
+  const mciDecisionSupportProbability =
+    clampScore(
+      input.mci_decision_support_probability ??
+        input.decision_support_probability,
+    );
+
+  const mciRiskRuptureProbability =
+    clampScore(
+      input.mci_risk_rupture_probability ??
+        input.risk_rupture_probability,
+    );
+
+  /**
+   * --------------------------------------------------------------------------
+   * SECONDARY SCORES
+   * --------------------------------------------------------------------------
+   */
 
   const confidenceScore =
     clampScore(
@@ -359,12 +426,169 @@ export function normalizeSample(
         input.confidence,
     );
 
+  const stabilityScore =
+    clampScore(
+      input.stability_score ??
+        input.stability,
+    );
+
+  const opportunityScore =
+    clampScore(
+      input.opportunity_score ??
+        input.opportunity,
+    );
+
+  const convergenceScore =
+    clampScore(
+      input.convergence_score ??
+        input.convergence,
+    );
+
+  /**
+   * --------------------------------------------------------------------------
+   * RECOVERY
+   * --------------------------------------------------------------------------
+   */
+
+  const recoveryProbability =
+    clampScore(
+      input.recovery_probability,
+    );
+
+  const recoveryRuptureDominance =
+    clampScore(
+      input.recovery_rupture_dominance,
+    );
+
+  const recoveryValidity =
+    normalizeValidityState(
+      input.recovery_validity,
+    );
+
+  const dominanceState =
+    normalizeDominanceState(
+      input.dominance_state,
+    );
+
+  /**
+   * --------------------------------------------------------------------------
+   * NEUTRALIZATION
+   * --------------------------------------------------------------------------
+   */
+
+  const neutralized =
+    Boolean(input.neutralized);
+
+  const neutralizationReason =
+    normalizeNeutralizationReason(
+      input.neutralization_reason,
+    );
+
+  const neutralizationSeverity =
+    normalizeNeutralizationSeverity(
+      input.neutralization_severity,
+    );
+
+  const neutralizationValidity =
+    normalizeValidityState(
+      input.neutralization_validity,
+    );
+
+  /**
+   * --------------------------------------------------------------------------
+   * RUPTURE
+   * --------------------------------------------------------------------------
+   */
+
+  const ruptureScore =
+    clampScore(
+      input.rupture_score,
+    );
+
+  const ruptureProbability =
+    clampScore(
+      input.rupture_probability,
+    );
+
+  const ruptureSeverityScore =
+    clampScore(
+      input.rupture_severity_score,
+    );
+
+  const ruptureFrequencyScore =
+    clampScore(
+      input.rupture_frequency_score,
+    );
+
+  const ruptureDurationScore =
+    clampScore(
+      input.rupture_duration_score,
+    );
+
+  const rupturePenaltyScore =
+    clampScore(
+      input.rupture_penalty_score,
+    );
+
+  const ruptureDetected =
+    Boolean(input.rupture_detected);
+
+  const ruptureReason =
+    safeStr(
+      input.rupture_reason,
+      "unknown",
+    );
+
+  const ruptureValidity =
+    normalizeValidityState(
+      input.rupture_validity,
+    );
+
+  /**
+   * --------------------------------------------------------------------------
+   * RUPTURE EVOLUTION
+   * --------------------------------------------------------------------------
+   */
+
+  const ruptureEvolutionScore =
+    clampScore(
+      input.rupture_evolution_score,
+    );
+
+  const ruptureEvolutionState =
+    normalizeRuptureEvolutionState(
+      input.rupture_evolution_state,
+    );
+
+  const ruptureAccelerationScore =
+    clampScore(
+      input.rupture_acceleration_score,
+    );
+
+  const ruptureEvolutionValidity =
+    normalizeValidityState(
+      input.rupture_evolution_validity,
+    );
+
+  /**
+   * --------------------------------------------------------------------------
+   * FINAL NORMALIZED SAMPLE
+   * --------------------------------------------------------------------------
+   */
+
   return {
     ...input,
 
+    /**
+     * ------------------------------------------------------------------------
+     * CANONICAL OBSERVED FIELDS
+     * ------------------------------------------------------------------------
+     */
+
     observed_ts: observedTs,
 
-    observed_horizon: observedHorizon,
+    observed_horizon:
+      observedHorizon,
 
     observed_analytical_version:
       analyticalVersion,
@@ -384,167 +608,146 @@ export function normalizeSample(
     observed_reliability:
       reliability,
 
+    /**
+     * ------------------------------------------------------------------------
+     * CANONICAL MCI FIELDS
+     * ------------------------------------------------------------------------
+     */
+
     mci_decision_score:
-      clampScore(
-        input.mci_decision_score ??
-          input.decision_score,
-      ),
+      mciDecisionScore,
 
     mci_allow_raw_score:
-      clampScore(
-        input.mci_allow_raw_score ??
-          input.allow_raw_score,
-      ),
+      mciAllowRawScore,
 
     mci_block_raw_score:
-      clampScore(
-        input.mci_block_raw_score ??
-          input.block_raw_score,
-      ),
+      mciBlockRawScore,
 
     mci_decision_support_probability:
-      clampScore(
-        input.mci_decision_support_probability ??
-          input.decision_support_probability,
-      ),
+      mciDecisionSupportProbability,
 
     mci_risk_rupture_probability:
-      clampScore(
-        input.mci_risk_rupture_probability ??
-          input.risk_rupture_probability,
-      ),
+      mciRiskRuptureProbability,
 
     mci_final_decision:
-      normalizeDecision(
-        input.mci_final_decision ??
-          observedDecision,
-      ),
+      observedDecision,
 
     mci_decision_reason:
       decisionReason,
 
+    /**
+     * ------------------------------------------------------------------------
+     * STRUCTURAL SCORES
+     * ------------------------------------------------------------------------
+     */
+
     stability_score:
-      clampScore(
-        input.stability_score ??
-          input.stability,
-      ),
+      stabilityScore,
 
     opportunity_score:
-      clampScore(
-        input.opportunity_score ??
-          input.opportunity,
-      ),
+      opportunityScore,
 
     convergence_score:
-      clampScore(
-        input.convergence_score ??
-          input.convergence,
-      ),
+      convergenceScore,
 
     confidence_score:
       confidenceScore,
 
+    /**
+     * ------------------------------------------------------------------------
+     * RECOVERY
+     * ------------------------------------------------------------------------
+     */
+
     recovery_probability:
-      clampScore(
-        input.recovery_probability,
-      ),
+      recoveryProbability,
 
     recovery_rupture_dominance:
-      clampScore(
-        input.recovery_rupture_dominance,
-      ),
+      recoveryRuptureDominance,
 
     recovery_validity:
-      normalizeValidityState(
-        input.recovery_validity,
-      ),
+      recoveryValidity,
 
     dominance_state:
-      normalizeDominanceState(
-        input.dominance_state,
-      ),
+      dominanceState,
 
-    neutralized:
-      Boolean(input.neutralized),
+    /**
+     * ------------------------------------------------------------------------
+     * NEUTRALIZATION
+     * ------------------------------------------------------------------------
+     */
+
+    neutralized,
 
     neutralization_reason:
-      normalizeNeutralizationReason(
-        input.neutralization_reason,
-      ),
+      neutralizationReason,
 
     neutralization_severity:
-      normalizeNeutralizationSeverity(
-        input.neutralization_severity,
-      ),
+      neutralizationSeverity,
 
     neutralization_validity:
-      normalizeValidityState(
-        input.neutralization_validity,
-      ),
+      neutralizationValidity,
+
+    /**
+     * ------------------------------------------------------------------------
+     * RUPTURE
+     * ------------------------------------------------------------------------
+     */
 
     rupture_score:
-      clampScore(
-        input.rupture_score,
-      ),
+      ruptureScore,
 
     rupture_probability:
-      clampScore(
-        input.rupture_probability,
-      ),
+      ruptureProbability,
 
     rupture_severity_score:
-      clampScore(
-        input.rupture_severity_score,
-      ),
+      ruptureSeverityScore,
 
     rupture_frequency_score:
-      clampScore(
-        input.rupture_frequency_score,
-      ),
+      ruptureFrequencyScore,
 
     rupture_duration_score:
-      clampScore(
-        input.rupture_duration_score,
-      ),
+      ruptureDurationScore,
 
     rupture_penalty_score:
-      clampScore(
-        input.rupture_penalty_score,
-      ),
+      rupturePenaltyScore,
 
     rupture_detected:
-      Boolean(input.rupture_detected),
+      ruptureDetected,
 
     rupture_reason:
-      safeStr(
-        input.rupture_reason,
-        "unknown",
-      ),
+      ruptureReason,
 
     rupture_validity:
-      normalizeValidityState(
-        input.rupture_validity,
-      ),
+      ruptureValidity,
+
+    /**
+     * ------------------------------------------------------------------------
+     * RUPTURE EVOLUTION
+     * ------------------------------------------------------------------------
+     */
 
     rupture_evolution_score:
-      clampScore(
-        input.rupture_evolution_score,
-      ),
+      ruptureEvolutionScore,
 
     rupture_evolution_state:
-      normalizeRuptureEvolutionState(
-        input.rupture_evolution_state,
-      ),
+      ruptureEvolutionState,
 
     rupture_acceleration_score:
-      clampScore(
-        input.rupture_acceleration_score,
-      ),
+      ruptureAccelerationScore,
 
     rupture_evolution_validity:
-      normalizeValidityState(
-        input.rupture_evolution_validity,
-      ),
+      ruptureEvolutionValidity,
+
+    /**
+     * ------------------------------------------------------------------------
+     * LEGACY MIRRORS
+     * ----------------------------------------------------------------------------
+     * IMPORTANT
+     * - legacy mirrors always derive from canonical values
+     * - never the opposite
+     * ------------------------------------------------------------------------
+     */
 
     ts: observedTs,
 
@@ -554,9 +757,11 @@ export function normalizeSample(
     policy_version:
       policyVersion,
 
-    horizon: observedHorizon,
+    horizon:
+      observedHorizon,
 
-    regime: observedRegime,
+    regime:
+      observedRegime,
 
     final_decision:
       observedDecision,
@@ -564,32 +769,23 @@ export function normalizeSample(
     decision_reason:
       decisionReason,
 
-    reason: decisionReason,
+    reason:
+      decisionReason,
 
     decision_score:
-      clampScore(
-        input.decision_score,
-      ),
+      mciDecisionScore,
 
     allow_raw_score:
-      clampScore(
-        input.allow_raw_score,
-      ),
+      mciAllowRawScore,
 
     block_raw_score:
-      clampScore(
-        input.block_raw_score,
-      ),
+      mciBlockRawScore,
 
     decision_support_probability:
-      clampScore(
-        input.decision_support_probability,
-      ),
+      mciDecisionSupportProbability,
 
     risk_rupture_probability:
-      clampScore(
-        input.risk_rupture_probability,
-      ),
+      mciRiskRuptureProbability,
 
     confidence:
       confidenceScore,

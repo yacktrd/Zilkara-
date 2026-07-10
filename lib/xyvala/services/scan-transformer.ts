@@ -26,13 +26,43 @@
  * - null means explicitly unavailable
  * - number means confirmed observable value
  * - READ -> VALIDATE -> NORMALIZE -> PROJECT
+ *
+ * INPUTS
+ * - PrivateScanAsset
+ * - ScanAsset
+ * - Record<string, unknown>
+ *
+ * OUTPUTS
+ * - ScanAsset
+ * - ScanTransformerItem
+ * - ScanTransformerResult
+ *
+ * INVARIANTS
+ * - public output remains descriptive only
+ * - public impulse mapping comes from public-structure.ts only
+ * - private fields never cross the public boundary
+ * - UI displays fields, it never rebuilds them
+ *
+ * CRITICAL DEPENDENCIES
+ * - lib/xyvala/contracts/scan-contract.ts
+ * - lib/xyvala/contracts/scan-private-contract.ts
+ * - lib/xyvala/public/public-structure.ts
+ * - lib/xyvala/structures/structure-7d.ts
+ *
+ * SENSITIVE ZONES
+ * - private/public boundary
+ * - public impulse context propagation
+ * - descriptive public labels
  * ========================================================================== */
 
 import type { ScanAsset } from "@/lib/xyvala/contracts/scan-contract";
 import type { PrivateScanAsset } from "@/lib/xyvala/contracts/scan-private-contract";
-import type { PublicImpulseContext } from "@/lib/xyvala/public/public-structure";
 
-import { buildPublicStructure } from "@/lib/xyvala/public/public-structure";
+import {
+  buildPublicStructure,
+  toPublicImpulseContext,
+  type PublicImpulseContext,
+} from "@/lib/xyvala/public/public-structure";
 
 import {
   buildStructure7D,
@@ -197,31 +227,7 @@ function normalizeNumberArray(value: unknown): number[] | null {
 }
 
 /* ============================================================================
- * 4. IMPULSE PUBLIC ADAPTER
- * ========================================================================== */
-
-function normalizePublicImpulseContext(value: unknown): PublicImpulseContext {
-  if (value === "Compression") return "Compression";
-  if (value === "Pressure Building") return "Pressure Building";
-  if (value === "Release") return "Release";
-  if (value === "Exhaustion") return "Exhaustion";
-  if (value === "Neutral") return "Neutral";
-
-  return "Unavailable";
-}
-
-function toPublicImpulseContext(value: unknown): PublicImpulseContext {
-  if (value === "COMPRESSION") return "Compression";
-  if (value === "PRESSURE_BUILDING") return "Pressure Building";
-  if (value === "RELEASE") return "Release";
-  if (value === "EXHAUSTION") return "Exhaustion";
-  if (value === "NEUTRAL") return "Neutral";
-
-  return normalizePublicImpulseContext(value);
-}
-
-/* ============================================================================
- * 5. RAW FIELD READERS
+ * 4. RAW FIELD READERS
  * ========================================================================== */
 
 function readField(
@@ -280,18 +286,28 @@ function readLogo(asset: Record<string, unknown>): string | null {
   );
 }
 
-function readPublicImpulseContext(asset: Record<string, unknown>): PublicImpulseContext {
-  const publicValue = readField(asset, "public_impulse_context", "impulse_context");
+function readPublicImpulseContext(
+  asset: Record<string, unknown>,
+): PublicImpulseContext {
+  const publicValue = readField(
+    asset,
+    "public_impulse_context",
+    "impulse_context",
+  );
 
-  if (publicValue !== undefined) {
-    return normalizePublicImpulseContext(publicValue);
+  const normalizedPublicValue = toPublicImpulseContext(publicValue);
+
+  if (normalizedPublicValue !== "Unavailable") {
+    return normalizedPublicValue;
   }
 
-  return toPublicImpulseContext(readField(asset, "impulse_transition_state"));
+  const transitionValue = readField(asset, "impulse_transition_state");
+
+  return toPublicImpulseContext(transitionValue);
 }
 
 /* ============================================================================
- * 6. STRUCTURE ADAPTERS
+ * 5. STRUCTURE ADAPTERS
  * ========================================================================== */
 
 function buildStructureFromAsset(asset: Record<string, unknown>): Structure7D {
@@ -316,6 +332,8 @@ function buildPublicStructureFromValues(input: {
   volume24h: number | null;
   marketCap: number | null;
   sparkline7d: number[] | null;
+  impulseTransitionState?: unknown;
+  publicImpulseContext?: unknown;
 }) {
   return buildPublicStructure({
     pct_24h: input.chg24h,
@@ -323,16 +341,20 @@ function buildPublicStructureFromValues(input: {
     volume_24h: input.volume24h,
     market_cap: input.marketCap,
     sparkline_7d: input.sparkline7d,
+    impulse_transition_state: input.impulseTransitionState,
+    public_impulse_context: input.publicImpulseContext,
   });
 }
 
 /* ============================================================================
- * 7. PRIVATE -> PUBLIC PROJECTION
+ * 6. PRIVATE -> PUBLIC PROJECTION
  * ========================================================================== */
 
 export function privateScanAssetToPublicScanAsset(
   asset: PrivateScanAsset,
 ): ScanAsset {
+  const symbol = safeString(asset.symbol, "UNKNOWN").toUpperCase();
+
   const price = normalizeNullableNumber(asset.price);
   const chg24h = normalizeNullableNumber(asset.chg_24h_pct);
   const chg7d = normalizeNullableNumber(asset.chg_7d_pct);
@@ -341,17 +363,24 @@ export function privateScanAssetToPublicScanAsset(
   const sparkline7d = normalizeNumberArray(asset.sparkline_7d);
 
   const publicStructure = buildPublicStructureFromValues({
-    chg24h,
-    chg7d,
-    volume24h,
-    marketCap,
-    sparkline7d,
-  });
+  chg24h,
+  chg7d,
+  volume24h,
+  marketCap,
+  sparkline7d,
+  impulseTransitionState: asset.impulse_transition_state,
+});
+
+console.log("XYVALA_PRIVATE_TO_PUBLIC_IMPULSE", {
+  symbol,
+  impulse_transition_state: asset.impulse_transition_state,
+  public_impulse_context: publicStructure.impulse_context,
+});
 
   return {
-    id: safeString(asset.id, asset.symbol.toLowerCase()),
-    symbol: safeString(asset.symbol, "UNKNOWN").toUpperCase(),
-    name: safeString(asset.name, asset.symbol),
+    id: safeString(asset.id, symbol.toLowerCase()),
+    symbol,
+    name: safeString(asset.name, symbol),
 
     price,
     chg_24h_pct: chg24h,
@@ -365,7 +394,7 @@ export function privateScanAssetToPublicScanAsset(
     public_activity: publicStructure.activity,
     public_sparkline_context_7d: publicStructure.sparkline_context_7d,
     public_structure_transition: publicStructure.structure_transition,
-    public_impulse_context: toPublicImpulseContext(asset.impulse_transition_state),
+    public_impulse_context: publicStructure.impulse_context,
 
     rank: normalizeRank(asset.rank),
     logo_url: normalizeNullableString(asset.logo_url),
@@ -379,7 +408,7 @@ export function privateScanAssetsToPublicScanAssets(
 }
 
 /* ============================================================================
- * 8. PUBLIC TRANSFORMER
+ * 7. PUBLIC TRANSFORMER
  * ========================================================================== */
 
 export function toScanServiceItem(
@@ -400,6 +429,7 @@ export function toScanServiceItem(
   const structure7d = buildStructureFromAsset(input);
 
   const price = normalizeNullableNumber(readField(input, "price"));
+
   const chg24h = normalizeNullableNumber(
     readField(input, "chg_24h_pct", "pct24h"),
   );
@@ -414,15 +444,25 @@ export function toScanServiceItem(
 
   const marketCap = normalizeNullableNumber(readField(input, "market_cap"));
   const volume24h = normalizeNullableNumber(readField(input, "volume_24h"));
+  const publicImpulseContext = readPublicImpulseContext(input);
+
+console.log("XYVALA_TRANSFORMER_IMPULSE_MAPPING", {
+  symbol: identity.symbol,
+  raw_public_impulse_context: readField(input, "public_impulse_context"),
+  raw_impulse_context: readField(input, "impulse_context"),
+  raw_impulse_transition_state: readField(input, "impulse_transition_state"),
+  resolved_public_impulse_context: publicImpulseContext,
+});
 
   const publicStructure = buildPublicStructureFromValues({
-    chg24h,
-    chg7d,
-    volume24h,
-    marketCap,
-    sparkline7d,
-  });
-
+  chg24h,
+  chg7d,
+  volume24h,
+  marketCap,
+  sparkline7d,
+  impulseTransitionState: readField(input, "impulse_transition_state"),
+  publicImpulseContext,
+});
   if (price === null) {
     warnings.push("scan_transformer_price_unavailable");
   }
@@ -457,7 +497,7 @@ export function toScanServiceItem(
     public_activity: publicStructure.activity,
     public_sparkline_context_7d: publicStructure.sparkline_context_7d,
     public_structure_transition: publicStructure.structure_transition,
-    public_impulse_context: readPublicImpulseContext(input),
+    public_impulse_context: publicStructure.impulse_context,
 
     rank: normalizeRank(readField(input, "rank")),
     logo_url: readLogo(input),
@@ -525,7 +565,7 @@ export function transformScanAssets(input: {
 }
 
 /* ============================================================================
- * 9. CONTRACT BRIDGE HELPERS
+ * 8. CONTRACT BRIDGE HELPERS
  * ========================================================================== */
 
 export function toPublicScanAsset(item: ScanTransformerItem): ScanAsset {

@@ -1,46 +1,17 @@
 /* ============================================================================
  * FILE: app/api/rebuild/route.ts
- * ----------------------------------------------------------------------------
- * TITLE
- * - Xyvala canonical public scan snapshot rebuild route
- *
- * ROLE
- * - rebuild the canonical public scan snapshot
- * - validate public ScanAsset contract compatibility
- * - persist one deterministic public snapshot into cache
- *
- * PARENTS
- * - lib/xyvala/services/raw-assets-service.ts
- * - lib/xyvala/snapshot.ts
- * - lib/xyvala/cache/cache-core.ts
- * - lib/xyvala/contracts/scan-contract.ts
- *
- * DIRECTIVES
- * - route orchestration only
- * - no dependency on /api/scan
- * - no circular rebuild chain
- * - no provider parsing here
- * - no RFS recomputation
- * - no MCI recomputation
- * - no private analytical fields
- * - no regime exposure
- * - no decision exposure
- * - no opportunity exposure
- * - no stability score exposure
- * - no rupture exposure
- * - no crash exposure
- * - no confidence exposure
- * - no calibration exposure
- * - no broker / affiliate exposure
- * - raw-assets-service remains the upstream normalization source
- * - snapshot remains descriptive and public-safe
- * - deterministic output only
- * - EUR remains default quote
  * ========================================================================== */
 
 import { NextResponse } from "next/server";
 
+import { privateScanAssetsToPublicScanAssets } from "@/lib/xyvala/services/scan-transformer";
+
+import { adaptMarketEvaluationsToPrivateScanAssets } from "@/lib/xyvala/stores/market-traceability-adapter";
+
+import { buildScanEngineResult } from "@/lib/xyvala/scan-engine";
+import type { ScanAsset } from "@/lib/xyvala/contracts/scan-contract";
 import { loadRawAssets } from "@/lib/xyvala/services/raw-assets-service";
+import { writeScanSnapshot } from "@/lib/xyvala/services/scan-snapshot-service";
 
 import {
   isScanSnapshot,
@@ -49,37 +20,20 @@ import {
   type ScanSnapshot,
 } from "@/lib/xyvala/snapshot";
 
-import type { ScanAsset } from "@/lib/xyvala/contracts/scan-contract";
-
-import {
-  scanKey,
-  setToCache,
-} from "@/lib/xyvala/cache/cache-core";
-
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
-/* ============================================================================
- * 1. CONFIG
- * ========================================================================== */
-
 const DEFAULT_MARKET = "crypto" as const;
 const DEFAULT_QUOTE: Quote = "eur";
+const DEFAULT_SORT = "rank" as const;
+const DEFAULT_ORDER = "asc" as const;
 
-const DEFAULT_LIMIT = 250;
-const SNAPSHOT_TTL_MS = 60_000;
+const CANONICAL_SCAN_SNAPSHOT_LIMIT = 250;
+const SNAPSHOT_TTL_MS = 15 * 60_000;
 const PREVIEW_LIMIT = 5;
 
-/* ============================================================================
- * 2. TYPES
- * ========================================================================== */
-
 type RawAssetsResult = Awaited<ReturnType<typeof loadRawAssets>>;
-
-/* ============================================================================
- * 3. SAFE HELPERS
- * ========================================================================== */
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -89,7 +43,6 @@ function normalizeQuote(value: unknown): Quote {
   if (value === "eur") return "eur";
   if (value === "usd") return "usd";
   if (value === "usdt") return "usdt";
-
   return DEFAULT_QUOTE;
 }
 
@@ -109,10 +62,7 @@ function uniqueWarnings(
 }
 
 function isFiniteNumberOrNull(value: unknown): value is number | null {
-  return value === null || (
-    typeof value === "number" &&
-    Number.isFinite(value)
-  );
+  return value === null || (typeof value === "number" && Number.isFinite(value));
 }
 
 function isStringOrNull(value: unknown): value is string | null {
@@ -122,46 +72,37 @@ function isStringOrNull(value: unknown): value is string | null {
 function isNumberArrayOrNull(value: unknown): value is number[] | null {
   return (
     value === null ||
-    (
-      Array.isArray(value) &&
-      value.every(
-        (item) =>
-          typeof item === "number" &&
-          Number.isFinite(item),
-      )
-    )
+    (Array.isArray(value) &&
+      value.every((item) => typeof item === "number" && Number.isFinite(item)))
   );
 }
 
-/* ============================================================================
- * 4. PUBLIC CONTRACT VALIDATION
- * ========================================================================== */
+function isPublicLabel(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
 
 function isPublicScanAsset(value: unknown): value is ScanAsset {
-  if (!value || typeof value !== "object") {
-    return false;
-  }
+  if (!value || typeof value !== "object") return false;
 
   const asset = value as Record<string, unknown>;
 
   return (
     typeof asset.id === "string" &&
     asset.id.trim().length > 0 &&
-
     typeof asset.symbol === "string" &&
     asset.symbol.trim().length > 0 &&
-
     typeof asset.name === "string" &&
     asset.name.trim().length > 0 &&
-
     isFiniteNumberOrNull(asset.price) &&
     isFiniteNumberOrNull(asset.chg_24h_pct) &&
     isFiniteNumberOrNull(asset.chg_7d_pct) &&
-
     isFiniteNumberOrNull(asset.market_cap) &&
     isFiniteNumberOrNull(asset.volume_24h) &&
-
     isNumberArrayOrNull(asset.sparkline_7d) &&
+    isPublicLabel(asset.public_activity) &&
+    isPublicLabel(asset.public_sparkline_context_7d) &&
+    isPublicLabel(asset.public_structure_transition) &&
+    isPublicLabel(asset.public_impulse_context) &&
     isFiniteNumberOrNull(asset.rank) &&
     isStringOrNull(asset.logo_url)
   );
@@ -172,7 +113,6 @@ function validatePublicAssets(data: unknown[]): {
   invalid_count: number;
 } {
   const valid: ScanAsset[] = [];
-
   let invalidCount = 0;
 
   for (const item of data) {
@@ -189,20 +129,18 @@ function validatePublicAssets(data: unknown[]): {
   };
 }
 
-/* ============================================================================
- * 5. SNAPSHOT HELPERS
- * ========================================================================== */
-
-function buildCanonicalScanCacheKey(quote: Quote): string {
-  return scanKey({
-    version: XYVALA_SNAPSHOT_VERSION,
-    market: DEFAULT_MARKET,
-    quote,
-    sort: "rank",
-    order: "asc",
-    limit: DEFAULT_LIMIT,
-    q: null,
-  });
+function buildSnapshotWarnings(input: {
+  raw_warnings?: string[];
+  engine_warnings?: string[];
+  invalid_count: number;
+}): string[] {
+  return uniqueWarnings(
+    input.raw_warnings,
+    input.engine_warnings,
+    input.invalid_count > 0
+      ? [`invalid_public_assets:${input.invalid_count}`]
+      : [],
+  );
 }
 
 function buildSnapshotCandidate(input: {
@@ -220,23 +158,16 @@ function buildSnapshotCandidate(input: {
     count: input.data.length,
     data: input.data,
     meta: {
-    limit: DEFAULT_LIMIT,
-    sort: "rank",
-    order: "asc",
-    q: null,
-    warnings: input.warnings,
+      limit: CANONICAL_SCAN_SNAPSHOT_LIMIT,
+      sort: DEFAULT_SORT,
+      order: DEFAULT_ORDER,
+      q: null,
+      warnings: input.warnings,
     },
   };
 }
 
-/* ============================================================================
- * 6. RESPONSE HELPERS
- * ========================================================================== */
-
-function json(
-  payload: unknown,
-  status: number,
-): NextResponse {
+function json(payload: unknown, status: number): NextResponse {
   return NextResponse.json(payload, {
     status,
     headers: {
@@ -247,129 +178,180 @@ function json(
   });
 }
 
-/* ============================================================================
- * 7. ROUTE HANDLER
- * ========================================================================== */
+function buildFailurePayload(input: {
+  quote?: Quote;
+  error: string;
+  warnings?: string[];
+  count?: number;
+}) {
+  return {
+    ok: false,
+    ts: nowIso(),
+    quote: input.quote ?? DEFAULT_QUOTE,
+    error: input.error,
+    warnings: input.warnings ?? [],
+    count: input.count ?? 0,
+  };
+}
 
 export async function GET(req: Request) {
   try {
     const url = new URL(req.url);
+    const quote = normalizeQuote(url.searchParams.get("quote"));
 
-    const quote = normalizeQuote(
-      url.searchParams.get("quote"),
-    );
-
-    const raw: RawAssetsResult =
-      await loadRawAssets(quote);
+    const raw: RawAssetsResult = await loadRawAssets(quote);
 
     if (!raw.ok) {
       return json(
-        {
-          ok: false,
-          ts: nowIso(),
+        buildFailurePayload({
           quote,
           error: raw.error ?? "raw_assets_not_ok",
           warnings: raw.warnings,
-          count: 0,
-        },
+        }),
         502,
       );
     }
 
-    if (
-      !Array.isArray(raw.data) ||
-      raw.data.length === 0
-    ) {
+    if (!Array.isArray(raw.data) || raw.data.length === 0) {
       return json(
-        {
-          ok: false,
-          ts: nowIso(),
+        buildFailurePayload({
           quote,
           error: "raw_assets_empty",
           warnings: raw.warnings,
-          count: 0,
-        },
+        }),
         502,
       );
     }
 
-    const validated = validatePublicAssets(
-      raw.data,
-    );
+    const marketEvaluations = raw.data.map((asset) => ({
+  mapped: {
+    ...(asset as Record<string, unknown>),
+    quote_asset: quote,
+  },
+}));
+
+const privateAdapter =
+  adaptMarketEvaluationsToPrivateScanAssets(marketEvaluations);
+
+if (!privateAdapter.ok || privateAdapter.assets.length === 0) {
+  return json(
+    buildFailurePayload({
+      quote,
+      error: "private_asset_adapter_failed",
+      warnings: uniqueWarnings(raw.warnings, privateAdapter.warnings),
+      count: privateAdapter.count,
+    }),
+    500,
+  );
+}
+
+const engine = buildScanEngineResult({
+  data: privateAdapter.assets,
+});
+
+    if (!Array.isArray(engine.data) || engine.data.length === 0) {
+  return json(
+    buildFailurePayload({
+      quote,
+      error: "scan_engine_empty",
+      warnings: raw.warnings,
+    }),
+    500,
+  );
+}
+
+    const publicAssets = privateScanAssetsToPublicScanAssets(engine.data);
+
+const validated = validatePublicAssets(publicAssets);
 
     if (validated.valid.length === 0) {
+  return json(
+    buildFailurePayload({
+      quote,
+      error: "public_scan_assets_invalid",
+      warnings: buildSnapshotWarnings({
+        raw_warnings: raw.warnings,
+        engine_warnings: [],
+        invalid_count: validated.invalid_count,
+      }),
+    }),
+    500,
+  );
+}
+
+    const snapshotWarnings = buildSnapshotWarnings({
+  raw_warnings: raw.warnings,
+  engine_warnings: [],
+  invalid_count: validated.invalid_count,
+});
+
+    const snapshot = buildSnapshotCandidate({
+      quote,
+      data: validated.valid.slice(0, CANONICAL_SCAN_SNAPSHOT_LIMIT),
+      warnings: snapshotWarnings,
+    });
+
+    if (!isScanSnapshot(snapshot)) {
       return json(
-        {
-          ok: false,
-          ts: nowIso(),
+        buildFailurePayload({
           quote,
-          error: "raw_assets_invalid_shape",
-          warnings: uniqueWarnings(
-            raw.warnings,
-            [
-              `invalid_raw_assets:${validated.invalid_count}`,
-            ],
-          ),
-          count: 0,
-        },
+          error: "snapshot_contract_invalid",
+          warnings: snapshotWarnings,
+          count: validated.valid.length,
+        }),
         500,
       );
     }
 
-    const snapshot = buildSnapshotCandidate({
+    const writeResult = await writeScanSnapshot({
       quote,
-      data: validated.valid,
-      warnings:
-        validated.invalid_count > 0
-          ? uniqueWarnings(
-              raw.warnings,
-              [
-                `invalid_raw_assets:${validated.invalid_count}`,
-              ],
-            )
-          : raw.warnings,
+      snapshot,
+      ttl_ms: SNAPSHOT_TTL_MS,
     });
 
-    const key =
-      buildCanonicalScanCacheKey(quote);
-
-    console.log("[REBUILD] writing snapshot", {
-  key,
-  count: snapshot.data.length,
-});
-
-    await setToCache(
-      key,
-      snapshot,
-      SNAPSHOT_TTL_MS,
-    );
+    if (!writeResult.ok) {
+      return json(
+        buildFailurePayload({
+          quote,
+          error: writeResult.error ?? "scan_snapshot_write_failed",
+          warnings: writeResult.warnings,
+          count: snapshot.data.length,
+        }),
+        500,
+      );
+    }
 
     return json(
       {
         ok: true,
         ts: nowIso(),
+        version: XYVALA_SNAPSHOT_VERSION,
         source: snapshot.source,
+        market: snapshot.market,
         quote: snapshot.quote,
-        key,
+        key: writeResult.key,
+        canonical: {
+          sort: DEFAULT_SORT,
+          order: DEFAULT_ORDER,
+          limit: CANONICAL_SCAN_SNAPSHOT_LIMIT,
+          q: null,
+        },
+        snapshot_saved: writeResult.snapshot_saved,
         count: snapshot.data.length,
-        warnings: snapshot.meta.warnings,
-        preview: snapshot.data.slice(
-          0,
-          PREVIEW_LIMIT,
-        ),
+        invalid_count: validated.invalid_count,
+        warnings: uniqueWarnings(snapshot.meta.warnings, writeResult.warnings),
+        preview: snapshot.data.slice(0, PREVIEW_LIMIT),
       },
       200,
     );
   } catch (error) {
     return json(
-      {
-        ok: false,
-        ts: nowIso(),
+      buildFailurePayload({
         error:
-          error instanceof Error
+          error instanceof Error && error.message
             ? error.message
             : "rebuild_unknown_error",
-      },
+      }),
       500,
     );
   }

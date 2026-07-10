@@ -49,7 +49,8 @@ import {
 } from "@/lib/xyvala/engine/mci-decision-funnel";
 
 import { runCalibrationOrchestrator } from "@/lib/xyvala/calibration/calibration-orchestrator";
-import { appendDecisionDistributionSample } from "@/lib/xyvala/calibration/decision-distribution-store";
+
+import { appendDecisionDistributionSample } from "@/lib/xyvala/calibration/store/decision-distribution-store";
 
 import type {
   CalibrationPolicySource,

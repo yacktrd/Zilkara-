@@ -2,65 +2,74 @@
  * FILE: lib/xyvala/cache/snapshot-key.ts
  * ----------------------------------------------------------------------------
  * TITLE
- * - Xyvala canonical snapshot cache key
+ * - Xyvala canonical scan snapshot cache key
+ *
+ * ROLE
+ * - provide the single deterministic cache key used by scan snapshot persistence
+ * - prevent key divergence between rebuild, scan, summary and state services
  *
  * PARENT FILES
  * - lib/xyvala/cache/cache-core.ts
  * - lib/xyvala/snapshot.ts
- *
- * ROLE
- * - provide one deterministic canonical cache key for scan snapshots
- * - prevent rebuild / scan / state key divergence
+ * - lib/xyvala/services/scan-snapshot-service.ts
  *
  * DIRECTIVES
- * - one source of truth
+ * - cache key factory only
  * - no route logic
+ * - no scan sorting logic
+ * - no pagination logic
+ * - no search query logic
  * - no snapshot building
+ * - no cache read/write
  * - no UI logic
+ * - no RFS recomputation
+ * - no MCI recomputation
  * - deterministic output only
- * - same quote => same canonical snapshot key
+ * - same quote => same key
  *
  * INPUTS
  * - Quote
  *
  * OUTPUTS
- * - canonical snapshot cache key string
+ * - canonical scan snapshot cache key
  *
  * INVARIANTS
- * - snapshot key must be shared by rebuild and scan-service
- * - no local reconstruction of snapshot key elsewhere
- * - EUR-compatible quote handling preserved
+ * - rebuild, scan, summary and state must use the same key for the same quote
+ * - snapshot identity must not depend on sort, order, limit or q
+ * - quote is the only variable part besides the snapshot version
+ * - EUR compatibility is preserved through Quote
  *
  * CRITICAL DEPENDENCIES
- * - scanKey
  * - XYVALA_SNAPSHOT_VERSION
+ * - Quote
  *
  * SENSITIVE ZONES
- * - canonical limit
- * - quote consistency
- * - snapshot version consistency
+ * - snapshot version
+ * - quote normalization upstream
+ * - cache key immutability
  * ========================================================================== */
 
-import { scanKey } from "@/lib/xyvala/cache/cache-core";
 import {
   XYVALA_SNAPSHOT_VERSION,
   type Quote,
 } from "@/lib/xyvala/snapshot";
 
+/* ============================================================================
+ * 1. CONFIG
+ * ========================================================================== */
+
 const CANONICAL_MARKET = "crypto" as const;
-const CANONICAL_SORT = "stability" as const;
-const CANONICAL_ORDER = "desc" as const;
-const CANONICAL_LIMIT = 250;
-const CANONICAL_Q = null;
+const CACHE_NAMESPACE = "xyvala:scan" as const;
+
+/* ============================================================================
+ * 2. CANONICAL KEY BUILDER
+ * ========================================================================== */
 
 export function buildCanonicalSnapshotKey(quote: Quote): string {
-  return scanKey({
-    version: XYVALA_SNAPSHOT_VERSION,
-    market: CANONICAL_MARKET,
-    quote,
-    sort: CANONICAL_SORT,
-    order: CANONICAL_ORDER,
-    limit: CANONICAL_LIMIT,
-    q: CANONICAL_Q,
-  });
+  return [
+    CACHE_NAMESPACE,
+    `v=${XYVALA_SNAPSHOT_VERSION}`,
+    `market=${CANONICAL_MARKET}`,
+    `quote=${quote}`,
+  ].join(":");
 }

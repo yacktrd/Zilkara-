@@ -189,29 +189,16 @@ export type DecisionSample = ObservedMarket &
  * 5. SAMPLE INPUTS
  * ========================================================================== */
 
-export type DecisionSampleInput = Partial<
-  Omit<
-    DecisionSample,
-    | "rupture_validity"
-    | "recovery_validity"
-    | "rupture_evolution_score"
-    | "rupture_evolution_state"
-    | "rupture_acceleration_score"
-    | "rupture_evolution_validity"
-  >
-> & {
-  rupture_validity?: ValidityState;
-  recovery_validity?: ValidityState;
+export type DecisionSampleInput = Partial<DecisionSample> & {
+  observed_decision?: CalibrationDecision;
+  observed_regime?: CalibrationRegime;
+  observed_analytical_version?: string;
+  observed_horizon?: EvaluationHorizon;
 
-  rupture_evolution_score?: number;
-  rupture_evolution_state?: RuptureEvolutionSignals["rupture_evolution_state"];
-  rupture_acceleration_score?: number;
-  rupture_evolution_validity?: ValidityState;
-
-  final_decision: CalibrationDecision;
-  regime: CalibrationRegime;
-  analytical_version: string;
-  horizon: EvaluationHorizon;
+  final_decision?: CalibrationDecision;
+  regime?: CalibrationRegime;
+  analytical_version?: string;
+  horizon?: EvaluationHorizon;
 };
 
 /* ============================================================================

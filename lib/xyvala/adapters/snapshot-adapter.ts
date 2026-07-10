@@ -194,14 +194,59 @@ export function normalizeSnapshotAsset(
 
 /* ============================================================================
  * 5. SNAPSHOT BATCH NORMALIZATION
+ * ============================================================================
+ *
+ * ROLE
+ * - extract legacy asset arrays from supported snapshot transports
+ * - preserve adapter-only responsibility
+ * - never reconstruct analytical truth
  * ========================================================================== */
 
-export function normalizeSnapshotData(data: unknown): PrivateScanAsset[] {
-  if (!Array.isArray(data)) {
+function extractSnapshotAssets(data: unknown): unknown[] {
+  if (Array.isArray(data)) {
+    return data;
+  }
+
+  if (typeof data !== "object" || data === null) {
     return [];
   }
 
-  return data.map((item) =>
+  const record = data as {
+    data?: unknown;
+    assets?: unknown;
+    snapshot?: unknown;
+  };
+
+  if (Array.isArray(record.data)) {
+    return record.data;
+  }
+
+  if (Array.isArray(record.assets)) {
+    return record.assets;
+  }
+
+  if (typeof record.snapshot === "object" && record.snapshot !== null) {
+    const snapshot = record.snapshot as {
+      data?: unknown;
+      assets?: unknown;
+    };
+
+    if (Array.isArray(snapshot.data)) {
+      return snapshot.data;
+    }
+
+    if (Array.isArray(snapshot.assets)) {
+      return snapshot.assets;
+    }
+  }
+
+  return [];
+}
+
+export function normalizeSnapshotData(data: unknown): PrivateScanAsset[] {
+  const assets = extractSnapshotAssets(data);
+
+  return assets.map((item) =>
     normalizeSnapshotAsset(item as LegacySnapshotAsset),
   );
 }

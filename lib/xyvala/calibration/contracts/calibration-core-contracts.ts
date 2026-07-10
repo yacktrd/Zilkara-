@@ -52,7 +52,7 @@ export type CalibrationRegime = "STABLE" | "TRANSITION" | "VOLATILE";
 
 export type EvaluationHorizon = "24H" | "7D" | "14D" | "30D" | "default";
 
-export type CalibrationVersion = "v8" | string;
+export type CalibrationVersion = string;
 
 /* ============================================================================
  * 2. CALIBRATION MATURITY / POLICY SOURCE

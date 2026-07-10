@@ -23,9 +23,12 @@
  * ========================================================================== */
 
 import { getFromCache, setToCache } from "@/lib/xyvala/cache/cache-core";
-import { buildCanonicalSnapshotKey } from "@/lib/xyvala/cache/snapshot-key";
+
 import {
-  isScanSnapshot,
+  readScanSnapshot as readCanonicalScanSnapshot,
+} from "@/lib/xyvala/services/scan-snapshot-service";
+
+import {
   XYVALA_SNAPSHOT_VERSION,
   type Quote,
   type ScanSnapshot,
@@ -70,11 +73,6 @@ export type StateServiceResult = {
   state: StateServiceState | null;
   warnings: string[];
   error: string | null;
-};
-
-export type ScanSnapshotReadResult = {
-  snapshot: ScanSnapshot | null;
-  warnings: string[];
 };
 
 /* ============================================================================
@@ -138,30 +136,7 @@ function buildStateCacheKey(quote: Quote): string {
 }
 
 /* ============================================================================
- * 5. SNAPSHOT READER
- * ========================================================================== */
-
-export async function readScanSnapshot(
-  quote: Quote,
-): Promise<ScanSnapshotReadResult> {
-  const key = buildCanonicalSnapshotKey(quote);
-  const raw = await getFromCache<unknown>(key);
-
-  if (!isScanSnapshot(raw)) {
-    return {
-      snapshot: null,
-      warnings: ["scan_snapshot_cache_miss_or_invalid"],
-    };
-  }
-
-  return {
-    snapshot: raw,
-    warnings: [],
-  };
-}
-
-/* ============================================================================
- * 6. PUBLIC MARKET CONTEXT
+ * 5. PUBLIC MARKET CONTEXT
  * ========================================================================== */
 
 function buildStateFromSnapshot(snapshot: ScanSnapshot): StateServiceState | null {
@@ -220,7 +195,7 @@ function buildStateFromSnapshot(snapshot: ScanSnapshot): StateServiceState | nul
 }
 
 /* ============================================================================
- * 7. RESULT FACTORY
+ * 6. RESULT FACTORY
  * ========================================================================== */
 
 function buildResult(
@@ -239,7 +214,7 @@ function buildResult(
 }
 
 /* ============================================================================
- * 8. PUBLIC SERVICE
+ * 7. PUBLIC SERVICE
  * ========================================================================== */
 
 export async function getStateService(
@@ -271,7 +246,7 @@ export async function getStateService(
   let warnings: string[] = [];
 
   try {
-    const readResult = await readScanSnapshot(quote);
+    const readResult = await readCanonicalScanSnapshot({ quote });
 
     snapshot = readResult.snapshot;
     warnings = uniqueWarnings(warnings, readResult.warnings);

@@ -7,6 +7,7 @@ import type {
   MciImpulseGovernanceState,
   MciImpulseTransitionState,
   MciMarketImpulseLayer,
+  MciMarketTripleLayer,
   MciMarketResult,
   RunMciMarketInput,
 } from "./mci/mci-market-types";
@@ -149,7 +150,71 @@ function buildImpulseGovernance(
     impulse_directional_bias: directionalBias,
     impulse_transition_state: transitionState,
     impulse_governance_state: governanceState,
-    impulse_validity: pressure === null ? "degraded" : "computed",
+    impulse_validity:
+  pressure === null
+    ? "insufficient_data"
+    : "computed",
+  };
+}
+
+/* ============================================================================
+ * 4. TRIPLE LAYER
+ * ========================================================================== */
+
+function resolveTripleLayerState(input: {
+  growth: number;
+  core: number;
+  decay: number;
+}): MciMarketTripleLayer["triple_layer_state"] {
+  const { growth, core, decay } = input;
+
+  if (growth <= 0 && core <= 0 && decay <= 0) {
+    return "unknown";
+  }
+
+  if (growth >= core && growth >= decay && growth >= 60) {
+    return "growth_dominant";
+  }
+
+  if (core >= growth && core >= decay && core >= 60) {
+    return "core_dominant";
+  }
+
+  if (decay >= growth && decay >= core && decay >= 60) {
+    return "decay_dominant";
+  }
+
+  return "mixed";
+}
+
+function buildTripleLayer(
+  scores: MciMarketScores,
+): MciMarketTripleLayer {
+  const growth = clampScore(scores.opportunity);
+  const core = clampScore(
+    scores.stability * 0.45 +
+      scores.convergence * 0.35 +
+      scores.confidence * 0.2,
+  );
+  const decay = clampScore(
+    scores.rupture * 0.65 +
+      (100 - scores.confidence) * 0.35,
+  );
+
+  return {
+    triple_layer_state: resolveTripleLayerState({
+      growth,
+      core,
+      decay,
+    }),
+
+    growth_score: growth,
+    core_pattern_score: core,
+    decay_score: decay,
+
+    growth_status: "computed",
+    core_status: "computed",
+    decay_status: "computed",
   };
 }
 

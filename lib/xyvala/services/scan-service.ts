@@ -39,20 +39,15 @@
 import type { ScanAsset } from "@/lib/xyvala/contracts/scan-contract";
 
 import {
-  getFromCache,
-  scanKey,
-} from "@/lib/xyvala/cache/cache-core";
-
-import {
-  isScanSnapshot,
-  XYVALA_SNAPSHOT_VERSION,
-  type Market,
   type Quote,
-  type ScanSnapshot,
 } from "@/lib/xyvala/snapshot";
 
 import { buildPublicStructure } from "@/lib/xyvala/public/public-structure";
 import { getMarketAssets } from "@/lib/xyvala/sources/market-source";
+
+import {
+  readScanSnapshot,
+} from "@/lib/xyvala/services/scan-snapshot-service";
 
 import {
   normalizeScanQuery,
@@ -88,9 +83,7 @@ type MarketSeed = Awaited<ReturnType<typeof getMarketAssets>>[number];
  * 2. CONFIG
  * ========================================================================== */
 
-const DEFAULT_MARKET: Market = "crypto";
 const DEFAULT_QUOTE: Quote = "eur";
-
 const DEFAULT_SORT: ScanSortKey = "rank";
 const DEFAULT_ORDER: ScanSortOrder = "asc";
 const DEFAULT_LIMIT = 250;
@@ -133,27 +126,25 @@ function uniqueWarnings(
  * 4. SNAPSHOT HELPERS
  * ========================================================================== */
 
-function buildCanonicalScanCacheKey(quote: Quote): string {
-  return scanKey({
-    version: XYVALA_SNAPSHOT_VERSION,
-    market: DEFAULT_MARKET,
-    quote,
-    sort: DEFAULT_SORT,
-    order: DEFAULT_ORDER,
-    limit: DEFAULT_LIMIT,
-    q: null,
+async function readCanonicalSnapshot(input: {
+  quote: Quote;
+  noStore: boolean;
+}) {
+  if (input.noStore) {
+    return {
+      snapshot: null,
+      warnings: ["scan_service_snapshot_skipped_no_store"],
+    };
+  }
+
+  const result = await readScanSnapshot({
+    quote: input.quote,
   });
-}
 
-async function readCanonicalSnapshot(
-  quote: Quote,
-): Promise<ScanSnapshot | null> {
-  const snapshot = await getFromCache<ScanSnapshot>(
-    buildCanonicalScanCacheKey(quote),
-    SNAPSHOT_TTL_MS,
-  );
-
-  return isScanSnapshot(snapshot) ? snapshot : null;
+  return {
+    snapshot: result.ok ? result.snapshot : null,
+    warnings: result.warnings,
+  };
 }
 
 /* ============================================================================
@@ -217,9 +208,12 @@ export async function getScan(
   });
 
   try {
-    const snapshot = input.noStore === true
-      ? null
-      : await readCanonicalSnapshot(quote);
+    const snapshotRead = await readCanonicalSnapshot({
+      quote,
+      noStore: input.noStore === true,
+    });
+
+    const snapshot = snapshotRead.snapshot;
 
     if (snapshot) {
       const queried = queryScanItems(snapshot.data, query);
@@ -229,6 +223,7 @@ export async function getScan(
         source: "scan",
         data: queried.data,
         warnings: uniqueWarnings(
+          snapshotRead.warnings,
           snapshot.meta?.warnings,
           ["scan_service_snapshot_source"],
         ),

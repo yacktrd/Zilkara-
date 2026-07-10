@@ -7,16 +7,8 @@
  * ROLE
  * - enrich private scan assets with RFS structural readings
  * - enrich private scan assets with Impulse Layer readings
- * - apply adaptive impulse calibration outside the impulse core
  * - keep analytical computation private
  * - preserve deterministic scan output ordering
- *
- * PARENT FILES
- * - lib/xyvala/contracts/scan-private-contract.ts
- * - lib/xyvala/rfs-core.ts
- * - lib/xyvala/engine/impulse-state-core.ts
- * - lib/xyvala/calibration/impulse-adaptive-thresholds.ts
- * - lib/xyvala/market-context.ts
  *
  * DIRECTIVES
  * - private engine only
@@ -24,6 +16,7 @@
  * - no API response building
  * - no public wording
  * - no MCI recomputation
+ * - no calibration logic
  * - no investment advice
  * - no prediction
  * - no buy / sell / hold semantics
@@ -44,16 +37,17 @@
  * - Impulse does not replace stability
  * - Impulse does not replace rupture
  * - Impulse reads pressure only
- * - adaptive impulse calibration stays outside impulse-state-core
- * - Triple Layer is contextual for impulse calibration only
  * - public transformer decides what can be exposed
  * ========================================================================== */
 
 import type {
+  PrivateAggregatedContext,
   PrivateScanAsset,
   PrivateScanRegime,
   PrivateScanStatus,
 } from "@/lib/xyvala/contracts/scan-private-contract";
+
+import type { ImpulseAdaptivePolicy } from "@/lib/xyvala/calibration/impulse-adaptive-thresholds";
 
 import { runRFS } from "@/lib/xyvala/rfs-core";
 
@@ -62,16 +56,6 @@ import {
   type ImpulseSignatureInput,
   type ImpulseTemporalBlock,
 } from "@/lib/xyvala/engine/impulse-state-core";
-
-import {
-  buildImpulseAdaptivePolicy,
-  resolveImpulseStateWithAdaptivePolicy,
-  type ImpulseAdaptiveSample,
-} from "@/lib/xyvala/calibration/impulse-adaptive-thresholds";
-
-import {
-  writeImpulseDistributionSnapshot,
-} from "@/lib/xyvala/calibration/impulse-distribution-store";
 
 import {
   buildMarketContext,
@@ -138,7 +122,28 @@ function resolveRegime(value: unknown): PrivateScanRegime {
 }
 
 /* ============================================================================
- * 4. IMPULSE INPUT HELPERS
+ * 4. IMPULSE HELPERS
+ * ----------------------------------------------------------------------------
+ * ROLE
+ * - derive deterministic private impulse inputs
+ * - transform observable price structures into impulse-compatible signatures
+ * - preserve analytical consistency without reconstructing RFS internals
+ *
+ * DIRECTIVES
+ * - deterministic only
+ * - no hidden randomness
+ * - no predictive logic
+ * - no public wording
+ * - no UI logic
+ * - no MCI logic
+ * - no calibration logic
+ * - observable price-derived helpers only
+ *
+ * INVARIANTS
+ * - same input => same output
+ * - bounded and finite outputs only
+ * - no undefined propagation
+ * - helpers remain isolated from public exposure
  * ========================================================================== */
 
 function computePriceReturns(prices: number[]): number[] {
@@ -163,13 +168,20 @@ function computePriceReturns(prices: number[]): number[] {
 }
 
 function computeAmplitudePct(prices: number[]): number {
-  if (prices.length < 2) return 0;
+  if (prices.length < 2) {
+    return 0;
+  }
 
   const min = Math.min(...prices);
   const max = Math.max(...prices);
+
   const last = prices[prices.length - 1];
 
-  if (typeof last !== "number" || !Number.isFinite(last) || last <= 0) {
+  if (
+    typeof last !== "number" ||
+    !Number.isFinite(last) ||
+    last <= 0
+  ) {
     return 0;
   }
 
@@ -177,7 +189,9 @@ function computeAmplitudePct(prices: number[]): number {
 }
 
 function computeSlopePct(prices: number[]): number {
-  if (prices.length < 2) return 0;
+  if (prices.length < 2) {
+    return 0;
+  }
 
   const first = prices[0];
   const last = prices[prices.length - 1];
@@ -198,21 +212,30 @@ function computeSlopePct(prices: number[]): number {
 function computeInstabilityScore(prices: number[]): number {
   const returns = computePriceReturns(prices);
 
-  if (returns.length === 0) return 0;
+  if (returns.length === 0) {
+    return 0;
+  }
 
-  const mean = returns.reduce((sum, value) => sum + value, 0) / returns.length;
+  const mean =
+    returns.reduce((sum, value) => sum + value, 0) / returns.length;
 
   const variance =
-    returns.reduce((sum, value) => sum + (value - mean) ** 2, 0) /
-    returns.length;
+    returns.reduce(
+      (sum, value) => sum + (value - mean) ** 2,
+      0,
+    ) / returns.length;
 
-  return Math.max(0, Math.min(100, Math.sqrt(variance) * 12));
+  const volatility = Math.sqrt(variance);
+
+  return Math.max(0, Math.min(100, volatility * 12));
 }
 
 function computeBreakRate(prices: number[]): number {
   const returns = computePriceReturns(prices);
 
-  if (returns.length < 2) return 0;
+  if (returns.length < 2) {
+    return 0;
+  }
 
   let breaks = 0;
 
@@ -225,9 +248,11 @@ function computeBreakRate(prices: number[]): number {
       typeof current === "number" &&
       Number.isFinite(previous) &&
       Number.isFinite(current) &&
-      ((previous > 0 && current < 0) ||
+      (
+        (previous > 0 && current < 0) ||
         (previous < 0 && current > 0) ||
-        Math.abs(current) >= 7)
+        Math.abs(current) >= 7
+      )
     ) {
       breaks += 1;
     }
@@ -241,10 +266,17 @@ function buildImpulseSignatureFromPrices(
 ): ImpulseSignatureInput {
   return {
     slope_pct: computeSlopePct(prices),
+
     amplitude_pct: computeAmplitudePct(prices),
+
     instability_score: computeInstabilityScore(prices),
+
     break_rate: computeBreakRate(prices),
-    duration_score: Math.max(0, Math.min(100, prices.length * 10)),
+
+    duration_score: Math.max(
+      0,
+      Math.min(100, prices.length * 10),
+    ),
   };
 }
 
@@ -257,10 +289,37 @@ function buildImpulseTemporalBlock(input: {
 }): ImpulseTemporalBlock {
   return {
     change_pct: safeNumber(input.change_pct),
-    slope_pct: safeNumber(input.slope_pct ?? input.change_pct),
-    stability_score: safeNumber(input.stability_score, 50),
-    rupture_score: safeNumber(input.rupture_score, 50),
-    rupture_probability: safeNumber(input.rupture_probability, 50),
+
+    slope_pct: safeNumber(
+      input.slope_pct ?? input.change_pct,
+    ),
+
+    stability_score: safeNumber(
+      input.stability_score,
+      50,
+    ),
+
+    rupture_score: safeNumber(
+      input.rupture_score,
+      50,
+    ),
+
+    rupture_probability: safeNumber(
+      input.rupture_probability,
+      50,
+    ),
+  };
+}
+
+function buildAggregatedContext(input: {
+  state: string;
+  status: PrivateScanStatus;
+  reason: string | null;
+}): PrivateAggregatedContext {
+  return {
+    state: input.state,
+    status: input.status,
+    reason: input.reason,
   };
 }
 
@@ -278,283 +337,185 @@ function buildNeutralImpulse(
 > {
   return {
     impulse_pressure_score: null,
+
     impulse_instability_score: null,
+
     impulse_saturation_score: null,
+
     impulse_exhaustion_score: null,
+
     impulse_directional_bias: "NEUTRAL",
+
     impulse_transition_state: "NEUTRAL",
+
     impulse_status: status,
   };
 }
 
 /* ============================================================================
- * 5. RFS + RAW IMPULSE ENRICHMENT
+ * 5. RFS + IMPULSE ENRICHMENT
  * ========================================================================== */
 
-function enrichAssetWithRFSAndRawImpulse(asset: PrivateScanAsset): PrivateScanAsset {
-  const prices = resolvePrices(asset);
-
-  if (prices.length < MIN_RFS_PRICES) {
-    return {
-      ...asset,
-
-      stability_score: null,
-      stability_status: "partial",
-
-      regime: "TRANSITION",
-
-      structure_score: null,
-      market_score: null,
-      coherence_score: null,
-
-      rupture_score: null,
-      rupture_probability: null,
-      rupture_penalty_score: null,
-
-      continuity_probability: null,
-
-      confidence_score: null,
-      confidence_status: "partial",
-
-      ...buildNeutralImpulse("partial"),
-
-      governance: {
-        ...asset.governance,
-        warnings: [
-          ...asset.governance.warnings,
-          "scan_engine_insufficient_rfs_prices",
-        ],
-      },
-    };
-  }
-
-  try {
-    const rfs = runRFS({ prices });
-
-    const stability = clampScore(rfs.stability);
-    const structure = clampScore(rfs.structure_score);
-    const market = clampScore(rfs.market_score);
-    const coherence = clampScore(rfs.coherence_score);
-
-    const rupture = clampScore(rfs.rupture_score);
-    const ruptureProbability = clampScore(rfs.rupture_probability);
-    const rupturePenalty = clampScore(rfs.rupture_penalty_score);
-
-    const continuity = clampScore(rfs.continuity_probability);
-    const confidence = clampScore(rfs.confidence_score);
-
-    const impulse = computeImpulseState({
-      current_signature: buildImpulseSignatureFromPrices(prices),
-
-      occurrence_score: safeNumber(clampScore(rfs.occurrence_score)),
-      frequency_score: safeNumber(clampScore(rfs.frequency_score)),
-      convergence_score: safeNumber(clampScore(rfs.convergence_score)),
-      correlation_score: safeNumber(clampScore(rfs.correlation_score)),
-      duration_score: safeNumber(clampScore(rfs.duration_score)),
-
-      rupture_probability: safeNumber(ruptureProbability),
-      rupture_penalty_score: safeNumber(rupturePenalty),
-
-      stability: safeNumber(stability),
-      coherence_score: safeNumber(coherence),
-
-      rolling_7d: buildImpulseTemporalBlock({
-        change_pct: asset.chg_7d_pct,
-        slope_pct: asset.chg_7d_pct,
-        stability_score: stability,
-        rupture_score: rupture,
-        rupture_probability: ruptureProbability,
-      }),
-
-      rolling_24h: buildImpulseTemporalBlock({
-        change_pct: asset.chg_24h_pct,
-        slope_pct: asset.chg_24h_pct,
-        stability_score: stability,
-        rupture_score: rupture,
-        rupture_probability: ruptureProbability,
-      }),
-    });
-
-    return {
-      ...asset,
-
-      stability_score: stability,
-      stability_status: resolveStatus(stability),
-
-      structure_score: structure,
-      market_score: market,
-      coherence_score: coherence,
-
-      occurrence_score: clampScore(rfs.occurrence_score),
-      frequency_score: clampScore(rfs.frequency_score),
-      convergence_score: clampScore(rfs.convergence_score),
-      duration_score: clampScore(rfs.duration_score),
-
-      rupture_score: rupture,
-      rupture_probability: ruptureProbability,
-      rupture_penalty_score: rupturePenalty,
-
-      rupture_occurrence_score: clampScore(rfs.rupture_occurrence_score),
-      rupture_frequency_score: clampScore(rfs.rupture_frequency_score),
-      rupture_convergence_score: clampScore(rfs.rupture_convergence_score),
-      rupture_duration_score: clampScore(rfs.rupture_duration_score),
-
-      crash_score: clampScore(rfs.crash_score),
-      crash_state:
-        rfs.crash_state === "NONE" ||
-        rfs.crash_state === "RISING" ||
-        rfs.crash_state === "CRASH"
-          ? rfs.crash_state
-          : "UNKNOWN",
-
-      impulse_pressure_score: impulse.impulse_pressure_score,
-      impulse_instability_score: impulse.impulse_instability_score,
-      impulse_saturation_score: impulse.impulse_saturation_score,
-      impulse_exhaustion_score: impulse.impulse_exhaustion_score,
-      impulse_directional_bias: impulse.impulse_directional_bias,
-      impulse_transition_state: impulse.impulse_transition_state,
-      impulse_status: "computed",
-
-      continuity_probability: continuity,
-
-      confidence_score: confidence,
-      confidence_status: resolvePartialStatus(confidence),
-
-      regime: resolveRegime(rfs.regime),
-
-      governance: {
-        ...asset.governance,
-        warnings: asset.governance.warnings,
-      },
-    };
-  } catch {
-    return {
-      ...asset,
-
-      stability_score: null,
-      stability_status: "degraded",
-
-      regime: "TRANSITION",
-
-      structure_score: null,
-      market_score: null,
-      coherence_score: null,
-
-      rupture_score: null,
-      rupture_probability: null,
-      rupture_penalty_score: null,
-
-      continuity_probability: null,
-
-      confidence_score: null,
-      confidence_status: "degraded",
-
-      ...buildNeutralImpulse("degraded"),
-
-      governance: {
-        ...asset.governance,
-        warnings: [...asset.governance.warnings, "scan_engine_rfs_failed"],
-      },
-    };
-  }
-}
-
-/* ============================================================================
- * 6. IMPULSE ADAPTIVE CALIBRATION
- * ========================================================================== */
-
-function buildImpulseSample(asset: PrivateScanAsset): ImpulseAdaptiveSample | null {
-  if (
-    asset.impulse_status !== "computed" ||
-    asset.impulse_pressure_score === null ||
-    asset.impulse_instability_score === null ||
-    asset.impulse_saturation_score === null ||
-    asset.impulse_exhaustion_score === null
-  ) {
-    return null;
-  }
-
-  return {
-    pressure_score: asset.impulse_pressure_score,
-    instability_score: asset.impulse_instability_score,
-    saturation_score: asset.impulse_saturation_score,
-    exhaustion_score: asset.impulse_exhaustion_score,
-
-    growth_score: asset.growth_score,
-    core_score: asset.core_pattern_score,
-    decay_score: asset.decay_score,
-
-    transition_state: asset.impulse_transition_state,
-  };
-}
-
-function buildImpulseSamples(data: PrivateScanAsset[]): ImpulseAdaptiveSample[] {
-  return data
-    .map(buildImpulseSample)
-    .filter((sample): sample is ImpulseAdaptiveSample => sample !== null);
-}
-
-function applyImpulseAdaptiveCalibration(
+export function applyRFS(
   data: PrivateScanAsset[],
+  adaptivePolicy?: ImpulseAdaptivePolicy,
 ): PrivateScanAsset[] {
-  const samples = buildImpulseSamples(data);
-  const policy = buildImpulseAdaptivePolicy(samples);
-
-writeImpulseDistributionSnapshot({
-  samples,
-  policy,
-  timestamp: 0,
-});
-
   return data.map((asset) => {
-    if (
-      asset.impulse_status !== "computed" ||
-      asset.impulse_pressure_score === null ||
-      asset.impulse_instability_score === null ||
-      asset.impulse_saturation_score === null ||
-      asset.impulse_exhaustion_score === null
-    ) {
-      return asset;
+    const prices = resolvePrices(asset);
+
+    if (prices.length < MIN_RFS_PRICES) {
+      return {
+        ...asset,
+        stability_score: null,
+        stability_status: "partial",
+        regime: "TRANSITION",
+        structure_score: null,
+        market_score: null,
+        coherence_score: null,
+        rupture_score: null,
+        rupture_probability: null,
+        rupture_penalty_score: null,
+        continuity_probability: null,
+        confidence_score: null,
+        confidence_status: "partial",
+        ...buildNeutralImpulse("partial"),
+        governance: {
+          ...asset.governance,
+          warnings: [
+            ...asset.governance.warnings,
+            "scan_engine_insufficient_rfs_prices",
+          ],
+        },
+      };
     }
 
-    const calibratedState = resolveImpulseStateWithAdaptivePolicy({
-      pressure_score: asset.impulse_pressure_score,
-      instability_score: asset.impulse_instability_score,
-      saturation_score: asset.impulse_saturation_score,
-      exhaustion_score: asset.impulse_exhaustion_score,
+    try {
+      const rfs = runRFS({ prices });
 
-      growth_score: asset.growth_score,
-      core_score: asset.core_pattern_score,
-      decay_score: asset.decay_score,
+      const stability = clampScore(rfs.stability);
+      const structure = clampScore(rfs.structure_score);
+      const market = clampScore(rfs.market_score);
+      const coherence = clampScore(rfs.coherence_score);
+      const rupture = clampScore(rfs.rupture_score);
+      const ruptureProbability = clampScore(rfs.rupture_probability);
+      const rupturePenalty = clampScore(rfs.rupture_penalty_score);
+      const continuity = clampScore(rfs.continuity_probability);
+      const confidence = clampScore(rfs.confidence_score);
 
-      policy,
-    });
+      const impulse = computeImpulseState({
+        current_signature: buildImpulseSignatureFromPrices(prices),
 
-    return {
-      ...asset,
-      impulse_transition_state: calibratedState,
-      governance: {
-        ...asset.governance,
-        warnings:
-          policy.warnings.length > 0
-            ? [...asset.governance.warnings, ...policy.warnings]
-            : asset.governance.warnings,
-      },
-    };
+        occurrence_score: safeNumber(clampScore(rfs.occurrence_score)),
+        frequency_score: safeNumber(clampScore(rfs.frequency_score)),
+        convergence_score: safeNumber(clampScore(rfs.convergence_score)),
+        correlation_score: safeNumber(clampScore(rfs.correlation_score)),
+        duration_score: safeNumber(clampScore(rfs.duration_score)),
+
+        rupture_probability: safeNumber(ruptureProbability),
+        rupture_penalty_score: safeNumber(rupturePenalty),
+
+        stability: safeNumber(stability),
+        coherence_score: safeNumber(coherence),
+
+        rolling_7d: buildImpulseTemporalBlock({
+          change_pct: asset.chg_7d_pct,
+          slope_pct: asset.chg_7d_pct,
+          stability_score: stability,
+          rupture_score: rupture,
+          rupture_probability: ruptureProbability,
+        }),
+
+        rolling_24h: buildImpulseTemporalBlock({
+          change_pct: asset.chg_24h_pct,
+          slope_pct: asset.chg_24h_pct,
+          stability_score: stability,
+          rupture_score: rupture,
+          rupture_probability: ruptureProbability,
+        }),
+
+        ...(adaptivePolicy !== undefined
+          ? { adaptive_policy: adaptivePolicy }
+          : {}),
+      });
+
+      return {
+        ...asset,
+
+        stability_score: stability,
+        stability_status: resolveStatus(stability),
+
+        structure_score: structure,
+        market_score: market,
+        coherence_score: coherence,
+
+        occurrence_score: clampScore(rfs.occurrence_score),
+        frequency_score: clampScore(rfs.frequency_score),
+        convergence_score: clampScore(rfs.convergence_score),
+        duration_score: clampScore(rfs.duration_score),
+
+        rupture_score: rupture,
+        rupture_probability: ruptureProbability,
+        rupture_penalty_score: rupturePenalty,
+        rupture_occurrence_score: clampScore(rfs.rupture_occurrence_score),
+        rupture_frequency_score: clampScore(rfs.rupture_frequency_score),
+        rupture_convergence_score: clampScore(rfs.rupture_convergence_score),
+        rupture_duration_score: clampScore(rfs.rupture_duration_score),
+
+        crash_score: clampScore(rfs.crash_score),
+        crash_state:
+          rfs.crash_state === "NONE" ||
+          rfs.crash_state === "RISING" ||
+          rfs.crash_state === "CRASH"
+            ? rfs.crash_state
+            : "UNKNOWN",
+
+        impulse_pressure_score: impulse.impulse_pressure_score,
+        impulse_instability_score: impulse.impulse_instability_score,
+        impulse_saturation_score: impulse.impulse_saturation_score,
+        impulse_exhaustion_score: impulse.impulse_exhaustion_score,
+        impulse_directional_bias: impulse.impulse_directional_bias,
+        impulse_transition_state: impulse.impulse_transition_state,
+        impulse_status: "computed",
+
+        continuity_probability: continuity,
+
+        confidence_score: confidence,
+        confidence_status: resolvePartialStatus(confidence),
+
+        regime: resolveRegime(rfs.regime),
+
+        governance: {
+          ...asset.governance,
+          warnings: asset.governance.warnings,
+        },
+      };
+    } catch {
+      return {
+        ...asset,
+        stability_score: null,
+        stability_status: "degraded",
+        regime: "TRANSITION",
+        structure_score: null,
+        market_score: null,
+        coherence_score: null,
+        rupture_score: null,
+        rupture_probability: null,
+        rupture_penalty_score: null,
+        continuity_probability: null,
+        confidence_score: null,
+        confidence_status: "degraded",
+        ...buildNeutralImpulse("degraded"),
+        governance: {
+          ...asset.governance,
+          warnings: [...asset.governance.warnings, "scan_engine_rfs_failed"],
+        },
+      };
+    }
   });
 }
 
 /* ============================================================================
- * 7. PUBLIC ENGINE API
- * ========================================================================== */
-
-export function applyRFS(data: PrivateScanAsset[]): PrivateScanAsset[] {
-  const rawEnriched = data.map(enrichAssetWithRFSAndRawImpulse);
-  return applyImpulseAdaptiveCalibration(rawEnriched);
-}
-
-/* ============================================================================
- * 8. SORTING
+ * 6. SORTING
  * ========================================================================== */
 
 export function sortAssets(
@@ -583,15 +544,19 @@ export function sortAssets(
 }
 
 /* ============================================================================
- * 9. EXECUTION
+ * 7. PUBLIC EXECUTION
  * ========================================================================== */
 
 export function buildScanEngineResult(input: {
   data: PrivateScanAsset[];
   key?: ScanEngineSortKey;
   order?: ScanEngineSortOrder;
+  adaptive_policy?: ImpulseAdaptivePolicy;
 }): ScanEngineResult {
-  const enriched = applyRFS(input.data);
+  const enriched = applyRFS(
+    input.data,
+    input.adaptive_policy,
+  );
 
   const sorted = sortAssets(
     enriched,

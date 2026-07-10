@@ -1,19 +1,14 @@
 /* ============================================================================
  * FILE: lib/xyvala/cache/cache-core.ts
  * ----------------------------------------------------------------------------
- * ROLE
- * - central deterministic cache layer for Xyvala
- * - provide stable key builders for canonical shared cache entries
- * - expose minimal get / set / delete / clear helpers
+ * TITLE
+ * - Xyvala shared cache core
  *
- * PARENTS
- * - lib/xyvala/snapshot.ts
- * - lib/xyvala/services/scan-service.ts
- * - lib/xyvala/services/state-service.ts
- * - app/api/scan/route.ts
- * - app/api/zones/route.ts
- * - app/api/rebuild/route.ts
- * - app/api/decision/route.ts
+ * ROLE
+ * - provide stable shared cache key builders
+ * - expose minimal get / set / delete / clear helpers
+ * - use Redis / Upstash as shared cache when configured
+ * - keep memory cache as development fallback only
  *
  * DIRECTIVES
  * - FR / EU compatible architecture
@@ -23,29 +18,18 @@
  * - no RFS logic here
  * - no MCI logic here
  * - no route shaping here
- * - keep cache-core minimal, auditable and reusable
- *
- * INPUTS
- * - typed cache key builder payloads
- * - raw cache values for read / write helpers
- *
- * OUTPUTS
- * - stable cache keys
- * - cached values or null
+ * - no payload mutation
+ * - no silent key divergence
+ * - expired entries are treated as unavailable
+ * - cache remains generic and reusable
+ * - Redis is preferred for SaaS / multi-route runtime
+ * - memory fallback is local development only
  *
  * INVARIANTS
  * - cache keys are pure string outputs
- * - cache-core never mutates business payloads
- * - expired entries are treated as missing
+ * - undefined is never stored
  * - cache API remains generic and reusable
- *
- * CRITICAL DEPENDENCIES
- * - globalThis memory store only
- *
- * SENSITIVE ZONES
- * - key stability across modules
- * - TTL enforcement
- * - deterministic normalization of key fragments
+ * - production must not silently fall back to memory cache
  * ========================================================================== */
 
 import type {
@@ -94,17 +78,20 @@ export type DecisionKeyInput = {
   symbol: string;
 };
 
-/* ============================================================================
- * 2. MEMORY STORE
- * ----------------------------------------------------------------------------
- * ROLE
- * - single in-process memory store
- * - explicit and deterministic shared container
- * ========================================================================== */
-
 type CacheStoreShape = {
   __XYVALA_CACHE_MEM__?: Map<string, CacheEntry>;
 };
+
+type RedisResponse<T> = {
+  result?: T;
+  error?: string;
+};
+
+type CacheBackend = "redis" | "memory" | "unavailable";
+
+/* ============================================================================
+ * 2. MEMORY STORE
+ * ========================================================================== */
 
 const globalCacheStore = globalThis as typeof globalThis & CacheStoreShape;
 
@@ -148,7 +135,7 @@ function sanitizeSymbol(value: string): string {
 }
 
 function sanitizeTf(value: string): string {
-  return safeUpper(value).replace(/[^A-Z0-9,._-]/g, "").slice(0, 32);
+  return safeUpper(value).replace(/[^A-Z0-9_.-]/g, "").slice(0, 32);
 }
 
 function normalizeTtlMs(ttlMs: number): number {
@@ -160,12 +147,65 @@ function isExpired(entry: CacheEntry): boolean {
   return entry.expiresAt <= nowMs();
 }
 
+function isProduction(): boolean {
+  return process.env.NODE_ENV === "production";
+}
+
+function redisUrl(): string {
+  return safeStr(
+    process.env.UPSTASH_REDIS_REST_URL ??
+      process.env.KV_REST_API_URL,
+  );
+}
+
+function redisToken(): string {
+  return safeStr(
+    process.env.UPSTASH_REDIS_REST_TOKEN ??
+      process.env.KV_REST_API_TOKEN,
+  );
+}
+
+function hasRedisConfig(): boolean {
+  return redisUrl().length > 0 && redisToken().length > 0;
+}
+
+function resolveBackend(): CacheBackend {
+  if (hasRedisConfig()) return "redis";
+  if (!isProduction()) return "memory";
+
+  return "unavailable";
+}
+
+function ensureCacheAvailable(): void {
+  if (resolveBackend() === "unavailable") {
+    throw new Error("xyvala_cache_unavailable_redis_required_in_production");
+  }
+}
+
+function encodeRedisArg(value: string): string {
+  return encodeURIComponent(value);
+}
+
+function serializeCacheValue(value: unknown): string {
+  return JSON.stringify(value);
+}
+
+function deserializeCacheValue<T>(value: unknown): T | null {
+  if (value === null || value === undefined) return null;
+
+  if (typeof value !== "string") {
+    return value as T;
+  }
+
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return null;
+  }
+}
+
 /* ============================================================================
  * 4. KEY BUILDERS
- * ----------------------------------------------------------------------------
- * ROLE
- * - provide deterministic shared cache keys
- * - keep key format stable across modules
  * ========================================================================== */
 
 export function scanKey(input: ScanKeyInput): string {
@@ -215,115 +255,140 @@ export function decisionKey(input: DecisionKeyInput): string {
 }
 
 /* ============================================================================
- * 5. CACHE READ / WRITE
- * ----------------------------------------------------------------------------
- * ROLE
- * - generic in-memory cache helpers
- * - expired entries are evicted on read
+ * 5. REDIS HELPERS
  * ========================================================================== */
 
-export async function getFromCache<T>(
-  key: string,
-  ttlMs?: number,
+async function redisCommand<T>(
+  command: readonly string[],
 ): Promise<T | null> {
-  const normalizedKey = safeStr(key);
+  const baseUrl = redisUrl().replace(/\/+$/, "");
+  const token = redisToken();
 
-  if (!normalizedKey) {
+  if (!baseUrl || !token) {
     return null;
   }
 
-  const entry = mem.get(normalizedKey);
+  const url = `${baseUrl}/${command.map(encodeRedisArg).join("/")}`;
 
-  if (!entry) {
-    return null;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+    cache: "no-store",
+  });
+
+  if (!response.ok) {
+    throw new Error(`xyvala_redis_http_${response.status}`);
   }
+
+  const payload = (await response.json()) as RedisResponse<T>;
+
+  if (typeof payload.error === "string" && payload.error.length > 0) {
+    throw new Error(`xyvala_redis_error:${payload.error}`);
+  }
+
+  return payload.result ?? null;
+}
+
+async function redisGet<T>(key: string): Promise<T | null> {
+  const value = await redisCommand<unknown>(["GET", key]);
+
+  return deserializeCacheValue<T>(value);
+}
+
+async function redisSet<T>(
+  key: string,
+  value: T,
+  ttlMs: number,
+): Promise<T> {
+  const ttlSeconds = Math.max(1, Math.ceil(ttlMs / 1000));
+
+  await redisCommand<"OK">([
+    "SET",
+    key,
+    serializeCacheValue(value),
+    "EX",
+    String(ttlSeconds),
+  ]);
+
+  return value;
+}
+
+async function redisDelete(key: string): Promise<boolean> {
+  const result = await redisCommand<number>(["DEL", key]);
+
+  return typeof result === "number" && result > 0;
+}
+
+async function redisClear(): Promise<void> {
+  const keys = await redisCommand<string[]>(["KEYS", "xyvala:*"]);
+
+  if (!Array.isArray(keys) || keys.length === 0) return;
+
+  await redisCommand<number>(["DEL", ...keys]);
+}
+
+async function redisHas(key: string): Promise<boolean> {
+  const result = await redisCommand<number>(["EXISTS", key]);
+
+  return result === 1;
+}
+
+async function redisKeys(): Promise<string[]> {
+  const keys = await redisCommand<string[]>(["KEYS", "xyvala:*"]);
+
+  return Array.isArray(keys) ? keys.sort((a, b) => a.localeCompare(b)) : [];
+}
+
+/* ============================================================================
+ * 6. MEMORY HELPERS
+ * ========================================================================== */
+
+function memoryGet<T>(key: string): T | null {
+  const entry = mem.get(key);
+
+  if (!entry) return null;
 
   if (isExpired(entry)) {
-    mem.delete(normalizedKey);
+    mem.delete(key);
     return null;
-  }
-
-  if (typeof ttlMs === "number" && ttlMs > 0) {
-    const maxAgeCutoff = nowMs() - normalizeTtlMs(ttlMs);
-    const createdAtEstimate = entry.expiresAt - normalizeTtlMs(ttlMs);
-
-    if (createdAtEstimate < maxAgeCutoff) {
-      mem.delete(normalizedKey);
-      return null;
-    }
   }
 
   return entry.value as T;
 }
 
-export async function setToCache<T>(
-  key: string,
-  value: T,
-  ttlMs: number,
-): Promise<T> {
-  const normalizedKey = safeStr(key);
-  const normalizedTtl = normalizeTtlMs(ttlMs);
-
-  if (!normalizedKey || normalizedTtl <= 0) {
-    return value;
-  }
-
-  mem.set(normalizedKey, {
+function memorySet<T>(key: string, value: T, ttlMs: number): T {
+  mem.set(key, {
     value,
-    expiresAt: nowMs() + normalizedTtl,
+    expiresAt: nowMs() + ttlMs,
   });
 
   return value;
 }
 
-export async function deleteFromCache(key: string): Promise<boolean> {
-  const normalizedKey = safeStr(key);
-
-  if (!normalizedKey) {
-    return false;
-  }
-
-  return mem.delete(normalizedKey);
+function memoryDelete(key: string): boolean {
+  return mem.delete(key);
 }
 
-export async function clearCache(): Promise<void> {
+function memoryClear(): void {
   mem.clear();
 }
 
-/* ============================================================================
- * 6. DEBUG / MAINTENANCE
- * ----------------------------------------------------------------------------
- * ROLE
- * - minimal observability helpers for local diagnosis
- * - no business semantics, no payload transformation
- * ========================================================================== */
+function memoryHas(key: string): boolean {
+  const entry = mem.get(key);
 
-export function getCacheSize(): number {
-  return mem.size;
-}
-
-export function hasCacheKey(key: string): boolean {
-  const normalizedKey = safeStr(key);
-
-  if (!normalizedKey) {
-    return false;
-  }
-
-  const entry = mem.get(normalizedKey);
-
-  if (!entry) {
-    return false;
-  }
+  if (!entry) return false;
 
   if (isExpired(entry)) {
-    mem.delete(normalizedKey);
+    mem.delete(key);
     return false;
   }
 
   return true;
 }
 
-export function listCacheKeys(): string[] {
+function memoryKeys(): string[] {
   const keys: string[] = [];
 
   for (const [key, entry] of mem.entries()) {
@@ -336,4 +401,113 @@ export function listCacheKeys(): string[] {
   }
 
   return keys.sort((a, b) => a.localeCompare(b));
+}
+
+/* ============================================================================
+ * 7. CACHE READ / WRITE
+ * ========================================================================== */
+
+export async function getFromCache<T>(
+  key: string,
+  _ttlMs?: number,
+): Promise<T | null> {
+  const normalizedKey = safeStr(key);
+
+  if (!normalizedKey) return null;
+
+  ensureCacheAvailable();
+
+  if (resolveBackend() === "redis") {
+    return redisGet<T>(normalizedKey);
+  }
+
+  return memoryGet<T>(normalizedKey);
+}
+
+export async function setToCache<T>(
+  key: string,
+  value: T,
+  ttlMs: number,
+): Promise<T> {
+  const normalizedKey = safeStr(key);
+  const normalizedTtl = normalizeTtlMs(ttlMs);
+
+  if (!normalizedKey || normalizedTtl <= 0 || value === undefined) {
+    return value;
+  }
+
+  ensureCacheAvailable();
+
+  if (resolveBackend() === "redis") {
+    return redisSet(normalizedKey, value, normalizedTtl);
+  }
+
+  return memorySet(normalizedKey, value, normalizedTtl);
+}
+
+export async function deleteFromCache(key: string): Promise<boolean> {
+  const normalizedKey = safeStr(key);
+
+  if (!normalizedKey) return false;
+
+  ensureCacheAvailable();
+
+  if (resolveBackend() === "redis") {
+    return redisDelete(normalizedKey);
+  }
+
+  return memoryDelete(normalizedKey);
+}
+
+export async function clearCache(): Promise<void> {
+  ensureCacheAvailable();
+
+  if (resolveBackend() === "redis") {
+    await redisClear();
+    return;
+  }
+
+  memoryClear();
+}
+
+/* ============================================================================
+ * 8. DEBUG / MAINTENANCE
+ * ========================================================================== */
+
+export async function getCacheSize(): Promise<number> {
+  ensureCacheAvailable();
+
+  if (resolveBackend() === "redis") {
+    return (await redisKeys()).length;
+  }
+
+  return memoryKeys().length;
+}
+
+export async function hasCacheKey(key: string): Promise<boolean> {
+  const normalizedKey = safeStr(key);
+
+  if (!normalizedKey) return false;
+
+  ensureCacheAvailable();
+
+  if (resolveBackend() === "redis") {
+    return redisHas(normalizedKey);
+  }
+
+  return memoryHas(normalizedKey);
+}
+
+export async function listCacheKeys(): Promise<string[]> {
+  ensureCacheAvailable();
+
+  if (resolveBackend() === "redis") {
+    return redisKeys();
+  }
+
+  return memoryKeys();
+}
+
+export function getCacheBackend(): CacheBackend {
+  return resolveBackend();
 }

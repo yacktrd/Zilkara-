@@ -2,12 +2,13 @@
  * FILE: lib/xyvala/calibration/store/decision-distribution-store.ts
  * ----------------------------------------------------------------------------
  * TITLE
- * - Xyvala decision distribution store
+ * - Xyvala decision distribution runtime store
  *
  * ROLE
  * - store normalized DecisionSample entries in a deterministic rolling buffer
  * - expose append / read / clear / stats accessors
  * - keep persistence orchestration isolated from normalization and validation
+ * - share runtime memory across Next.js route module instances
  *
  * DIRECTIVES
  * - store orchestration only
@@ -19,27 +20,7 @@
  * - no UI logic
  * - no API logic
  * - no public investment decision exposure
- *
- * INPUTS
- * - DecisionSampleInput
- * - SampleReadInput
- *
- * OUTPUTS
- * - SampleAppendResult
- * - SamplesAppendResult
- * - SampleReadResult
- * - StoreStats
- *
- * INVARIANTS
- * - store remains bounded
- * - reads never expose mutable internal references
- * - invalid samples are rejected explicitly
- * - same stored state => same read output
- *
- * CRITICAL DEPENDENCIES
- * - decision-distribution-normalizers.ts
- * - decision-distribution-validators.ts
- * - decision-distribution-cloners.ts
+ * - runtime singleton through globalThis
  * ========================================================================== */
 
 import type {
@@ -77,33 +58,56 @@ import {
 
 const STORE_CAPACITY = 5_000;
 
-const decisionDistributionStore: DecisionSample[] = [];
-
-let rejectedSampleCount = 0;
-
-let lastRejection: {
-  reason: ValidationReason | null;
-  ts: number | null;
-  details: string[];
-} = {
-  reason: null,
-  ts: null,
-  details: [],
+type StoreRuntimeState = {
+  samples: DecisionSample[];
+  rejected_sample_count: number;
+  last_rejection: {
+    reason: ValidationReason | null;
+    ts: number | null;
+    details: string[];
+  };
 };
+
+const STORE_KEY = "__xyvala_decision_distribution_store__";
+
+type XyvalaGlobal = typeof globalThis & {
+  [STORE_KEY]?: StoreRuntimeState;
+};
+
+function getRuntimeState(): StoreRuntimeState {
+  const runtime = globalThis as XyvalaGlobal;
+
+  if (!runtime[STORE_KEY]) {
+    runtime[STORE_KEY] = {
+      samples: [],
+      rejected_sample_count: 0,
+      last_rejection: {
+        reason: null,
+        ts: null,
+        details: [],
+      },
+    };
+  }
+
+  return runtime[STORE_KEY];
+}
 
 /* ============================================================================
  * 2. STORE HELPERS
  * ========================================================================== */
 
 function lastSample(): DecisionSample | null {
-  return decisionDistributionStore[decisionDistributionStore.length - 1] ?? null;
+  const state = getRuntimeState();
+  return state.samples[state.samples.length - 1] ?? null;
 }
 
 function boundedPush(sample: DecisionSample): void {
-  decisionDistributionStore.push(sample);
+  const state = getRuntimeState();
 
-  while (decisionDistributionStore.length > STORE_CAPACITY) {
-    decisionDistributionStore.shift();
+  state.samples.push(sample);
+
+  while (state.samples.length > STORE_CAPACITY) {
+    state.samples.shift();
   }
 }
 
@@ -111,9 +115,11 @@ function recordRejection(
   reason: ValidationReason,
   details: string[],
 ): void {
-  rejectedSampleCount += 1;
+  const state = getRuntimeState();
 
-  lastRejection = {
+  state.rejected_sample_count += 1;
+
+  state.last_rejection = {
     reason,
     ts: Date.now(),
     details: [...details],
@@ -123,7 +129,7 @@ function recordRejection(
     console.error("[XYVALA][CALIBRATION][SAMPLE_REJECTED]", {
       reason,
       details,
-      rejected_sample_count: rejectedSampleCount,
+      rejected_sample_count: state.rejected_sample_count,
     });
   }
 }
@@ -153,11 +159,18 @@ export function appendDecisionDistributionSample(
 
   boundedPush(normalized);
 
-  return {
-    ok: true,
-    sample: cloneSample(normalized),
-    warnings: [],
-  };
+console.log(
+  "[STORE_APPEND]",
+  getRuntimeState().samples.length,
+);
+
+return {
+  ok: true,
+  sample: cloneSample(normalized),
+  warnings: [],
+};
+
+
 }
 
 export function appendDecisionDistributionSamples(
@@ -188,11 +201,13 @@ export function appendDecisionDistributionSamples(
 export function readDecisionDistributionSamples(
   input: SampleReadInput = {},
 ): ReadDecisionDistributionSamplesResult {
+  const state = getRuntimeState();
+
   const analyticalVersion = safeStr(input.analytical_version);
   const horizon = input.horizon ?? null;
   const limit = normalizeLimit(input.limit ?? 250, STORE_CAPACITY);
 
-  const filtered = decisionDistributionStore.filter((sample) => {
+  const filtered = state.samples.filter((sample) => {
     if (
       analyticalVersion &&
       sample.observed_analytical_version !== analyticalVersion
@@ -222,10 +237,12 @@ export function readDecisionDistributionSamples(
  * ========================================================================== */
 
 export function clearDecisionDistributionStore(): void {
-  decisionDistributionStore.length = 0;
-  rejectedSampleCount = 0;
+  const state = getRuntimeState();
 
-  lastRejection = {
+  state.samples.length = 0;
+  state.rejected_sample_count = 0;
+
+  state.last_rejection = {
     reason: null,
     ts: null,
     details: [],
@@ -237,6 +254,8 @@ export function clearDecisionDistributionStore(): void {
  * ========================================================================== */
 
 export function getDecisionDistributionStoreStats(): DecisionDistributionStoreStats {
+  const state = getRuntimeState();
+
   const decision_count: Record<CalibrationDecision, number> = {
     ALLOW: 0,
     WATCH: 0,
@@ -249,13 +268,13 @@ export function getDecisionDistributionStoreStats(): DecisionDistributionStoreSt
     VOLATILE: 0,
   };
 
-  for (const sample of decisionDistributionStore) {
+  for (const sample of state.samples) {
     decision_count[sample.observed_decision] += 1;
     regime_count[sample.observed_regime] += 1;
   }
 
   const stats: DecisionDistributionStoreStats = {
-    sample_count: decisionDistributionStore.length,
+    sample_count: state.samples.length,
     last_sample_ts: lastSample()?.observed_ts ?? null,
     decision_count,
     regime_count,

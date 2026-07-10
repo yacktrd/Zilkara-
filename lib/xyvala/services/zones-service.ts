@@ -32,10 +32,11 @@
 
 import {
   getFromCache,
-  scanKey,
   setToCache,
   zonesKey,
 } from "@/lib/xyvala/cache/cache-core";
+
+import { buildCanonicalSnapshotKey } from "@/lib/xyvala/cache/snapshot-key";
 
 import {
   XYVALA_SNAPSHOT_VERSION,
@@ -72,7 +73,6 @@ const DEFAULT_TF: ZonesTimeframe = "AUTO";
 
 const DEFAULT_LIMIT = 5;
 const MAX_LIMIT = 12;
-const CANONICAL_SCAN_LIMIT = 250;
 
 const SNAPSHOT_CACHE_TTL_MS = 60_000;
 const ZONES_CACHE_TTL_MS = 45_000;
@@ -217,15 +217,7 @@ function buildLocalZonesCacheKey(input: NormalizedZonesParams): string {
 }
 
 function buildSnapshotScanCacheKey(quote: Quote): string {
-  return scanKey({
-    version: XYVALA_VERSION,
-    market: DEFAULT_MARKET,
-    quote,
-    sort: "rank",
-    order: "asc",
-    limit: CANONICAL_SCAN_LIMIT,
-    q: null,
-  });
+  return buildCanonicalSnapshotKey(quote);
 }
 
 function buildSnapshotZonesCacheKey(input: {
@@ -400,6 +392,15 @@ export async function getZonesService(
     snapshotKey,
     SNAPSHOT_CACHE_TTL_MS,
   );
+
+console.log("XYVALA_ZONES_SNAPSHOT_AUDIT", {
+  snapshot_key: snapshotKey,
+  snapshot_found: scanSnapshot !== null,
+  snapshot_count: scanSnapshot?.data?.length ?? 0,
+  requested_symbol: params.symbol,
+  first_symbols: scanSnapshot?.data?.slice(0, 20).map((asset) => asset.symbol) ?? [],
+  btc_found: scanSnapshot?.data?.some((asset) => asset.symbol === "BTC") ?? false,
+});
 
   const asset = findScanAsset(scanSnapshot, params.symbol);
   const referencePrice = safeNumber(asset?.price);

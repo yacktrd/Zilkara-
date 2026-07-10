@@ -8,12 +8,8 @@
  *
  * ROLE
  * - render public ScanAsset data
- * - display public structural labels produced by the public structure layer
+ * - display public structural labels produced upstream
  * - keep UI passive and deterministic
- *
- * PARENTS
- * - app/scan/page.tsx
- * - app/page.tsx when scan table is rendered on the public landing surface
  *
  * DIRECTIVES
  * - public UI only
@@ -24,29 +20,24 @@
  * - no calibration exposure
  * - no investment advice
  * - one public data source for desktop and mobile
- * - desktop and mobile may diverge only by layout, density and visual hierarchy
- *
- * INVARIANTS
- * - same input => same output
- * - visibleData is the single public rendering source
- * - mobile must not rebuild analytical states
- * - UI must display public labels only
+ * - UI displays public labels only
  * ========================================================================== */
 
 import React, { useDeferredValue, useMemo, useState } from "react";
 import { Sparkline } from "./sparkline";
 
+import type { ScanAsset } from "@/lib/xyvala/contracts/scan-contract";
+
 import {
   buildPublicMarketStructureSummary,
-  buildPublicStructure,
   type PublicActivityLabel,
+  type PublicCoreStructure,
+  type PublicDecayContext,
+  type PublicGrowthContext,
+  type PublicImpulseContext,
   type PublicMarketClimate,
   type PublicSparklineContext7D,
   type PublicStructureTransition,
-  type PublicGrowthContext,
-  type PublicCoreStructure,
-  type PublicDecayContext,
-  type PublicImpulseContext,
 } from "@/lib/xyvala/public/public-structure";
 
 /* ============================================================================
@@ -55,30 +46,21 @@ import {
 
 type Quote = "EUR" | "USD" | "USDT";
 
-type AssetInput = {
-  id?: unknown;
-  symbol?: unknown;
-  name?: unknown;
-  rank?: unknown;
-  price?: unknown;
-  chg_24h_pct?: unknown;
-  chg_7d_pct?: unknown;
-  market_cap?: unknown;
-  volume_24h?: unknown;
-  sparkline_7d?: unknown;
-};
+type AssetInput = Partial<ScanAsset>;
 
 type Asset = {
   key: string;
   rank: number | null;
   symbol: string;
   name: string;
+  logoUrl: string | null;
   price: number | null;
   pct24h: number | null;
   pct7d: number | null;
   marketCap: number | null;
   volume24h: number | null;
   sparkline: number[] | null;
+
   activity: PublicActivityLabel;
   sparklineContext7D: PublicSparklineContext7D;
   transition: PublicStructureTransition;
@@ -89,13 +71,6 @@ type Props = {
   assets: unknown;
   quote?: Quote | string;
   limit?: number;
-};
-
-type MarketSummaryInput = {
-  activity: PublicActivityLabel;
-  sparkline_context_7d: PublicSparklineContext7D;
-  structure_transition: PublicStructureTransition;
-  impulse_context: PublicImpulseContext;
 };
 
 /* ============================================================================
@@ -150,47 +125,99 @@ function normalizeSourceAssets(value: unknown): unknown[] | null {
 }
 
 /* ============================================================================
- * 3. NORMALIZATION
+ * 3. PUBLIC LABEL NORMALIZERS
+ * ========================================================================== */
+
+function normalizePublicActivity(value: unknown): PublicActivityLabel {
+  if (value === "Low") return "Low";
+  if (value === "Normal") return "Normal";
+  if (value === "High") return "High";
+
+  return "Unavailable";
+}
+
+function normalizeSparklineContext7D(
+  value: unknown,
+): PublicSparklineContext7D {
+  if (value === "Compression") return "Compression";
+  if (value === "Expansion") return "Expansion";
+  if (value === "Recovery") return "Recovery";
+  if (value === "Fragmented") return "Fragmented";
+  if (value === "Stable") return "Stable";
+  if (value === "Neutral") return "Neutral";
+
+  return "Unavailable";
+}
+
+function normalizeStructureTransition(
+  value: unknown,
+): PublicStructureTransition {
+  if (value === "Compression Phase") return "Compression Phase";
+  if (value === "Expansion Phase") return "Expansion Phase";
+  if (value === "Recovery Structure") return "Recovery Structure";
+  if (value === "Fragmentation Detected") return "Fragmentation Detected";
+  if (value === "Stable Structure") return "Stable Structure";
+  if (value === "Active Expansion") return "Active Expansion";
+
+  return "Neutral Structure";
+}
+
+function normalizeImpulseContext(value: unknown): PublicImpulseContext {
+  if (value === "Compression") return "Compression";
+  if (value === "Pressure Building") return "Pressure Building";
+  if (value === "Release") return "Release";
+  if (value === "Exhaustion") return "Exhaustion";
+  if (value === "Neutral") return "Neutral";
+
+  return "Unavailable";
+}
+
+/* ============================================================================
+ * 4. NORMALIZATION
  * ========================================================================== */
 
 function normalizeAsset(input: AssetInput): Asset {
   const symbol = safeString(input.symbol, "UNKNOWN").toUpperCase();
   const name = safeString(input.name, symbol);
 
-  const pct24h = safeNumberOrNull(input.chg_24h_pct);
-  const pct7d = safeNumberOrNull(input.chg_7d_pct);
-  const marketCap = safeNumberOrNull(input.market_cap);
-  const volume24h = safeNumberOrNull(input.volume_24h);
-  const sparkline = safeArrayNumbers(input.sparkline_7d);
+  console.log("XYVALA_UI_IMPULSE_MAPPING", {
+  symbol: input.symbol,
+  public_impulse_context: input.public_impulse_context,
+});
 
-  const publicStructure = buildPublicStructure({
-    pct_24h: pct24h,
-    pct_7d: pct7d,
-    volume_24h: volume24h,
-    market_cap: marketCap,
-    sparkline_7d: sparkline,
-  });
+  console.log("SCAN_TABLE_INPUT", {
+  symbol: input.symbol,
+  public_impulse_context: input.public_impulse_context,
+  keys: Object.keys(input),
+});
 
   return {
     key: safeString(input.id, symbol),
     rank: safeRank(input.rank),
     symbol,
     name,
+    logoUrl: safeString(input.logo_url) || null,
+
     price: safeNumberOrNull(input.price),
-    pct24h,
-    pct7d,
-    marketCap,
-    volume24h,
-    sparkline,
-    activity: publicStructure.activity,
-    sparklineContext7D: publicStructure.sparkline_context_7d,
-    transition: publicStructure.structure_transition,
-    impulseContext: publicStructure.impulse_context,
+    pct24h: safeNumberOrNull(input.chg_24h_pct),
+    pct7d: safeNumberOrNull(input.chg_7d_pct),
+    marketCap: safeNumberOrNull(input.market_cap),
+    volume24h: safeNumberOrNull(input.volume_24h),
+    sparkline: safeArrayNumbers(input.sparkline_7d),
+
+    activity: normalizePublicActivity(input.public_activity),
+    sparklineContext7D: normalizeSparklineContext7D(
+      input.public_sparkline_context_7d,
+    ),
+    transition: normalizeStructureTransition(
+      input.public_structure_transition,
+    ),
+    impulseContext: normalizeImpulseContext(input.public_impulse_context),
   };
 }
 
 /* ============================================================================
- * 4. SORTING
+ * 5. SORTING
  * ========================================================================== */
 
 function getTransitionPriority(transition: PublicStructureTransition): number {
@@ -224,7 +251,7 @@ function pickTransitionHighlights(data: Asset[]): Asset[] {
 }
 
 /* ============================================================================
- * 5. VISUAL HELPERS
+ * 6. FORMATTERS
  * ========================================================================== */
 
 function resolveValueClass(value: number | null): string {
@@ -234,10 +261,6 @@ function resolveValueClass(value: number | null): string {
 
   return "valueNeutral";
 }
-
-/* ============================================================================
- * 6. FORMATTERS
- * ========================================================================== */
 
 function formatPrice(value: number | null, quote: Quote): string {
   if (value === null) return "–";
@@ -275,45 +298,28 @@ function formatRank(value: number | null, fallback: number): string {
 
 /* ============================================================================
  * 7. VIEW COMPONENTS
- * ----------------------------------------------------------------------------
- * ROLE
- * - render passive public structural market perception
- * - expose descriptive structural context only
- * - preserve deterministic rendering consistency
- *
- * DIRECTIVES
- * - no private score exposure
- * - no RFS recomputation
- * - no MCI recomputation
- * - no calibration exposure
- * - no local structural reconstruction
- * - no hidden analytical derivation
- * - sparkline remains contextual only
- * - desktop and mobile share the same public source
- * - dynamic refresh affects observable values only
  * ========================================================================== */
 
 function ContextBand({
   marketClimate,
   dominantTransition,
+  impulseContext,
   growthContext,
   coreStructure,
   decayContext,
-  pulseContext,
   activityContext,
   assetsCount,
 }: {
   marketClimate: PublicMarketClimate;
   dominantTransition: PublicStructureTransition | "Unavailable";
+  impulseContext: PublicImpulseContext;
   growthContext: PublicGrowthContext;
   coreStructure: PublicCoreStructure;
   decayContext: PublicDecayContext;
-  pulseContext: PublicImpulseContext;
   activityContext: PublicActivityLabel;
   assetsCount: number;
-}) { 
-
- return (
+}) {
+  return (
     <div className="contextBand">
       <div className="contextCard contextCardMain">
         <span>Market Climate</span>
@@ -323,6 +329,11 @@ function ContextBand({
       <div className="contextCard">
         <span>Dominant Transition</span>
         <strong>{dominantTransition}</strong>
+      </div>
+
+      <div className="contextCard">
+        <span>Impulse Context</span>
+        <strong>{impulseContext}</strong>
       </div>
 
       <div className="contextCard">
@@ -343,11 +354,6 @@ function ContextBand({
       <div className="contextCard">
         <span>Decay Context</span>
         <strong>{decayContext}</strong>
-      </div>
-
-      <div className="contextCard">
-        <span>Pulse Context</span>
-        <strong>{pulseContext}</strong>
       </div>
 
       <div className="contextCard">
@@ -381,6 +387,11 @@ function TransitionPanel({ assets }: { assets: Asset[] }) {
               <span>Transition</span>
               <p>{asset.transition}</p>
             </div>
+
+            <div>
+              <span>Impulse</span>
+              <p>{asset.impulseContext}</p>
+            </div>
           </article>
         ))}
       </div>
@@ -406,6 +417,7 @@ function DesktopMarketTable({
             <th>24H</th>
             <th>7D</th>
             <th>Activity</th>
+            <th>Impulse</th>
             <th>Volume</th>
             <th>Market Cap</th>
             <th>Transition</th>
@@ -435,14 +447,10 @@ function DesktopMarketTable({
               </td>
 
               <td>{asset.activity}</td>
+              <td>{asset.impulseContext}</td>
 
-              <td>
-                {formatCompactCurrency(asset.volume24h, quote)}
-              </td>
-
-              <td>
-                {formatCompactCurrency(asset.marketCap, quote)}
-              </td>
+              <td>{formatCompactCurrency(asset.volume24h, quote)}</td>
+              <td>{formatCompactCurrency(asset.marketCap, quote)}</td>
 
               <td>{asset.transition}</td>
             </tr>
@@ -493,22 +501,23 @@ function MobileMarketCards({
             </div>
 
             <div>
+              <span>Impulse</span>
+              <strong>{asset.impulseContext}</strong>
+            </div>
+
+            <div>
               <span>Activity</span>
               <strong>{asset.activity}</strong>
             </div>
 
             <div>
               <span>Volume</span>
-              <strong>
-                {formatCompactCurrency(asset.volume24h, quote)}
-              </strong>
+              <strong>{formatCompactCurrency(asset.volume24h, quote)}</strong>
             </div>
 
             <div>
               <span>Market Cap</span>
-              <strong>
-                {formatCompactCurrency(asset.marketCap, quote)}
-              </strong>
+              <strong>{formatCompactCurrency(asset.marketCap, quote)}</strong>
             </div>
           </div>
         </article>
@@ -553,15 +562,15 @@ export default function ScanTable({
   }, [sourceAssets, deferredQuery, limit]);
 
   const structuralSummary = useMemo(() => {
-    const summaryInput: MarketSummaryInput[] = visibleData.map((asset) => ({
+  return buildPublicMarketStructureSummary(
+    visibleData.map((asset) => ({
       activity: asset.activity,
       sparkline_context_7d: asset.sparklineContext7D,
       structure_transition: asset.transition,
-      impulse_context: asset.impulseContext,
-    }));
-
-    return buildPublicMarketStructureSummary(summaryInput);
-  }, [visibleData]);
+      impulse_context: asset.impulseContext ?? "Unavailable",
+    })),
+  );
+}, [visibleData]);
 
   const transitionHighlights = useMemo(() => {
     return pickTransitionHighlights(visibleData);
@@ -580,15 +589,15 @@ export default function ScanTable({
       </header>
 
       <ContextBand
-  marketClimate={structuralSummary.market_climate}
-  dominantTransition={structuralSummary.dominant_transition}
-  activityContext={structuralSummary.activity_context}
-  growthContext={structuralSummary.growth_context}
-  coreStructure={structuralSummary.core_structure}
-  decayContext={structuralSummary.decay_context}
-  assetsCount={structuralSummary.assets_count}
-  pulseContext={structuralSummary.impulse_context}
-/>
+        marketClimate={structuralSummary.market_climate}
+        dominantTransition={structuralSummary.dominant_transition}
+        impulseContext={structuralSummary.impulse_context}
+        activityContext={structuralSummary.activity_context}
+        growthContext={structuralSummary.growth_context}
+        coreStructure={structuralSummary.core_structure}
+        decayContext={structuralSummary.decay_context}
+        assetsCount={structuralSummary.assets_count}
+      />
 
       <div className="toolbar">
         <div className="marketState">

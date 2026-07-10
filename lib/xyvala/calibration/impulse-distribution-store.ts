@@ -129,7 +129,26 @@ const INITIAL_STATE: ImpulseDistributionStoreState = {
  * 3. RUNTIME STATE
  * ========================================================================== */
 
-let runtimeState: ImpulseDistributionStoreState = INITIAL_STATE;
+type ImpulseDistributionGlobalStore = typeof globalThis & {
+  __XYVALA_IMPULSE_DISTRIBUTION_STORE__?: ImpulseDistributionStoreState;
+};
+
+const globalImpulseStore =
+  globalThis as ImpulseDistributionGlobalStore;
+
+const runtimeState: ImpulseDistributionStoreState =
+  globalImpulseStore.__XYVALA_IMPULSE_DISTRIBUTION_STORE__ ??
+  {
+    snapshot: null,
+    updated_at: null,
+    warnings: [],
+  };
+
+globalImpulseStore.__XYVALA_IMPULSE_DISTRIBUTION_STORE__ = runtimeState;
+
+function setRuntimeState(nextState: ImpulseDistributionStoreState): void {
+  globalImpulseStore.__XYVALA_IMPULSE_DISTRIBUTION_STORE__ = nextState;
+}
 
 /* ============================================================================
  * 4. SAFE HELPERS
@@ -164,6 +183,13 @@ function uniqueWarnings(values: readonly string[]): string[] {
 
 function sortAscending(values: readonly number[]): number[] {
   return [...values].sort((a, b) => a - b);
+}
+
+function getRuntimeState(): ImpulseDistributionStoreState {
+  return (
+    globalImpulseStore.__XYVALA_IMPULSE_DISTRIBUTION_STORE__ ??
+    INITIAL_STATE
+  );
 }
 
 function percentile(values: readonly number[], p: number): number {
@@ -383,33 +409,19 @@ export function writeImpulseDistributionSnapshot(input: {
   warnings?: readonly string[];
   timestamp?: number;
 }): ImpulseDistributionSnapshot {
-  const snapshotInput: {
-  samples: readonly ImpulseAdaptiveSample[];
-  policy: ImpulseAdaptivePolicy;
-  warnings?: readonly string[];
-  timestamp?: number;
-} = {
+
+const snapshot = buildImpulseDistributionSnapshot({
   samples: input.samples,
   policy: input.policy,
-};
+  ...(input.warnings !== undefined ? { warnings: input.warnings } : {}),
+  ...(input.timestamp !== undefined ? { timestamp: input.timestamp } : {}),
+});
 
-if (input.warnings !== undefined) {
-  snapshotInput.warnings = input.warnings;
-}
-
-if (input.timestamp !== undefined) {
-  snapshotInput.timestamp = input.timestamp;
-}
-
-const snapshot =
-  buildImpulseDistributionSnapshot(snapshotInput);
-
-  runtimeState = {
-    snapshot,
-    updated_at: snapshot.created_at,
-    warnings: snapshot.warnings,
-  };
-
+  setRuntimeState({
+  snapshot,
+  updated_at: snapshot.created_at,
+  warnings: snapshot.warnings,
+});
   return snapshot;
 }
 
@@ -429,7 +441,11 @@ export function readImpulseDistributionStoreState():
 }
 
 export function clearImpulseDistributionStore(): void {
-  runtimeState = INITIAL_STATE;
+  setRuntimeState({
+  snapshot: null,
+  updated_at: null,
+  warnings: [],
+});
 }
 
 /* ============================================================================

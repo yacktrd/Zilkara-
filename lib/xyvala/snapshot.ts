@@ -136,27 +136,19 @@ function isSnapshotSortOrder(value: unknown): value is SnapshotSortOrder {
 }
 
 /* ============================================================================
- * 4. ASSET GUARD
+ * 4. PUBLIC ASSET GUARD
  * ========================================================================== */
 
-function isScoreStatus(value: unknown): value is "computed" {
-  return value === "computed";
+function isPublicLabel(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
 }
 
 export function isScanAsset(value: unknown): value is ScanAsset {
   if (!isPlainObject(value)) return false;
 
-  /* --------------------------------------------------------------------------
-   * Identity
-   * ------------------------------------------------------------------------ */
-
   if (!isNonEmptyString(value.id)) return false;
   if (!isNonEmptyString(value.symbol)) return false;
   if (!isNonEmptyString(value.name)) return false;
-
-  /* --------------------------------------------------------------------------
-   * Market data
-   * ------------------------------------------------------------------------ */
 
   if (!isNullableFiniteNumber(value.price)) return false;
   if (!isNullableFiniteNumber(value.chg_24h_pct)) return false;
@@ -164,23 +156,12 @@ export function isScanAsset(value: unknown): value is ScanAsset {
 
   if (!isNullableFiniteNumber(value.market_cap)) return false;
   if (!isNullableFiniteNumber(value.volume_24h)) return false;
-
-  /* --------------------------------------------------------------------------
-   * Public structural reading
-   * ------------------------------------------------------------------------ */
-
-  if (!isNullableFiniteNumber(value.stability_score)) return false;
-  if (!isScoreStatus(value.stability_status)) return false;
-
-  /* --------------------------------------------------------------------------
-   * Visual support
-   * ------------------------------------------------------------------------ */
-
   if (!isNullableNumberArray(value.sparkline_7d)) return false;
 
-  /* --------------------------------------------------------------------------
-   * Metadata
-   * ------------------------------------------------------------------------ */
+  if (!isPublicLabel(value.public_activity)) return false;
+  if (!isPublicLabel(value.public_sparkline_context_7d)) return false;
+  if (!isPublicLabel(value.public_structure_transition)) return false;
+  if (!isPublicLabel(value.public_impulse_context)) return false;
 
   if (!isNullableFiniteNumber(value.rank)) return false;
   if (!isNullableString(value.logo_url)) return false;
