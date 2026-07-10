@@ -29,7 +29,6 @@ import {
   XYVALA_SNAPSHOT_VERSION,
 } from "@/lib/xyvala/snapshot";
 
-
 import { PUBLIC_SCAN_LIMIT } from "@/lib/xyvala/contracts/scan-contract";
 
 import { buildPublicStructure } from "@/lib/xyvala/public/public-structure";
@@ -84,6 +83,7 @@ function buildDebugAsset(input: {
     public_activity: publicStructure.activity,
     public_sparkline_context_7d: publicStructure.sparkline_context_7d,
     public_structure_transition: publicStructure.structure_transition,
+    public_impulse_context: publicStructure.impulse_context,
   };
 }
 
@@ -133,9 +133,12 @@ export async function GET() {
       q: null,
       warnings: [],
     },
+    error: null,
   };
 
-     const snapshot: ScanSnapshot | null = isScanSnapshot(sample) ? sample : null;
+  const snapshot: ScanSnapshot | null = isScanSnapshot(sample)
+  ? sample
+  : null;
 
   return NextResponse.json(
     {
