@@ -33,7 +33,7 @@
 
 import { NextRequest, NextResponse } from "next/server";
 
-import { readScanSnapshot } from "@/lib/xyvala/services/scan-snapshot-service";
+import { getScanService } from "@/lib/xyvala/services/scan-service";
 
 import type { ScanAsset } from "@/lib/xyvala/contracts/scan-contract";
 
@@ -370,89 +370,44 @@ export async function GET(req: NextRequest) {
   const noStore = parseBool(searchParams.get("noStore"));
 
   try {
-    const snapshotResult = noStore
-      ? null
-      : await readScanSnapshot({ quote });
+  const result = await getScanService({
+    quote,
+    q,
+    sort,
+    order,
+    limit,
+    noStore,
+  });
 
-    const snapshot = snapshotResult?.snapshot ?? null;
+  const effectiveLimit =
+    limit === null
+      ? DEFAULT_PUBLIC_SCAN_LIMIT
+      : Math.min(limit, MAX_PUBLIC_SCAN_LIMIT);
 
-    if (!snapshotResult?.ok || snapshot === null) {
-      const payload = buildResponse({
-        ok: false,
-        source: "fallback",
-        quote,
-        q,
-        sort,
-        order,
-        limit,
-        data: [],
-        total: 0,
-        warnings: uniqueWarnings(["scan_snapshot_unavailable"]),
-        error: "scan_snapshot_unavailable",
-      });
+  const payload = buildResponse({
+    ok: result.ok,
+    source: result.source,
+    quote,
+    q,
+    sort,
+    order,
+    limit: effectiveLimit,
+    data: result.data,
+    total: result.data.length,
+    warnings: result.warnings,
+    error: result.error,
+  });
 
-      return NextResponse.json(payload, {
-        status: 503,
-        headers: {
-          "cache-control": "no-store",
-          "x-xyvala-version": XYVALA_SNAPSHOT_VERSION,
-          "x-xyvala-endpoint": "/api/scan",
-          "x-xyvala-nostore": noStore ? "1" : "0",
-        },
-      });
-    }
+  return NextResponse.json(payload, {
+    status: result.ok ? 200 : 503,
+    headers: {
+      "cache-control": "no-store",
+      "x-xyvala-version": XYVALA_SNAPSHOT_VERSION,
+      "x-xyvala-endpoint": "/api/scan",
+      "x-xyvala-nostore": noStore ? "1" : "0",
+    },
+  });
 
-    let data = [...snapshot.data];
-
-    const warnings = uniqueWarnings(
-      snapshot.meta?.warnings,
-      snapshotResult.warnings,
-    );
-
-    if (q) {
-      data = data.filter((asset) => {
-        const symbol = safeLower(asset.symbol);
-        const name = safeLower(asset.name);
-        const id = safeLower(asset.id);
-
-        return symbol.includes(q) || name.includes(q) || id.includes(q);
-      });
-    }
-
-    const total = data.length;
-
-    data = sortAssets(data, sort, order);
-
-    const effectiveLimit =
-      limit === null
-        ? DEFAULT_PUBLIC_SCAN_LIMIT
-        : Math.min(limit, MAX_PUBLIC_SCAN_LIMIT);
-
-    data = data.slice(0, effectiveLimit);
-
-    const payload = buildResponse({
-      ok: true,
-      source: "scan",
-      quote,
-      q,
-      sort,
-      order,
-      limit: effectiveLimit,
-      data,
-      total,
-      warnings,
-      error: null,
-    });
-
-    return NextResponse.json(payload, {
-      status: 200,
-      headers: {
-        "cache-control": "no-store",
-        "x-xyvala-version": XYVALA_SNAPSHOT_VERSION,
-        "x-xyvala-endpoint": "/api/scan",
-        "x-xyvala-nostore": noStore ? "1" : "0",
-      },
-    });
   } catch (error) {
     const payload = buildResponse({
       ok: false,

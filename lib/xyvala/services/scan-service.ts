@@ -187,6 +187,9 @@ function marketSeedToScanAsset(seed: MarketSeed): ScanAsset {
 async function loadMarketFallbackAssets(): Promise<ScanAsset[]> {
   const seeds = await getMarketAssets(DEFAULT_QUOTE);
 
+  console.log("Seeds:", seeds.length);
+  console.log(seeds[0]);
+
   return seeds.map(marketSeedToScanAsset);
 }
 
