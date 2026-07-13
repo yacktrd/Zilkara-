@@ -4,13 +4,10 @@
 
 import { NextResponse } from "next/server";
 
-import { privateScanAssetsToPublicScanAssets } from "@/lib/xyvala/services/scan-transformer";
-
-import { adaptMarketEvaluationsToPrivateScanAssets } from "@/lib/xyvala/stores/market-traceability-adapter";
-
-import { buildScanEngineResult } from "@/lib/xyvala/scan-engine";
 import type { ScanAsset } from "@/lib/xyvala/contracts/scan-contract";
+
 import { loadRawAssets } from "@/lib/xyvala/services/raw-assets-service";
+
 import { writeScanSnapshot } from "@/lib/xyvala/services/scan-snapshot-service";
 
 import {
@@ -223,46 +220,7 @@ export async function GET(req: Request) {
       );
     }
 
-    const marketEvaluations = raw.data.map((asset) => ({
-  mapped: {
-    ...(asset as Record<string, unknown>),
-    quote_asset: quote,
-  },
-}));
-
-const privateAdapter =
-  adaptMarketEvaluationsToPrivateScanAssets(marketEvaluations);
-
-if (!privateAdapter.ok || privateAdapter.assets.length === 0) {
-  return json(
-    buildFailurePayload({
-      quote,
-      error: "private_asset_adapter_failed",
-      warnings: uniqueWarnings(raw.warnings, privateAdapter.warnings),
-      count: privateAdapter.count,
-    }),
-    500,
-  );
-}
-
-const engine = buildScanEngineResult({
-  data: privateAdapter.assets,
-});
-
-    if (!Array.isArray(engine.data) || engine.data.length === 0) {
-  return json(
-    buildFailurePayload({
-      quote,
-      error: "scan_engine_empty",
-      warnings: raw.warnings,
-    }),
-    500,
-  );
-}
-
-    const publicAssets = privateScanAssetsToPublicScanAssets(engine.data);
-
-const validated = validatePublicAssets(publicAssets);
+    const validated = validatePublicAssets(raw.data);
 
     if (validated.valid.length === 0) {
   return json(

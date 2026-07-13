@@ -270,6 +270,10 @@ async function redisCommand<T>(
 
   const url = `${baseUrl}/${command.map(encodeRedisArg).join("/")}`;
 
+console.log("KV URL =", !!process.env.KV_REST_API_URL);
+console.log("KV TOKEN =", !!process.env.KV_REST_API_TOKEN);
+console.log("NODE_ENV =", process.env.NODE_ENV);
+
   const response = await fetch(url, {
     method: "POST",
     headers: {

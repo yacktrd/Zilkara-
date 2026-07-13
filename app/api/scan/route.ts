@@ -2,40 +2,82 @@
  * FILE: app/api/scan/route.ts
  * ----------------------------------------------------------------------------
  * TITLE
- * - Xyvala public canonical scan endpoint
+ * - Xyvala canonical public scan endpoint
  *
  * ROLE
- * - expose public ScanAsset payloads only
- * - read the canonical scan snapshot through scan-snapshot-service
- * - preserve deterministic filtering and public sorting
+ * - expose validated public ScanAsset payloads
+ * - delegate canonical snapshot reading and public querying to scan-service
+ * - translate the service result into a stable HTTP response contract
  *
  * PARENTS
- * - app/api/summary/route.ts
- * - scan-snapshot-service
- * - scan-contract
- * - snapshot
+ * - lib/xyvala/services/scan-service.ts
+ * - lib/xyvala/contracts/scan-contract.ts
+ * - lib/xyvala/snapshot.ts
  *
  * DIRECTIVES
- * - FR / EU compatible public output
- * - EUR is the default quote
- * - public API only
+ * - public HTTP exposure only
+ * - FR / EU compatible output
+ * - EUR remains the default quote
+ * - canonical snapshot remains the sole data source
+ * - no direct cache access
+ * - no provider acquisition
+ * - no fallback reconstruction
+ * - no local ScanAsset sorting
+ * - no local ScanAsset filtering
+ * - no snapshot reconstruction
  * - no RFS recomputation
+ * - no Triple Layer recomputation
+ * - no Impulse Layer recomputation
  * - no MCI recomputation
  * - no calibration recomputation
- * - no snapshot reconstruction
+ * - no private analytical exposure
  * - no regime exposure
  * - no decision exposure
  * - no opportunity exposure
+ * - no confidence exposure
  * - no stability score exposure
  * - no broker / affiliate exposure
- * - snapshot remains the source of truth
+ * - deterministic response shape
+ *
+ * INPUTS
+ * - public HTTP query parameters
+ *
+ * OUTPUTS
+ * - canonical public scan HTTP response
+ *
+ * INVARIANTS
+ * - route never creates or modifies ScanAsset truth
+ * - route never reads cache directly
+ * - route never bypasses scan-service
+ * - unavailable snapshot remains explicitly unavailable
+ * - service total is preserved
+ * - undefined never leaks
+ *
+ * CRITICAL DEPENDENCIES
+ * - getScanService()
+ * - ScanServiceSource
+ * - ScanAsset
+ *
+ * SENSITIVE ZONES
+ * - service-to-HTTP contract boundary
+ * - public error status
+ * - source-state propagation
+ * - total and count semantics
  * ========================================================================== */
 
-import { NextRequest, NextResponse } from "next/server";
+import {
+  NextRequest,
+  NextResponse,
+} from "next/server";
 
-import { getScanService } from "@/lib/xyvala/services/scan-service";
+import {
+  getScanService,
+  type ScanServiceSource,
+} from "@/lib/xyvala/services/scan-service";
 
-import type { ScanAsset } from "@/lib/xyvala/contracts/scan-contract";
+import type {
+  ScanAsset,
+} from "@/lib/xyvala/contracts/scan-contract";
 
 import {
   XYVALA_SNAPSHOT_VERSION,
@@ -43,21 +85,19 @@ import {
   type Quote,
 } from "@/lib/xyvala/snapshot";
 
+import type {
+  ScanSortKey,
+  ScanSortOrder,
+} from "@/lib/xyvala/services/scan-query";
+
 /* ============================================================================
  * 1. TYPES
  * ========================================================================== */
 
-type SortKey =
-  | "rank"
-  | "price"
-  | "market_cap"
-  | "volume_24h"
-  | "change_24h"
-  | "change_7d";
-
-type SortOrder = "asc" | "desc";
-
-type Currency = "EUR" | "USD" | "USDT";
+type Currency =
+  | "EUR"
+  | "USD"
+  | "USDT";
 
 type ScanRouteContext = {
   asset_count: number;
@@ -70,7 +110,7 @@ type ScanRouteResponse = {
   ok: boolean;
   ts: string;
   version: string;
-  source: "scan" | "fallback";
+  source: ScanServiceSource;
   market: Market;
   quote: Quote;
   count: number;
@@ -80,9 +120,9 @@ type ScanRouteResponse = {
   warnings: string[];
   meta: {
     q: string | null;
-    sort: SortKey;
-    order: SortOrder;
-    limit: number | null;
+    sort: ScanSortKey;
+    order: ScanSortOrder;
+    limit: number;
     region: "EU";
     currency: Currency;
   };
@@ -90,16 +130,15 @@ type ScanRouteResponse = {
 };
 
 /* ============================================================================
- * 2. CONSTANTS
+ * 2. CONFIG
  * ========================================================================== */
 
 const DEFAULT_MARKET: Market = "crypto";
 const DEFAULT_QUOTE: Quote = "eur";
 
-const DEFAULT_SORT: SortKey = "rank";
-const DEFAULT_ORDER: SortOrder = "asc";
+const DEFAULT_SORT: ScanSortKey = "rank";
+const DEFAULT_ORDER: ScanSortOrder = "asc";
 
-const DEFAULT_LIMIT: number | null = null;
 const DEFAULT_PUBLIC_SCAN_LIMIT = 10;
 const MAX_PUBLIC_SCAN_LIMIT = 250;
 
@@ -111,126 +150,196 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-function safeString(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "";
+function safeString(
+  value: unknown,
+): string {
+  return typeof value === "string"
+    ? value.trim()
+    : "";
 }
 
-function safeLower(value: unknown): string {
+function safeLower(
+  value: unknown,
+): string {
   return safeString(value).toLowerCase();
 }
 
-function safeNumber(value: unknown, fallback = -1): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
-}
-
-function safeRank(value: unknown): number {
-  return typeof value === "number" && Number.isFinite(value)
-    ? value
-    : Number.POSITIVE_INFINITY;
-}
-
-function clamp(value: number, min: number, max: number): number {
-  if (!Number.isFinite(value)) return min;
-
-  return Math.max(min, Math.min(max, value));
-}
-
 function uniqueWarnings(
-  ...groups: Array<string[] | undefined | null>
+  ...groups: Array<
+    readonly string[] | undefined | null
+  >
 ): string[] {
   return [
     ...new Set(
       groups
-        .flatMap((group) => (Array.isArray(group) ? group : []))
+        .flatMap((group) =>
+          Array.isArray(group)
+            ? group
+            : [],
+        )
+        .map((warning) =>
+          safeString(warning),
+        )
         .filter(
-          (item): item is string =>
-            typeof item === "string" && item.trim().length > 0,
+          (warning) =>
+            warning.length > 0,
         ),
     ),
   ];
+}
+
+function clampInteger(
+  value: number,
+  minimum: number,
+  maximum: number,
+): number {
+  if (!Number.isFinite(value)) {
+    return minimum;
+  }
+
+  return Math.max(
+    minimum,
+    Math.min(
+      maximum,
+      Math.trunc(value),
+    ),
+  );
 }
 
 /* ============================================================================
  * 4. INPUT NORMALIZATION
  * ========================================================================== */
 
-function normalizeQuote(value: string | null): Quote {
-  const quote = safeLower(value);
+function normalizeQuote(
+  value: string | null,
+): Quote {
+  const normalizedValue =
+    safeLower(value);
 
-  if (quote === "usd") return "usd";
-  if (quote === "usdt") return "usdt";
+  if (normalizedValue === "usd") {
+    return "usd";
+  }
+
+  if (normalizedValue === "usdt") {
+    return "usdt";
+  }
 
   return DEFAULT_QUOTE;
 }
 
-function normalizeSearch(value: string | null): string | null {
-  const q = safeLower(value);
+function normalizeSearch(
+  value: string | null,
+): string | null {
+  const normalizedValue =
+    safeLower(value);
 
-  return q.length > 0 ? q : null;
+  return normalizedValue.length > 0
+    ? normalizedValue
+    : null;
 }
 
-function normalizeSort(value: string | null): SortKey {
-  const sort = safeLower(value);
+function normalizeSort(
+  value: string | null,
+): ScanSortKey {
+  const normalizedValue =
+    safeLower(value);
 
-  if (sort === "price") return "price";
-  if (sort === "market_cap") return "market_cap";
-  if (sort === "volume_24h") return "volume_24h";
-  if (sort === "volume") return "volume_24h";
-  if (sort === "change_24h") return "change_24h";
-  if (sort === "chg_24h") return "change_24h";
-  if (sort === "change_7d") return "change_7d";
-  if (sort === "chg_7d") return "change_7d";
+  if (normalizedValue === "price") {
+    return "price";
+  }
+
+  if (normalizedValue === "market_cap") {
+    return "market_cap";
+  }
+
+  if (
+    normalizedValue === "volume" ||
+    normalizedValue === "volume_24h"
+  ) {
+    return "volume_24h";
+  }
+
+  if (
+    normalizedValue === "change_24h" ||
+    normalizedValue === "chg_24h"
+  ) {
+    return "change_24h";
+  }
+
+  if (
+    normalizedValue === "change_7d" ||
+    normalizedValue === "chg_7d"
+  ) {
+    return "change_7d";
+  }
 
   return DEFAULT_SORT;
 }
 
-function normalizeOrder(value: string | null): SortOrder {
-  return safeLower(value) === "desc" ? "desc" : DEFAULT_ORDER;
+function normalizeOrder(
+  value: string | null,
+): ScanSortOrder {
+  return safeLower(value) === "desc"
+    ? "desc"
+    : DEFAULT_ORDER;
 }
 
-function normalizeLimit(value: string | null): number | null {
-  if (value === null || value.trim() === "") {
-    return DEFAULT_LIMIT;
+function normalizeLimit(
+  value: string | null,
+): number {
+  if (
+    value === null ||
+    value.trim().length === 0
+  ) {
+    return DEFAULT_PUBLIC_SCAN_LIMIT;
   }
 
-  const parsed = Number(value);
+  const parsedValue = Number(value);
 
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    return DEFAULT_LIMIT;
+  if (
+    !Number.isFinite(parsedValue) ||
+    parsedValue <= 0
+  ) {
+    return DEFAULT_PUBLIC_SCAN_LIMIT;
   }
 
-  return clamp(Math.trunc(parsed), 1, MAX_PUBLIC_SCAN_LIMIT);
-}
-
-function parseBool(value: string | null): boolean {
-  const normalized = safeLower(value);
-
-  return (
-    normalized === "1" ||
-    normalized === "true" ||
-    normalized === "yes" ||
-    normalized === "on"
+  return clampInteger(
+    parsedValue,
+    1,
+    MAX_PUBLIC_SCAN_LIMIT,
   );
 }
 
-function quoteToCurrency(quote: Quote): Currency {
-  if (quote === "usd") return "USD";
-  if (quote === "usdt") return "USDT";
+function quoteToCurrency(
+  quote: Quote,
+): Currency {
+  if (quote === "usd") {
+    return "USD";
+  }
+
+  if (quote === "usdt") {
+    return "USDT";
+  }
 
   return "EUR";
 }
 
 /* ============================================================================
- * 5. CONTEXT HELPERS
+ * 5. PUBLIC CONTEXT
  * ========================================================================== */
 
-function computeContext(data: ScanAsset[]): ScanRouteContext {
+function computeContext(
+  data: readonly ScanAsset[],
+): ScanRouteContext {
   let pricedAssetCount = 0;
   let marketCapAvailableCount = 0;
   let volumeAvailableCount = 0;
 
   for (const asset of data) {
-    if (typeof asset.price === "number" && Number.isFinite(asset.price)) {
+    if (
+      typeof asset.price === "number" &&
+      Number.isFinite(asset.price)
+    ) {
       pricedAssetCount += 1;
     }
 
@@ -251,84 +360,30 @@ function computeContext(data: ScanAsset[]): ScanRouteContext {
 
   return {
     asset_count: data.length,
-    priced_asset_count: pricedAssetCount,
-    market_cap_available_count: marketCapAvailableCount,
-    volume_available_count: volumeAvailableCount,
+    priced_asset_count:
+      pricedAssetCount,
+    market_cap_available_count:
+      marketCapAvailableCount,
+    volume_available_count:
+      volumeAvailableCount,
   };
 }
 
 /* ============================================================================
- * 6. SORT HELPERS
- * ========================================================================== */
-
-function sortValue(asset: ScanAsset, sort: SortKey): number {
-  if (sort === "price") return safeNumber(asset.price);
-  if (sort === "market_cap") return safeNumber(asset.market_cap);
-  if (sort === "volume_24h") return safeNumber(asset.volume_24h);
-  if (sort === "change_24h") return safeNumber(asset.chg_24h_pct);
-  if (sort === "change_7d") return safeNumber(asset.chg_7d_pct);
-
-  return safeRank(asset.rank);
-}
-
-function tieBreak(left: ScanAsset, right: ScanAsset): number {
-  const rankDelta = safeRank(left.rank) - safeRank(right.rank);
-
-  if (rankDelta !== 0) {
-    return rankDelta;
-  }
-
-  const marketCapDelta =
-    safeNumber(right.market_cap) - safeNumber(left.market_cap);
-
-  if (marketCapDelta !== 0) {
-    return marketCapDelta;
-  }
-
-  const volumeDelta =
-    safeNumber(right.volume_24h) - safeNumber(left.volume_24h);
-
-  if (volumeDelta !== 0) {
-    return volumeDelta;
-  }
-
-  return left.symbol.localeCompare(right.symbol);
-}
-
-function sortAssets(
-  data: ScanAsset[],
-  sort: SortKey,
-  order: SortOrder,
-): ScanAsset[] {
-  return [...data].sort((left, right) => {
-    const leftValue = sortValue(left, sort);
-    const rightValue = sortValue(right, sort);
-
-    if (leftValue !== rightValue) {
-      return order === "asc"
-        ? leftValue - rightValue
-        : rightValue - leftValue;
-    }
-
-    return tieBreak(left, right);
-  });
-}
-
-/* ============================================================================
- * 7. RESPONSE HELPERS
+ * 6. RESPONSE BUILDER
  * ========================================================================== */
 
 function buildResponse(input: {
   ok: boolean;
-  source: "scan" | "fallback";
+  source: ScanServiceSource;
   quote: Quote;
   q: string | null;
-  sort: SortKey;
-  order: SortOrder;
-  limit: number | null;
+  sort: ScanSortKey;
+  order: ScanSortOrder;
+  limit: number;
   data: ScanAsset[];
   total: number;
-  warnings: string[];
+  warnings: readonly string[];
   error: string | null;
 }): ScanRouteResponse {
   return {
@@ -339,79 +394,118 @@ function buildResponse(input: {
     market: DEFAULT_MARKET,
     quote: input.quote,
     count: input.data.length,
-    total: Math.max(0, input.total),
+    total: Math.max(
+      0,
+      Math.trunc(input.total),
+    ),
     data: input.data,
-    context: computeContext(input.data),
-    warnings: input.warnings,
+    context: computeContext(
+      input.data,
+    ),
+    warnings: uniqueWarnings(
+      input.warnings,
+    ),
     meta: {
       q: input.q,
       sort: input.sort,
       order: input.order,
       limit: input.limit,
       region: "EU",
-      currency: quoteToCurrency(input.quote),
+      currency: quoteToCurrency(
+        input.quote,
+      ),
     },
     error: input.error,
   };
 }
 
 /* ============================================================================
+ * 7. HTTP RESPONSE
+ * ========================================================================== */
+
+function jsonResponse(
+  payload: ScanRouteResponse,
+  status: number,
+): NextResponse {
+  return NextResponse.json(
+    payload,
+    {
+      status,
+      headers: {
+        "cache-control": "no-store",
+        "x-xyvala-version":
+          XYVALA_SNAPSHOT_VERSION,
+        "x-xyvala-endpoint":
+          "/api/scan",
+        "x-xyvala-source":
+          payload.source,
+      },
+    },
+  );
+}
+
+/* ============================================================================
  * 8. ROUTE HANDLER
  * ========================================================================== */
 
-export async function GET(req: NextRequest) {
-  const searchParams = req.nextUrl.searchParams;
+export async function GET(
+  request: NextRequest,
+): Promise<NextResponse> {
+  const searchParams =
+    request.nextUrl.searchParams;
 
-  const quote = normalizeQuote(searchParams.get("quote"));
-  const q = normalizeSearch(searchParams.get("q"));
-  const sort = normalizeSort(searchParams.get("sort"));
-  const order = normalizeOrder(searchParams.get("order"));
-  const limit = normalizeLimit(searchParams.get("limit"));
-  const noStore = parseBool(searchParams.get("noStore"));
+  const quote = normalizeQuote(
+    searchParams.get("quote"),
+  );
+
+  const q = normalizeSearch(
+    searchParams.get("q"),
+  );
+
+  const sort = normalizeSort(
+    searchParams.get("sort"),
+  );
+
+  const order = normalizeOrder(
+    searchParams.get("order"),
+  );
+
+  const limit = normalizeLimit(
+    searchParams.get("limit"),
+  );
 
   try {
-  const result = await getScanService({
-    quote,
-    q,
-    sort,
-    order,
-    limit,
-    noStore,
-  });
+    const result =
+      await getScanService({
+        quote,
+        q,
+        sort,
+        order,
+        limit,
+      });
 
-  const effectiveLimit =
-    limit === null
-      ? DEFAULT_PUBLIC_SCAN_LIMIT
-      : Math.min(limit, MAX_PUBLIC_SCAN_LIMIT);
+    const payload = buildResponse({
+      ok: result.ok,
+      source: result.source,
+      quote: result.quote,
+      q,
+      sort,
+      order,
+      limit,
+      data: result.data,
+      total: result.total,
+      warnings: result.warnings,
+      error: result.error,
+    });
 
-  const payload = buildResponse({
-    ok: result.ok,
-    source: result.source,
-    quote,
-    q,
-    sort,
-    order,
-    limit: effectiveLimit,
-    data: result.data,
-    total: result.data.length,
-    warnings: result.warnings,
-    error: result.error,
-  });
-
-  return NextResponse.json(payload, {
-    status: result.ok ? 200 : 503,
-    headers: {
-      "cache-control": "no-store",
-      "x-xyvala-version": XYVALA_SNAPSHOT_VERSION,
-      "x-xyvala-endpoint": "/api/scan",
-      "x-xyvala-nostore": noStore ? "1" : "0",
-    },
-  });
-
+    return jsonResponse(
+      payload,
+      result.ok ? 200 : 503,
+    );
   } catch (error) {
     const payload = buildResponse({
       ok: false,
-      source: "fallback",
+      source: "unavailable",
       quote,
       q,
       sort,
@@ -419,21 +513,19 @@ export async function GET(req: NextRequest) {
       limit,
       data: [],
       total: 0,
-      warnings: uniqueWarnings(["scan_route_error"]),
+      warnings: [
+        "scan_route_failed",
+      ],
       error:
-        error instanceof Error && error.message
-          ? error.message
+        error instanceof Error &&
+        error.message.trim().length > 0
+          ? error.message.trim()
           : "scan_route_unknown_error",
     });
 
-    return NextResponse.json(payload, {
-      status: 500,
-      headers: {
-        "cache-control": "no-store",
-        "x-xyvala-version": XYVALA_SNAPSHOT_VERSION,
-        "x-xyvala-endpoint": "/api/scan",
-        "x-xyvala-nostore": noStore ? "1" : "0",
-      },
-    });
+    return jsonResponse(
+      payload,
+      500,
+    );
   }
 }
