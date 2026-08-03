@@ -11,6 +11,11 @@
  * - detect orphan variables and naming governance violations
  * - provide deterministic registry / contract alignment diagnostics
  *
+ * CLASSIFICATION
+ * - GOVERNANCE AUDIT
+ * - OBSERVE / COMPUTE
+ * - no MUTATE
+ *
  * DIRECTIVES
  * - governance audit only
  * - observe / compute layer only
@@ -38,7 +43,12 @@
  * - audit never mutates runtime state
  * - registry remains expected truth model
  * - private assets remain observed truth model
- * - orphan variables must remain explicit
+ * - produced variables are collected before registry comparison
+ * - orphan variables remain explicit
+ * - registered missing variables remain explicit
+ * - nested private analytical contracts remain auditable
+ * - governance metadata is excluded from analytical variable comparison
+ * - same assets + same registry => same report
  *
  * CRITICAL DEPENDENCIES
  * - PrivateScanAsset
@@ -48,6 +58,7 @@
  * - private analytical variables
  * - registry / contract divergence
  * - naming governance
+ * - nested analytical contracts
  * - orphan variables
  * ========================================================================== */
 
@@ -107,30 +118,37 @@ export type VariableRegistryAuditReport = {
  * 2. SAFE HELPERS
  * ========================================================================== */
 
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+function isPlainObject(
+  value: unknown,
+): value is Record<string, unknown> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value)
+  );
 }
 
-function isNonEmptyString(value: unknown): value is string {
-  return typeof value === "string" && value.trim().length > 0;
+function isNonEmptyString(
+  value: unknown,
+): value is string {
+  return (
+    typeof value === "string" &&
+    value.trim().length > 0
+  );
 }
 
-function isBoolean(value: unknown): value is boolean {
+function isBoolean(
+  value: unknown,
+): value is boolean {
   return typeof value === "boolean";
 }
 
-function normalizeRegistry(input: unknown): VariableRegistryAuditEntry[] {
-  const values = Array.isArray(input)
-    ? input
-    : isPlainObject(input)
-      ? Object.values(input)
-      : [];
-
-  return values.filter(isRegistryEntry);
-}
-
-function isRegistryEntry(value: unknown): value is VariableRegistryAuditEntry {
-  if (!isPlainObject(value)) return false;
+function isRegistryEntry(
+  value: unknown,
+): value is VariableRegistryAuditEntry {
+  if (!isPlainObject(value)) {
+    return false;
+  }
 
   return (
     isNonEmptyString(value.variable_name) &&
@@ -140,17 +158,52 @@ function isRegistryEntry(value: unknown): value is VariableRegistryAuditEntry {
   );
 }
 
-function uniqueSorted(values: Iterable<string>): string[] {
-  return [...new Set([...values].filter(isNonEmptyString))].sort((a, b) =>
-    a.localeCompare(b),
-  );
+function normalizeRegistry(
+  input: unknown,
+): VariableRegistryAuditEntry[] {
+  const values = Array.isArray(input)
+    ? input
+    : isPlainObject(input)
+      ? Object.values(input)
+      : [];
+
+  return values.filter(isRegistryEntry);
 }
 
-function isProducedValue(value: unknown): boolean {
+function compareDeterministicStrings(
+  left: string,
+  right: string,
+): number {
+  if (left < right) {
+    return -1;
+  }
+
+  if (left > right) {
+    return 1;
+  }
+
+  return 0;
+}
+
+function uniqueSorted(
+  values: Iterable<string>,
+): string[] {
+  return [
+    ...new Set(
+      [...values].filter(isNonEmptyString),
+    ),
+  ].sort(compareDeterministicStrings);
+}
+
+function isProducedValue(
+  value: unknown,
+): boolean {
   return value !== undefined;
 }
 
-function isAuditablePrimitive(value: unknown): boolean {
+function isAuditablePrimitive(
+  value: unknown,
+): boolean {
   return (
     value === null ||
     typeof value === "string" ||
@@ -163,56 +216,152 @@ function isAuditablePrimitive(value: unknown): boolean {
  * 3. NAMING GOVERNANCE
  * ========================================================================== */
 
-function isSnakeCase(value: string): boolean {
-  return /^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/.test(value);
+function isSnakeCase(
+  value: string,
+): boolean {
+  return /^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/.test(
+    value,
+  );
 }
 
-function detectNamingViolations(names: readonly string[]): string[] {
+function detectNamingViolations(
+  names: readonly string[],
+): string[] {
   return uniqueSorted(
     names
-      .filter((name) => !isSnakeCase(name))
-      .map((name) => `invalid_variable_name:${name}`),
+      .filter(
+        (name) =>
+          !isSnakeCase(name),
+      )
+      .map(
+        (name) =>
+          `invalid_variable_name:${name}`,
+      ),
   );
 }
 
 /* ============================================================================
  * 4. PRODUCED VARIABLE EXTRACTION
+ * ----------------------------------------------------------------------------
+ * Produced variables are collected independently from the registry.
+ *
+ * Registry comparison occurs only after extraction. This preserves the
+ * ability to detect variables produced by contracts but absent from the
+ * Variable Lineage Registry.
  * ========================================================================== */
 
-const PRODUCED_VARIABLE_ALIASES: Record<string, string> = {
+const PRODUCED_VARIABLE_ALIASES: Readonly<
+  Record<string, string>
+> = Object.freeze({
   price: "price_eur",
   market_cap: "market_cap_eur",
-};
+});
 
-function normalizeProducedVariableName(name: string): string {
-  return PRODUCED_VARIABLE_ALIASES[name] ?? name;
+function normalizeProducedVariableName(
+  name: string,
+): string {
+  return (
+    PRODUCED_VARIABLE_ALIASES[name] ??
+    name
+  );
+}
+
+function collectProducedVariableNames(
+  value: unknown,
+  output: Set<string>,
+  parentKey: string | null = null,
+): void {
+  if (Array.isArray(value)) {
+    if (
+      parentKey !== null &&
+      isProducedValue(value)
+    ) {
+      output.add(
+        normalizeProducedVariableName(
+          parentKey,
+        ),
+      );
+    }
+
+    return;
+  }
+
+  if (!isPlainObject(value)) {
+    if (
+      parentKey !== null &&
+      isAuditablePrimitive(value) &&
+      isProducedValue(value)
+    ) {
+      output.add(
+        normalizeProducedVariableName(
+          parentKey,
+        ),
+      );
+    }
+
+    return;
+  }
+
+  for (const [key, nestedValue] of Object.entries(value)) {
+    if (key === "governance") {
+      continue;
+    }
+
+    if (Array.isArray(nestedValue)) {
+      if (isProducedValue(nestedValue)) {
+        output.add(
+          normalizeProducedVariableName(
+            key,
+          ),
+        );
+      }
+
+      continue;
+    }
+
+    if (isPlainObject(nestedValue)) {
+      collectProducedVariableNames(
+        nestedValue,
+        output,
+        key,
+      );
+
+      continue;
+    }
+
+    if (
+      isAuditablePrimitive(nestedValue) &&
+      isProducedValue(nestedValue)
+    ) {
+      output.add(
+        normalizeProducedVariableName(
+          key,
+        ),
+      );
+    }
+  }
 }
 
 function extractProducedVariableNamesFromAsset(
   asset: PrivateScanAsset,
 ): string[] {
-  const source = asset as unknown as Record<string, unknown>;
-  const registryNames = new Set(
-    VARIABLE_LINEAGE_REGISTRY.map((entry) => entry.variable_name),
+  const producedNames = new Set<string>();
+
+  collectProducedVariableNames(
+    asset,
+    producedNames,
   );
 
-  return Object.entries(source)
-    .filter(([key, value]) => {
-      if (key === "governance") return false;
-      if (key === "sparkline_7d" && Array.isArray(value)) return true;
-      if (!isAuditablePrimitive(value)) return false;
-
-      return isProducedValue(value);
-    })
-    .map(([key]) => normalizeProducedVariableName(key))
-    .filter((name) => registryNames.has(name));
+  return uniqueSorted(producedNames);
 }
 
 function extractProducedVariableNames(
   assets: readonly PrivateScanAsset[],
 ): string[] {
   return uniqueSorted(
-    assets.flatMap(extractProducedVariableNamesFromAsset),
+    assets.flatMap(
+      extractProducedVariableNamesFromAsset,
+    ),
   );
 }
 
@@ -224,17 +373,25 @@ function hasCriticalMissing(
   missingVariables: readonly string[],
   registryEntries: readonly VariableRegistryAuditEntry[],
 ): boolean {
-  const criticalNames = new Set(
+  const criticalNames = new Set<string>(
     registryEntries
       .filter(
         (entry) =>
-          entry.criticality_level === "Core Truth" ||
-          entry.criticality_level === "CORE_TRUTH",
+          entry.criticality_level ===
+            "Core Truth" ||
+          entry.criticality_level ===
+            "CORE_TRUTH",
       )
-      .map((entry) => entry.variable_name),
+      .map(
+        (entry) =>
+          entry.variable_name,
+      ),
   );
 
-  return missingVariables.some((name) => criticalNames.has(name));
+  return missingVariables.some(
+    (name) =>
+      criticalNames.has(name),
+  );
 }
 
 function resolveStatus(input: {
@@ -244,8 +401,13 @@ function resolveStatus(input: {
   orphanCount: number;
   namingViolationCount: number;
 }): VariableRegistryAuditStatus {
-  if (input.registryCount === 0) return "invalid";
-  if (input.producedCount === 0) return "empty";
+  if (input.registryCount === 0) {
+    return "invalid";
+  }
+
+  if (input.producedCount === 0) {
+    return "empty";
+  }
 
   if (
     input.missingCount === 0 &&
@@ -255,7 +417,10 @@ function resolveStatus(input: {
     return "aligned";
   }
 
-  if (input.missingCount > 0 || input.orphanCount > 0) {
+  if (
+    input.missingCount > 0 ||
+    input.orphanCount > 0
+  ) {
     return "divergent";
   }
 
@@ -269,12 +434,29 @@ function resolveSeverity(input: {
   orphanCount: number;
   namingViolationCount: number;
 }): VariableRegistryAuditSeverity {
-  if (input.status === "invalid") return "critical";
-  if (input.status === "empty") return "critical";
-  if (input.hasCriticalMissing) return "critical";
-  if (input.missingCount > 0) return "major";
-  if (input.orphanCount > 0) return "major";
-  if (input.namingViolationCount > 0) return "minor";
+  if (input.status === "invalid") {
+    return "critical";
+  }
+
+  if (input.status === "empty") {
+    return "critical";
+  }
+
+  if (input.hasCriticalMissing) {
+    return "critical";
+  }
+
+  if (input.missingCount > 0) {
+    return "major";
+  }
+
+  if (input.orphanCount > 0) {
+    return "major";
+  }
+
+  if (input.namingViolationCount > 0) {
+    return "minor";
+  }
 
   return "none";
 }
@@ -288,17 +470,22 @@ export function buildVariableRegistryAuditReport(input: {
   registry?: unknown;
 }): VariableRegistryAuditReport {
   const registryEntries = normalizeRegistry(
-  input.registry ?? VARIABLE_LINEAGE_REGISTRY,
-).filter((entry) => {
-  const name = entry.variable_name;
+    input.registry ??
+      VARIABLE_LINEAGE_REGISTRY,
+  ).filter((entry) => {
+    const name = entry.variable_name;
 
-  if (name.startsWith("public_")) return false;
-  if (name.startsWith("ui_")) return false;
+    if (name.startsWith("public_")) {
+      return false;
+    }
 
- 
+    if (name.startsWith("ui_")) {
+      return false;
+    }
 
-  return true;
-});
+    return true;
+  });
+
   if (registryEntries.length === 0) {
     return {
       ok: false,
@@ -318,64 +505,116 @@ export function buildVariableRegistryAuditReport(input: {
       naming_violations_count: 0,
       naming_violations: [],
 
-      warnings: ["variable_registry_audit_registry_empty_or_invalid"],
-      error: "variable_registry_audit_invalid_registry",
+      warnings: [
+        "variable_registry_audit_registry_empty_or_invalid",
+      ],
+
+      error:
+        "variable_registry_audit_invalid_registry",
     };
   }
 
-  const registryNames = new Set(
-    registryEntries.map((entry) => entry.variable_name),
+  const registryNames = new Set<string>(
+    registryEntries.map(
+      (entry) =>
+        entry.variable_name,
+    ),
   );
 
-  const producedNames = new Set(
-  extractProducedVariableNames(input.assets)
-    .filter((name) => registryNames.has(name)),
-);
-  const registeredMissingVariables = uniqueSorted(
-    [...registryNames].filter((name) => !producedNames.has(name)),
+  /*
+   * Produced variables must not be filtered by registry membership here.
+   *
+   * Filtering them before comparison would make orphan detection impossible.
+   */
+  const producedNames = new Set<string>(
+    extractProducedVariableNames(
+      input.assets,
+    ),
   );
 
-  const producedOrphanVariables = uniqueSorted(
-    [...producedNames].filter((name) => !registryNames.has(name)),
-  );
+  const registeredMissingVariables =
+    uniqueSorted(
+      [...registryNames].filter(
+        (name) =>
+          !producedNames.has(name),
+      ),
+    );
 
-  const matchedVariables = uniqueSorted(
-    [...registryNames].filter((name) => producedNames.has(name)),
-  );
+  const producedOrphanVariables =
+    uniqueSorted(
+      [...producedNames].filter(
+        (name) =>
+          !registryNames.has(name),
+      ),
+    );
 
-  const namingViolations = detectNamingViolations([
-    ...registryNames,
-    ...producedNames,
-  ]);
+  const matchedVariables =
+    uniqueSorted(
+      [...registryNames].filter(
+        (name) =>
+          producedNames.has(name),
+      ),
+    );
+
+  const namingViolations =
+    detectNamingViolations([
+      ...registryNames,
+      ...producedNames,
+    ]);
 
   const status = resolveStatus({
-    registryCount: registryNames.size,
-    producedCount: producedNames.size,
-    missingCount: registeredMissingVariables.length,
-    orphanCount: producedOrphanVariables.length,
-    namingViolationCount: namingViolations.length,
+    registryCount:
+      registryNames.size,
+
+    producedCount:
+      producedNames.size,
+
+    missingCount:
+      registeredMissingVariables.length,
+
+    orphanCount:
+      producedOrphanVariables.length,
+
+    namingViolationCount:
+      namingViolations.length,
   });
 
   const severity = resolveSeverity({
     status,
-    hasCriticalMissing: hasCriticalMissing(
-      registeredMissingVariables,
-      registryEntries,
-    ),
-    missingCount: registeredMissingVariables.length,
-    orphanCount: producedOrphanVariables.length,
-    namingViolationCount: namingViolations.length,
+
+    hasCriticalMissing:
+      hasCriticalMissing(
+        registeredMissingVariables,
+        registryEntries,
+      ),
+
+    missingCount:
+      registeredMissingVariables.length,
+
+    orphanCount:
+      producedOrphanVariables.length,
+
+    namingViolationCount:
+      namingViolations.length,
   });
 
   const warnings = uniqueSorted([
     ...(registeredMissingVariables.length > 0
-      ? [`registry_missing_variables:${registeredMissingVariables.length}`]
+      ? [
+          `registry_missing_variables:${registeredMissingVariables.length}`,
+        ]
       : []),
+
     ...(producedOrphanVariables.length > 0
-      ? [`registry_orphan_variables:${producedOrphanVariables.length}`]
+      ? [
+          `registry_orphan_variables:${producedOrphanVariables.length}`,
+        ]
       : []),
+
     ...(namingViolations.length > 0
-      ? [`registry_naming_violations:${namingViolations.length}`]
+      ? [
+          `registry_naming_violations:${namingViolations.length}`,
+        ]
       : []),
   ]);
 
@@ -384,21 +623,39 @@ export function buildVariableRegistryAuditReport(input: {
     status,
     severity,
 
-    registry_variable_count: registryNames.size,
-    produced_variable_count: producedNames.size,
-    matched_variable_count: matchedVariables.length,
+    registry_variable_count:
+      registryNames.size,
 
-    registered_missing_count: registeredMissingVariables.length,
-    produced_orphan_count: producedOrphanVariables.length,
+    produced_variable_count:
+      producedNames.size,
 
-    registered_missing_variables: registeredMissingVariables,
-    produced_orphan_variables: producedOrphanVariables,
+    matched_variable_count:
+      matchedVariables.length,
 
-    naming_violations_count: namingViolations.length,
-    naming_violations: namingViolations,
+    registered_missing_count:
+      registeredMissingVariables.length,
+
+    produced_orphan_count:
+      producedOrphanVariables.length,
+
+    registered_missing_variables:
+      registeredMissingVariables,
+
+    produced_orphan_variables:
+      producedOrphanVariables,
+
+    naming_violations_count:
+      namingViolations.length,
+
+    naming_violations:
+      namingViolations,
 
     warnings,
-    error: status === "aligned" ? null : `variable_registry_audit_${status}`,
+
+    error:
+      status === "aligned"
+        ? null
+        : `variable_registry_audit_${status}`,
   };
 }
 
@@ -406,7 +663,8 @@ export function assertVariableRegistryAligned(input: {
   assets: readonly PrivateScanAsset[];
   registry?: unknown;
 }): void {
-  const report = buildVariableRegistryAuditReport(input);
+  const report =
+    buildVariableRegistryAuditReport(input);
 
   if (!report.ok) {
     throw new Error(

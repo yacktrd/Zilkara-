@@ -66,7 +66,8 @@
  * - market rank never determines eligibility
  * - market capitalization never determines eligibility
  * - volume never determines eligibility
- * - missing public values remain explicit
+ * - missing public values remain explicitly unavailable
+ * - unavailable never becomes neutral
  * - canonical identity must be present and unique
  * - ranking priorities remain ordering policy only
  *
@@ -156,6 +157,9 @@ export const STRUCTURAL_TRANSITION_RANKING_POLICY_VERSION:
  * - decision scores
  *
  * They must never be exposed as analytical truths.
+ *
+ * Unavailable remains rankable to preserve the complete supplied universe,
+ * but always receives the lowest structural-transition priority.
  * ========================================================================== */
 
 const STRUCTURAL_TRANSITION_PRIORITY: Readonly<
@@ -168,6 +172,7 @@ const STRUCTURAL_TRANSITION_PRIORITY: Readonly<
   "Recovery Structure": 3,
   "Stable Structure": 2,
   "Neutral Structure": 1,
+  Unavailable: 0,
 });
 
 const IMPULSE_CONTEXT_PRIORITY: Readonly<
@@ -192,80 +197,62 @@ const ACTIVITY_PRIORITY: Readonly<
 
 /* ============================================================================
  * 4. SAFE NORMALIZERS
+ * ----------------------------------------------------------------------------
+ * Normalizers accept canonical public values only.
+ *
+ * Missing, invalid or non-canonical values remain explicitly unavailable.
+ * They must never be converted into neutral analytical states.
  * ========================================================================== */
 
 function normalizePublicStructureTransition(
   value: unknown,
 ): PublicStructureTransition {
-  if (value === "Fragmentation Detected") {
-    return "Fragmentation Detected";
-  }
+  switch (value) {
+    case "Fragmentation Detected":
+    case "Compression Phase":
+    case "Active Expansion":
+    case "Expansion Phase":
+    case "Recovery Structure":
+    case "Stable Structure":
+    case "Neutral Structure":
+    case "Unavailable":
+      return value;
 
-  if (value === "Compression Phase") {
-    return "Compression Phase";
+    default:
+      return "Unavailable";
   }
-
-  if (value === "Active Expansion") {
-    return "Active Expansion";
-  }
-
-  if (value === "Expansion Phase") {
-    return "Expansion Phase";
-  }
-
-  if (value === "Recovery Structure") {
-    return "Recovery Structure";
-  }
-
-  if (value === "Stable Structure") {
-    return "Stable Structure";
-  }
-
-  return "Neutral Structure";
 }
 
 function normalizePublicImpulseContext(
   value: unknown,
 ): PublicImpulseContext {
-  if (value === "Exhaustion") {
-    return "Exhaustion";
-  }
+  switch (value) {
+    case "Exhaustion":
+    case "Release":
+    case "Pressure Building":
+    case "Compression":
+    case "Neutral":
+    case "Unavailable":
+      return value;
 
-  if (value === "Release") {
-    return "Release";
+    default:
+      return "Unavailable";
   }
-
-  if (value === "Pressure Building") {
-    return "Pressure Building";
-  }
-
-  if (value === "Compression") {
-    return "Compression";
-  }
-
-  if (value === "Neutral") {
-    return "Neutral";
-  }
-
-  return "Unavailable";
 }
 
 function normalizePublicActivity(
   value: unknown,
 ): PublicActivityLabel {
-  if (value === "High") {
-    return "High";
-  }
+  switch (value) {
+    case "High":
+    case "Normal":
+    case "Low":
+    case "Unavailable":
+      return value;
 
-  if (value === "Normal") {
-    return "Normal";
+    default:
+      return "Unavailable";
   }
-
-  if (value === "Low") {
-    return "Low";
-  }
-
-  return "Unavailable";
 }
 
 /* ============================================================================
@@ -281,7 +268,9 @@ function resolveCanonicalAssetIdentity(
     return id;
   }
 
-  return normalizeRankingString(asset.symbol).toUpperCase();
+  return normalizeRankingString(
+    asset.symbol,
+  ).toUpperCase();
 }
 
 /* ============================================================================
@@ -330,14 +319,18 @@ export const compareStructuralTransitionAssets: RankingComparator<
 
   compareByPriority(
     (asset) =>
-      normalizePublicActivity(asset.public_activity),
+      normalizePublicActivity(
+        asset.public_activity,
+      ),
     ACTIVITY_PRIORITY,
     "desc",
   ),
 
   compareByString(
     (asset) =>
-      normalizeRankingString(asset.symbol).toUpperCase(),
+      normalizeRankingString(
+        asset.symbol,
+      ).toUpperCase(),
     "asc",
   ),
 );
@@ -367,7 +360,10 @@ export function rankStructuralTransitions(
       : {}),
   };
 
-  const ranking = buildDeterministicRanking(rankingInput);
+  const ranking =
+    buildDeterministicRanking(
+      rankingInput,
+    );
 
   return {
     policy_version:
@@ -401,10 +397,13 @@ export function getStructuralTransitionHighlights(
   assets: readonly StructuralTransitionRankableAsset[],
   limit = 3,
 ): StructuralTransitionRankingResult {
-  return rankStructuralTransitions(assets, {
-    limit,
-    startAt: 1,
-  });
+  return rankStructuralTransitions(
+    assets,
+    {
+      limit,
+      startAt: 1,
+    },
+  );
 }
 
 /* ============================================================================

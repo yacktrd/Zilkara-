@@ -2,21 +2,61 @@
  * FILE: lib/xyvala/public/public-structure.ts
  * ----------------------------------------------------------------------------
  * TITLE
- * - Xyvala public structure reader
+ * - Xyvala canonical public structure projector
  *
  * ROLE
- * - derive public descriptive market structure labels from observable data only
- * - centralize public transition, activity, impulse, market climate and Triple Layer context
+ * - project validated public structural values without analytical reconstruction
+ * - normalize canonical public labels
+ * - expose public-safe transition, activity, impulse and market contexts
+ * - provide deterministic descriptive counts over validated public truths
  * - keep UI components passive and deterministic
  *
- * PARENTS
- * - lib/xyvala/contracts/scan-contract.ts
+ * CLASSIFICATION
+ * - PUBLIC PROJECTION
+ * - OBSERVE
+ * - no COMPUTE of analytical truths
+ * - no MUTATE
+ *
+ * PRODUCERS
  * - lib/xyvala/services/scan-transformer.ts
+ * - validated public snapshot transformer
+ * - validated public market-context transformer
+ *
+ * CONSUMERS
  * - lib/xyvala/services/scan-service.ts
  * - components/scan-table.tsx
+ * - public rankings
+ * - public market summaries
  *
- * DIRECTIVES
- * - public descriptive layer only
+ * CRITICAL DEPENDENCIES
+ * - lib/xyvala/contracts/scan-contract.ts
+ * - lib/xyvala/services/scan-transformer.ts
+ *
+ * INPUTS
+ * - validated public activity label
+ * - validated public 7D sparkline context
+ * - validated public transition label
+ * - validated public impulse context
+ * - validated public market-context projections
+ *
+ * OUTPUTS
+ * - canonical public activity label
+ * - canonical public 7D sparkline context
+ * - canonical public transition label
+ * - canonical public impulse context
+ * - deterministic descriptive counts
+ * - validated public market summary projection
+ *
+ * INVARIANTS
+ * - public values are projected, never analytically reconstructed
+ * - public transition labels must already exist upstream
+ * - public impulse context must already exist upstream
+ * - public Triple Layer contexts must already exist upstream
+ * - public market climate must already exist upstream
+ * - 24H and 7D values never determine global structural truth
+ * - sparkline values never determine global structural truth
+ * - missing canonical values produce Unavailable
+ * - neutral never represents unavailable
  * - no private score usage
  * - no regime exposure
  * - no decision exposure
@@ -24,50 +64,38 @@
  * - no confidence exposure
  * - no rupture probability exposure
  * - no calibration exposure
- * - no broker / affiliate exposure
+ * - no broker or affiliate exposure
  * - no RFS recomputation
- * - no MCI recomputation
+ * - no Triple Layer recomputation
+ * - no Impulse Layer recomputation
+ * - no Analytical Aggregation recomputation
  * - no investment advice
  * - deterministic output only
- * - same input => same public structure output
+ * - same validated input produces the same public output
  *
- * INPUTS
- * - observable public asset fields
- * - public-safe impulse transition labels
- *
- * OUTPUTS
- * - activity label
- * - 7D sparkline context
- * - structure transition label
- * - public impulse context
- * - market climate summary
- * - public Triple Layer context
- *
- * INVARIANTS
- * - null means explicitly unavailable
- * - labels remain descriptive, never prescriptive
- * - no buy / sell / hold semantics
- * - no predictive wording
- * - no numerical private scoring
- * - UI must display these values, not rebuild them
- *
- * CRITICAL DEPENDENCIES
- * - scan-contract.ts
- * - scan-transformer.ts
- *
- * SENSITIVE ZONES
+ * SENSITIVE AREAS
  * - public/private boundary
- * - legal wording
- * - impulse context must remain descriptive and non-advisory
- * - transition labels must remain non-advisory
- * - Triple Layer context must remain descriptive and public-safe
+ * - transition projection
+ * - impulse projection
+ * - Triple Layer projection
+ * - market-context projection
+ * - explicit unavailable-state handling
+ *
+ * COMPATIBILITY
+ * - legacy observable fields remain accepted by PublicStructureInput
+ * - legacy observable fields are not used to create analytical truths
+ * - visual sparkline helpers remain exported for non-analytical consumers
  * ========================================================================== */
 
 /* ============================================================================
- * 1. PUBLIC TYPES
+ * 1. PUBLIC CANONICAL TYPES
  * ========================================================================== */
 
-export type PublicActivityLabel = "Low" | "Normal" | "High" | "Unavailable";
+export type PublicActivityLabel =
+  | "Low"
+  | "Normal"
+  | "High"
+  | "Unavailable";
 
 export type PublicSparklineContext7D =
   | "Compression"
@@ -85,7 +113,8 @@ export type PublicStructureTransition =
   | "Fragmentation Detected"
   | "Stable Structure"
   | "Active Expansion"
-  | "Neutral Structure";
+  | "Neutral Structure"
+  | "Unavailable";
 
 export type PublicImpulseContext =
   | "Compression"
@@ -121,15 +150,43 @@ export type PublicDecayContext =
   | "Elevated"
   | "Unavailable";
 
-export type PublicStructureInput = {
-  pct_24h: number | null;
-  pct_7d: number | null;
-  volume_24h: number | null;
-  market_cap: number | null;
-  sparkline_7d: number[] | null;
+/* ============================================================================
+ * 2. PUBLIC INPUT CONTRACTS
+ * ----------------------------------------------------------------------------
+ * Canonical fields are the only fields authorized to produce public
+ * analytical labels.
+ *
+ * Legacy observable fields remain available for compatibility and purely
+ * visual usage. They must never be used to reconstruct structural truth.
+ * ========================================================================== */
 
-  impulse_transition_state?: unknown;
+export type PublicStructureInput = {
+  /**
+   * Canonical public projections.
+   */
+  public_activity_label?: unknown;
+  public_sparkline_context_7d?: unknown;
+  public_transition_label?: unknown;
   public_impulse_context?: unknown;
+
+  /**
+   * Legacy observable fields.
+   *
+   * These values must not be used to derive global structural labels.
+   */
+  pct_24h?: number | null;
+  pct_7d?: number | null;
+  volume_24h?: number | null;
+  market_cap?: number | null;
+  sparkline_7d?: number[] | null;
+
+  /**
+   * Legacy impulse propagation fields.
+   *
+   * They remain accepted only to avoid immediate consumer breakage.
+   * They are intentionally ignored by the canonical projector.
+   */
+  impulse_transition_state?: unknown;
   impulse_context?: unknown;
 };
 
@@ -140,16 +197,24 @@ export type PublicStructureResult = {
   impulse_context: PublicImpulseContext;
 };
 
-export type PublicMarketStructureAsset = {
-  activity: PublicActivityLabel;
-  sparkline_context_7d: PublicSparklineContext7D;
-  structure_transition: PublicStructureTransition;
-  impulse_context: PublicImpulseContext;
+/**
+ * Canonical alias.
+ *
+ * A public market-structure asset and a projected public structure result
+ * represent the same contract.
+ */
+export type PublicMarketStructureAsset = PublicStructureResult;
+
+export type PublicMarketSummaryProjection = {
+  public_market_climate?: unknown;
+  public_growth_context?: unknown;
+  public_core_structure?: unknown;
+  public_decay_context?: unknown;
 };
 
 export type PublicMarketStructureSummary = {
   market_climate: PublicMarketClimate;
-  dominant_transition: PublicStructureTransition | "Unavailable";
+  dominant_transition: PublicStructureTransition;
   activity_context: PublicActivityLabel;
   impulse_context: PublicImpulseContext;
 
@@ -158,143 +223,235 @@ export type PublicMarketStructureSummary = {
   decay_context: PublicDecayContext;
 
   assets_count: number;
+  available_assets_count: number;
+  unavailable_assets_count: number;
+
   expansion_count: number;
   fragmentation_count: number;
   compression_count: number;
 };
 
 /* ============================================================================
- * 2. SAFE HELPERS
+ * 3. SAFE PRIMITIVE HELPERS
  * ========================================================================== */
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
 
-function normalizeNullableNumber(value: unknown): number | null {
-  return isFiniteNumber(value) ? value : null;
-}
-
 function normalizeSparkline(value: unknown): number[] | null {
-  if (!Array.isArray(value)) return null;
+  if (!Array.isArray(value) || value.length < 2) {
+    return null;
+  }
 
-  const points = value.filter(isFiniteNumber);
+  if (!value.every(isFiniteNumber)) {
+    return null;
+  }
 
-  return points.length >= 2 ? points : null;
-}
-
-function abs(value: number | null): number {
-  return Math.abs(value ?? 0);
+  return [...value];
 }
 
 /* ============================================================================
- * 3. PUBLIC IMPULSE CONTEXT
+ * 4. STRICT CANONICAL LABEL PROJECTORS
+ * ----------------------------------------------------------------------------
+ * These functions accept only official public values.
+ *
+ * Synonyms, casing variants and private values are rejected as unavailable.
+ * This behavior exposes propagation failures instead of masking them.
  * ========================================================================== */
 
-export function toPublicImpulseContext(value: unknown): PublicImpulseContext {
+export function toPublicActivityLabel(
+  value: unknown,
+): PublicActivityLabel {
   switch (value) {
-    case "COMPRESSION":
-    case "Compression":
-    case "compression":
-      return "Compression";
-
-    case "PRESSURE_BUILDING":
-    case "Pressure Building":
-    case "pressure_building":
-      return "Pressure Building";
-
-    case "RELEASE":
-    case "Release":
-    case "release":
-      return "Release";
-
-    case "EXHAUSTION":
-    case "Exhaustion":
-    case "exhaustion":
-      return "Exhaustion";
-
-    case "NEUTRAL":
-    case "Neutral":
-    case "neutral":
-      return "Neutral";
-
+    case "Low":
+    case "Normal":
+    case "High":
     case "Unavailable":
-    case "UNAVAILABLE":
-    case "unavailable":
-      return "Unavailable";
+      return value;
 
     default:
       return "Unavailable";
   }
 }
 
-function resolvePublicImpulseContext(input: {
-  public_impulse_context?: unknown;
-  impulse_context?: unknown;
-  impulse_transition_state?: unknown;
-}): PublicImpulseContext {
-  const publicContext = toPublicImpulseContext(input.public_impulse_context);
+export function toPublicSparklineContext7D(
+  value: unknown,
+): PublicSparklineContext7D {
+  switch (value) {
+    case "Compression":
+    case "Expansion":
+    case "Recovery":
+    case "Fragmented":
+    case "Stable":
+    case "Neutral":
+    case "Unavailable":
+      return value;
 
-  if (publicContext !== "Unavailable") {
-    return publicContext;
+    default:
+      return "Unavailable";
   }
-
-  const impulseContext = toPublicImpulseContext(input.impulse_context);
-
-  if (impulseContext !== "Unavailable") {
-    return impulseContext;
-  }
-
-  return toPublicImpulseContext(input.impulse_transition_state);
 }
 
-function resolveDominantImpulseContext(
-  assets: readonly PublicMarketStructureAsset[],
-): PublicImpulseContext {
-  if (assets.length === 0) return "Unavailable";
+export function toPublicStructureTransition(
+  value: unknown,
+): PublicStructureTransition {
+  switch (value) {
+    case "Compression Phase":
+    case "Expansion Phase":
+    case "Recovery Structure":
+    case "Fragmentation Detected":
+    case "Stable Structure":
+    case "Active Expansion":
+    case "Neutral Structure":
+    case "Unavailable":
+      return value;
 
-  const counts: Record<PublicImpulseContext, number> = {
-    Compression: 0,
-    "Pressure Building": 0,
-    Release: 0,
-    Exhaustion: 0,
-    Neutral: 0,
-    Unavailable: 0,
-  };
-
-  for (const asset of assets) {
-    counts[toPublicImpulseContext(asset.impulse_context)] += 1;
+    default:
+      return "Unavailable";
   }
+}
 
-  const ordered: PublicImpulseContext[] = [
-    "Exhaustion",
-    "Release",
-    "Pressure Building",
-    "Compression",
-    "Neutral",
-  ];
+export function toPublicImpulseContext(
+  value: unknown,
+): PublicImpulseContext {
+  switch (value) {
+    case "Compression":
+    case "Pressure Building":
+    case "Release":
+    case "Exhaustion":
+    case "Neutral":
+    case "Unavailable":
+      return value;
 
-  const dominant = ordered.reduce<PublicImpulseContext>((best, current) => {
-    return counts[current] > counts[best] ? current : best;
-  }, "Neutral");
+    default:
+      return "Unavailable";
+  }
+}
 
-  return counts[dominant] > 0 ? dominant : "Unavailable";
+export function toPublicMarketClimate(
+  value: unknown,
+): PublicMarketClimate {
+  switch (value) {
+    case "Calm Market":
+    case "Active Market":
+    case "Expansion Market":
+    case "Fragmented Market":
+    case "Transitioning Market":
+    case "Unavailable":
+      return value;
+
+    default:
+      return "Unavailable";
+  }
+}
+
+export function toPublicGrowthContext(
+  value: unknown,
+): PublicGrowthContext {
+  switch (value) {
+    case "Low":
+    case "Moderate":
+    case "Active":
+    case "Unavailable":
+      return value;
+
+    default:
+      return "Unavailable";
+  }
+}
+
+export function toPublicCoreStructure(
+  value: unknown,
+): PublicCoreStructure {
+  switch (value) {
+    case "Weak":
+    case "Mixed":
+    case "Stable":
+    case "Unavailable":
+      return value;
+
+    default:
+      return "Unavailable";
+  }
+}
+
+export function toPublicDecayContext(
+  value: unknown,
+): PublicDecayContext {
+  switch (value) {
+    case "Limited":
+    case "Rising":
+    case "Elevated":
+    case "Unavailable":
+      return value;
+
+    default:
+      return "Unavailable";
+  }
 }
 
 /* ============================================================================
- * 4. OBSERVABLE SHAPE READERS
+ * 5. CANONICAL PUBLIC STRUCTURE PROJECTOR
+ * ----------------------------------------------------------------------------
+ * No observable market field is used to produce analytical labels.
  * ========================================================================== */
 
-export function computePublicAmplitude7D(points: number[] | null): number {
+export function buildPublicStructure(
+  input: PublicStructureInput,
+): PublicStructureResult {
+  return {
+    activity: toPublicActivityLabel(
+      input.public_activity_label,
+    ),
+
+    sparkline_context_7d: toPublicSparklineContext7D(
+      input.public_sparkline_context_7d,
+    ),
+
+    structure_transition: toPublicStructureTransition(
+      input.public_transition_label,
+    ),
+
+    impulse_context: toPublicImpulseContext(
+      input.public_impulse_context,
+    ),
+  };
+}
+
+/* ============================================================================
+ * 6. LEGACY VISUAL SPARKLINE HELPERS
+ * ----------------------------------------------------------------------------
+ * These helpers are retained for compatibility with visual consumers only.
+ *
+ * They must never be used to:
+ * - produce a structural transition
+ * - produce a regime
+ * - produce a Triple Layer context
+ * - produce an Impulse Layer state
+ * - produce a market climate
+ * - produce a decision or ranking score
+ *
+ * Invalid or incomplete data returns an explicit non-computable result where
+ * the existing return contract permits it.
+ * ========================================================================== */
+
+export function computePublicAmplitude7D(
+  points: number[] | null,
+): number {
   const clean = normalizeSparkline(points);
 
-  if (!clean) return 0;
+  if (!clean) {
+    return 0;
+  }
 
   const min = Math.min(...clean);
   const max = Math.max(...clean);
   const last = clean.at(-1);
 
-  if (!isFiniteNumber(last) || last <= 0) return 0;
+  if (!isFiniteNumber(last) || last <= 0) {
+    return 0;
+  }
 
   return ((max - min) / last) * 100;
 }
@@ -304,19 +461,31 @@ export function computePublicSparklineDirection7D(
 ): "up" | "down" | "flat" {
   const clean = normalizeSparkline(points);
 
-  if (!clean) return "flat";
+  if (!clean) {
+    return "flat";
+  }
 
   const first = clean[0];
   const last = clean.at(-1);
 
-  if (!isFiniteNumber(first) || !isFiniteNumber(last) || first <= 0) {
+  if (
+    !isFiniteNumber(first) ||
+    !isFiniteNumber(last) ||
+    first <= 0
+  ) {
     return "flat";
   }
 
-  const changePct = ((last - first) / first) * 100;
+  const changePct =
+    ((last - first) / first) * 100;
 
-  if (changePct > 1) return "up";
-  if (changePct < -1) return "down";
+  if (changePct > 1) {
+    return "up";
+  }
+
+  if (changePct < -1) {
+    return "down";
+  }
 
   return "flat";
 }
@@ -326,12 +495,18 @@ export function computePublicSparklineChange7D(
 ): number | null {
   const clean = normalizeSparkline(points);
 
-  if (!clean) return null;
+  if (!clean) {
+    return null;
+  }
 
   const first = clean[0];
   const last = clean.at(-1);
 
-  if (!isFiniteNumber(first) || !isFiniteNumber(last) || first <= 0) {
+  if (
+    !isFiniteNumber(first) ||
+    !isFiniteNumber(last) ||
+    first <= 0
+  ) {
     return null;
   }
 
@@ -343,23 +518,41 @@ export function computePublicDirectionChanges7D(
 ): number {
   const clean = normalizeSparkline(points);
 
-  if (!clean || clean.length < 3) return 0;
+  if (!clean || clean.length < 3) {
+    return 0;
+  }
 
   let changes = 0;
-  let previousDirection: "up" | "down" | "flat" = "flat";
+  let previousDirection:
+    | "up"
+    | "down"
+    | "flat" = "flat";
 
-  for (let index = 1; index < clean.length; index += 1) {
+  for (
+    let index = 1;
+    index < clean.length;
+    index += 1
+  ) {
     const previous = clean[index - 1];
     const current = clean[index];
 
-    if (!isFiniteNumber(previous) || !isFiniteNumber(current) || previous <= 0) {
+    if (
+      !isFiniteNumber(previous) ||
+      !isFiniteNumber(current) ||
+      previous <= 0
+    ) {
       continue;
     }
 
-    const deltaPct = ((current - previous) / previous) * 100;
+    const deltaPct =
+      ((current - previous) / previous) * 100;
 
     const direction =
-      deltaPct > 0.15 ? "up" : deltaPct < -0.15 ? "down" : "flat";
+      deltaPct > 0.15
+        ? "up"
+        : deltaPct < -0.15
+          ? "down"
+          : "flat";
 
     if (
       previousDirection !== "flat" &&
@@ -378,380 +571,479 @@ export function computePublicDirectionChanges7D(
 }
 
 /* ============================================================================
- * 5. PUBLIC ACTIVITY
+ * 7. LEGACY RESOLVER COMPATIBILITY
+ * ----------------------------------------------------------------------------
+ * These exports remain available to prevent immediate import failures.
+ *
+ * They no longer derive analytical truth from observable data.
+ * Without an explicit canonical public label, they return Unavailable.
  * ========================================================================== */
 
 export function resolvePublicActivity(input: {
-  volume_24h: unknown;
-  market_cap: unknown;
+  public_activity_label?: unknown;
+  volume_24h?: unknown;
+  market_cap?: unknown;
 }): PublicActivityLabel {
-  const volume24h = normalizeNullableNumber(input.volume_24h);
-  const marketCap = normalizeNullableNumber(input.market_cap);
-
-  if (volume24h === null || marketCap === null || marketCap <= 0) {
-    return "Unavailable";
-  }
-
-  const activityRatio = volume24h / marketCap;
-
-  if (activityRatio >= 0.08) return "High";
-  if (activityRatio >= 0.025) return "Normal";
-
-  return "Low";
+  return toPublicActivityLabel(
+    input.public_activity_label,
+  );
 }
-
-/* ============================================================================
- * 6. PUBLIC 7D SPARKLINE CONTEXT
- * ========================================================================== */
 
 export function resolvePublicSparklineContext7D(input: {
-  pct_24h: unknown;
-  pct_7d: unknown;
-  sparkline_7d: unknown;
+  public_sparkline_context_7d?: unknown;
+  pct_24h?: unknown;
+  pct_7d?: unknown;
+  sparkline_7d?: unknown;
 }): PublicSparklineContext7D {
-  const pct24h = normalizeNullableNumber(input.pct_24h) ?? 0;
-  const pct7d = normalizeNullableNumber(input.pct_7d) ?? 0;
-  const sparkline = normalizeSparkline(input.sparkline_7d);
-
-  if (!sparkline) return "Unavailable";
-
-  const abs24h = Math.abs(pct24h);
-  const abs7d = Math.abs(pct7d);
-  const amplitude = computePublicAmplitude7D(sparkline);
-  const direction = computePublicSparklineDirection7D(sparkline);
-  const directionChanges = computePublicDirectionChanges7D(sparkline);
-
-  if (
-    abs24h >= 6 ||
-    abs7d >= 14 ||
-    amplitude >= 14 ||
-    directionChanges >= 8
-  ) {
-    return "Fragmented";
-  }
-
-  if (pct24h > 0.2 && pct7d > 1 && direction === "up") {
-    return "Expansion";
-  }
-
-  if (pct24h > 0.2 && pct7d < -1 && direction !== "down") {
-    return "Recovery";
-  }
-
-  if (
-    abs24h <= 0.25 &&
-    abs7d <= 1 &&
-    amplitude <= 2 &&
-    directionChanges <= 2
-  ) {
-    return "Compression";
-  }
-
-  if (
-    abs24h <= 1.2 &&
-    abs7d <= 4 &&
-    amplitude <= 6 &&
-    directionChanges <= 4
-  ) {
-    return "Stable";
-  }
-
-  return "Neutral";
+  return toPublicSparklineContext7D(
+    input.public_sparkline_context_7d,
+  );
 }
-
-/* ============================================================================
- * 7. PUBLIC STRUCTURE TRANSITION
- * ========================================================================== */
 
 export function resolvePublicStructureTransition(input: {
-  pct_24h: unknown;
-  pct_7d: unknown;
-  volume_24h: unknown;
-  market_cap: unknown;
-  sparkline_7d: unknown;
+  public_transition_label?: unknown;
+  pct_24h?: unknown;
+  pct_7d?: unknown;
+  volume_24h?: unknown;
+  market_cap?: unknown;
+  sparkline_7d?: unknown;
 }): PublicStructureTransition {
-  const pct24h = normalizeNullableNumber(input.pct_24h) ?? 0;
-  const pct7d = normalizeNullableNumber(input.pct_7d) ?? 0;
-  const sparkline = normalizeSparkline(input.sparkline_7d);
-
-  const activity = resolvePublicActivity({
-    volume_24h: input.volume_24h,
-    market_cap: input.market_cap,
-  });
-
-  const abs24h = abs(pct24h);
-  const abs7d = abs(pct7d);
-  const amplitude = computePublicAmplitude7D(sparkline);
-  const direction = computePublicSparklineDirection7D(sparkline);
-  const directionChanges = computePublicDirectionChanges7D(sparkline);
-
-  if (
-    abs24h >= 6 ||
-    abs7d >= 14 ||
-    amplitude >= 14 ||
-    directionChanges >= 8
-  ) {
-    return "Fragmentation Detected";
-  }
-
-  if (
-    pct24h > 0.4 &&
-    pct7d > 1.5 &&
-    direction === "up" &&
-    activity === "High"
-  ) {
-    return "Active Expansion";
-  }
-
-  if (pct24h > 0.2 && pct7d > 1 && direction === "up") {
-    return "Expansion Phase";
-  }
-
-  if (pct24h > 0.2 && pct7d < -1 && direction !== "down") {
-    return "Recovery Structure";
-  }
-
-  if (
-    abs24h <= 0.25 &&
-    abs7d <= 1 &&
-    amplitude <= 2 &&
-    direction === "flat" &&
-    directionChanges <= 2
-  ) {
-    return "Compression Phase";
-  }
-
-  if (
-    abs24h <= 1.2 &&
-    abs7d <= 4 &&
-    amplitude <= 6 &&
-    directionChanges <= 4
-  ) {
-    return "Stable Structure";
-  }
-
-  return "Neutral Structure";
-}
-
-export function buildPublicStructure(
-  input: PublicStructureInput,
-): PublicStructureResult {
-  const normalizedInput = {
-    pct_24h: normalizeNullableNumber(input.pct_24h),
-    pct_7d: normalizeNullableNumber(input.pct_7d),
-    volume_24h: normalizeNullableNumber(input.volume_24h),
-    market_cap: normalizeNullableNumber(input.market_cap),
-    sparkline_7d: normalizeSparkline(input.sparkline_7d),
-    impulse_context: resolvePublicImpulseContext({
-      public_impulse_context: input.public_impulse_context,
-      impulse_context: input.impulse_context,
-      impulse_transition_state: input.impulse_transition_state,
-    }),
-  };
-
-  return {
-    activity: resolvePublicActivity({
-      volume_24h: normalizedInput.volume_24h,
-      market_cap: normalizedInput.market_cap,
-    }),
-
-    sparkline_context_7d: resolvePublicSparklineContext7D({
-      pct_24h: normalizedInput.pct_24h,
-      pct_7d: normalizedInput.pct_7d,
-      sparkline_7d: normalizedInput.sparkline_7d,
-    }),
-
-    structure_transition: resolvePublicStructureTransition({
-      pct_24h: normalizedInput.pct_24h,
-      pct_7d: normalizedInput.pct_7d,
-      volume_24h: normalizedInput.volume_24h,
-      market_cap: normalizedInput.market_cap,
-      sparkline_7d: normalizedInput.sparkline_7d,
-    }),
-
-    impulse_context: normalizedInput.impulse_context,
-  };
+  return toPublicStructureTransition(
+    input.public_transition_label,
+  );
 }
 
 /* ============================================================================
- * 8. PUBLIC TRIPLE LAYER CONTEXT
+ * 8. DESCRIPTIVE PUBLIC COUNTS
+ * ----------------------------------------------------------------------------
+ * Counting and ordering validated public labels does not create a new
+ * analytical truth.
+ *
+ * These functions:
+ * - do not generate scores
+ * - do not infer private states
+ * - do not change labels
+ * - do not use price or sparkline data
  * ========================================================================== */
 
-export function resolveGrowthContext(
-  assets: readonly PublicMarketStructureAsset[],
-): PublicGrowthContext {
-  if (assets.length === 0) return "Unavailable";
-
-  const expanding = assets.filter(
-    (asset) =>
-      asset.structure_transition === "Expansion Phase" ||
-      asset.structure_transition === "Active Expansion",
-  ).length;
-
-  const ratio = expanding / assets.length;
-
-  if (ratio >= 0.4) return "Active";
-  if (ratio >= 0.18) return "Moderate";
-
-  return "Low";
+function isAvailableStructureAsset(
+  asset: PublicMarketStructureAsset,
+): boolean {
+  return (
+    asset.activity !== "Unavailable" ||
+    asset.sparkline_context_7d !== "Unavailable" ||
+    asset.structure_transition !== "Unavailable" ||
+    asset.impulse_context !== "Unavailable"
+  );
 }
-
-export function resolveCoreStructure(
-  assets: readonly PublicMarketStructureAsset[],
-): PublicCoreStructure {
-  if (assets.length === 0) return "Unavailable";
-
-  const stable = assets.filter(
-    (asset) =>
-      asset.structure_transition === "Stable Structure" ||
-      asset.structure_transition === "Compression Phase",
-  ).length;
-
-  const neutral = assets.filter(
-    (asset) => asset.structure_transition === "Neutral Structure",
-  ).length;
-
-  const coreRatio = (stable + neutral * 0.5) / assets.length;
-
-  if (coreRatio >= 0.45) return "Stable";
-  if (coreRatio >= 0.2) return "Mixed";
-
-  return "Weak";
-}
-
-export function resolveDecayContext(
-  assets: readonly PublicMarketStructureAsset[],
-): PublicDecayContext {
-  if (assets.length === 0) return "Unavailable";
-
-  const fragmented = assets.filter(
-    (asset) => asset.structure_transition === "Fragmentation Detected",
-  ).length;
-
-  const recovery = assets.filter(
-    (asset) => asset.structure_transition === "Recovery Structure",
-  ).length;
-
-  const decayRatio = (fragmented + recovery * 0.35) / assets.length;
-
-  if (decayRatio >= 0.3) return "Elevated";
-  if (decayRatio >= 0.12) return "Rising";
-
-  return "Limited";
-}
-
-/* ============================================================================
- * 9. PUBLIC MARKET SUMMARY
- * ========================================================================== */
 
 function countByTransition(
   assets: readonly PublicMarketStructureAsset[],
-  predicate: (transition: PublicStructureTransition) => boolean,
+  predicate: (
+    transition: PublicStructureTransition,
+  ) => boolean,
 ): number {
-  return assets.filter((asset) => predicate(asset.structure_transition)).length;
+  return assets.reduce(
+    (count, asset) =>
+      predicate(asset.structure_transition)
+        ? count + 1
+        : count,
+    0,
+  );
 }
 
 function resolveDominantTransition(
   assets: readonly PublicMarketStructureAsset[],
-): PublicStructureTransition | "Unavailable" {
-  if (assets.length === 0) return "Unavailable";
-
-  const counts = new Map<PublicStructureTransition, number>();
-
-  for (const asset of assets) {
-    counts.set(
-      asset.structure_transition,
-      (counts.get(asset.structure_transition) ?? 0) + 1,
+): PublicStructureTransition {
+  const availableTransitions = assets
+    .map((asset) =>
+      toPublicStructureTransition(
+        asset.structure_transition,
+      ),
+    )
+    .filter(
+      (
+        transition,
+      ): transition is Exclude<
+        PublicStructureTransition,
+        "Unavailable"
+      > => transition !== "Unavailable",
     );
+
+  if (availableTransitions.length === 0) {
+    return "Unavailable";
   }
 
-  return [...counts.entries()].sort((left, right) => {
-    if (right[1] !== left[1]) return right[1] - left[1];
-    return left[0].localeCompare(right[0]);
-  })[0]?.[0] ?? "Unavailable";
+  const priority: readonly Exclude<
+    PublicStructureTransition,
+    "Unavailable"
+  >[] = [
+    "Fragmentation Detected",
+    "Active Expansion",
+    "Expansion Phase",
+    "Recovery Structure",
+    "Compression Phase",
+    "Stable Structure",
+    "Neutral Structure",
+  ];
+
+  const counts: Record<
+    Exclude<
+      PublicStructureTransition,
+      "Unavailable"
+    >,
+    number
+  > = {
+    "Fragmentation Detected": 0,
+    "Active Expansion": 0,
+    "Expansion Phase": 0,
+    "Recovery Structure": 0,
+    "Compression Phase": 0,
+    "Stable Structure": 0,
+    "Neutral Structure": 0,
+  };
+
+  for (const transition of availableTransitions) {
+    counts[transition] += 1;
+  }
+
+  let dominant: Exclude<
+    PublicStructureTransition,
+    "Unavailable"
+  > = "Neutral Structure";
+
+  let dominantCount = -1;
+
+  for (const transition of priority) {
+    const count = counts[transition];
+
+    if (count > dominantCount) {
+      dominant = transition;
+      dominantCount = count;
+    }
+  }
+
+  return dominant;
 }
 
 function resolveActivityContext(
   assets: readonly PublicMarketStructureAsset[],
 ): PublicActivityLabel {
-  if (assets.length === 0) return "Unavailable";
+  const availableActivities = assets
+    .map((asset) =>
+      toPublicActivityLabel(
+        asset.activity,
+      ),
+    )
+    .filter(
+      (
+        activity,
+      ): activity is Exclude<
+        PublicActivityLabel,
+        "Unavailable"
+      > => activity !== "Unavailable",
+    );
 
-  const high = assets.filter((asset) => asset.activity === "High").length;
-  const normal = assets.filter((asset) => asset.activity === "Normal").length;
+  if (availableActivities.length === 0) {
+    return "Unavailable";
+  }
 
-  if (high / assets.length >= 0.3) return "High";
-  if ((high + normal) / assets.length >= 0.5) return "Normal";
+  const counts: Record<
+    Exclude<
+      PublicActivityLabel,
+      "Unavailable"
+    >,
+    number
+  > = {
+    Low: 0,
+    Normal: 0,
+    High: 0,
+  };
 
-  return "Low";
+  for (const activity of availableActivities) {
+    counts[activity] += 1;
+  }
+
+  const priority: readonly Exclude<
+    PublicActivityLabel,
+    "Unavailable"
+  >[] = [
+    "High",
+    "Normal",
+    "Low",
+  ];
+
+  let dominant: Exclude<
+    PublicActivityLabel,
+    "Unavailable"
+  > = "Low";
+
+  let dominantCount = -1;
+
+  for (const activity of priority) {
+    const count = counts[activity];
+
+    if (count > dominantCount) {
+      dominant = activity;
+      dominantCount = count;
+    }
+  }
+
+  return dominant;
 }
+
+function resolveDominantImpulseContext(
+  assets: readonly PublicMarketStructureAsset[],
+): PublicImpulseContext {
+  const availableContexts = assets
+    .map((asset) =>
+      toPublicImpulseContext(
+        asset.impulse_context,
+      ),
+    )
+    .filter(
+      (
+        context,
+      ): context is Exclude<
+        PublicImpulseContext,
+        "Unavailable"
+      > => context !== "Unavailable",
+    );
+
+  if (availableContexts.length === 0) {
+    return "Unavailable";
+  }
+
+  const counts: Record<
+    Exclude<
+      PublicImpulseContext,
+      "Unavailable"
+    >,
+    number
+  > = {
+    Compression: 0,
+    "Pressure Building": 0,
+    Release: 0,
+    Exhaustion: 0,
+    Neutral: 0,
+  };
+
+  for (const context of availableContexts) {
+    counts[context] += 1;
+  }
+
+  const priority: readonly Exclude<
+    PublicImpulseContext,
+    "Unavailable"
+  >[] = [
+    "Exhaustion",
+    "Release",
+    "Pressure Building",
+    "Compression",
+    "Neutral",
+  ];
+
+  let dominant: Exclude<
+    PublicImpulseContext,
+    "Unavailable"
+  > = "Neutral";
+
+  let dominantCount = -1;
+
+  for (const context of priority) {
+    const count = counts[context];
+
+    if (count > dominantCount) {
+      dominant = context;
+      dominantCount = count;
+    }
+  }
+
+  return dominant;
+}
+
+/* ============================================================================
+ * 9. PUBLIC TRIPLE LAYER PROJECTION
+ * ----------------------------------------------------------------------------
+ * Triple Layer public contexts must already be produced by a validated
+ * upstream transformer.
+ *
+ * Asset transition counts are not authorized to recreate Growth, Core or
+ * Decay contexts.
+ * ========================================================================== */
+
+export function resolveGrowthContext(
+  _assets: readonly PublicMarketStructureAsset[],
+  publicGrowthContext?: unknown,
+): PublicGrowthContext {
+  return toPublicGrowthContext(
+    publicGrowthContext,
+  );
+}
+
+export function resolveCoreStructure(
+  _assets: readonly PublicMarketStructureAsset[],
+  publicCoreStructure?: unknown,
+): PublicCoreStructure {
+  return toPublicCoreStructure(
+    publicCoreStructure,
+  );
+}
+
+export function resolveDecayContext(
+  _assets: readonly PublicMarketStructureAsset[],
+  publicDecayContext?: unknown,
+): PublicDecayContext {
+  return toPublicDecayContext(
+    publicDecayContext,
+  );
+}
+
+/* ============================================================================
+ * 10. PUBLIC MARKET CLIMATE PROJECTION
+ * ----------------------------------------------------------------------------
+ * Market climate is an upstream aggregated public projection.
+ *
+ * It must never be recreated locally from transition or activity ratios.
+ * ========================================================================== */
 
 export function resolvePublicMarketClimate(
-  assets: readonly PublicMarketStructureAsset[],
+  _assets: readonly PublicMarketStructureAsset[],
+  publicMarketClimate?: unknown,
 ): PublicMarketClimate {
-  if (assets.length === 0) return "Unavailable";
-
-  const total = assets.length;
-
-  const fragmented = countByTransition(
-    assets,
-    (transition) => transition === "Fragmentation Detected",
+  return toPublicMarketClimate(
+    publicMarketClimate,
   );
-
-  const expanding = countByTransition(
-    assets,
-    (transition) =>
-      transition === "Expansion Phase" || transition === "Active Expansion",
-  );
-
-  const compressed = countByTransition(
-    assets,
-    (transition) =>
-      transition === "Compression Phase" || transition === "Stable Structure",
-  );
-
-  const active = assets.filter((asset) => asset.activity === "High").length;
-
-  if (fragmented / total >= 0.3) return "Fragmented Market";
-  if (expanding / total >= 0.35) return "Expansion Market";
-  if (active / total >= 0.35) return "Active Market";
-  if (compressed / total >= 0.45) return "Calm Market";
-
-  return "Transitioning Market";
 }
+
+/* ============================================================================
+ * 11. PUBLIC MARKET SUMMARY
+ * ----------------------------------------------------------------------------
+ * The function:
+ * - projects validated market and Triple Layer contexts
+ * - counts existing validated public labels
+ * - identifies dominant existing public labels deterministically
+ *
+ * It never derives a new structural, impulsional or Triple Layer truth.
+ * ========================================================================== */
 
 export function buildPublicMarketStructureSummary(
   assets: readonly PublicMarketStructureAsset[],
+  projection: PublicMarketSummaryProjection = {},
 ): PublicMarketStructureSummary {
-  const expansionCount = countByTransition(
-    assets,
-    (transition) =>
-      transition === "Expansion Phase" || transition === "Active Expansion",
-  );
+  const normalizedAssets =
+    assets.map(
+      (
+        asset,
+      ): PublicMarketStructureAsset => ({
+        activity: toPublicActivityLabel(
+          asset.activity,
+        ),
 
-  const fragmentationCount = countByTransition(
-    assets,
-    (transition) => transition === "Fragmentation Detected",
-  );
+        sparkline_context_7d:
+          toPublicSparklineContext7D(
+            asset.sparkline_context_7d,
+          ),
 
-  const compressionCount = countByTransition(
-    assets,
-    (transition) =>
-      transition === "Compression Phase" || transition === "Stable Structure",
-  );
+        structure_transition:
+          toPublicStructureTransition(
+            asset.structure_transition,
+          ),
+
+        impulse_context:
+          toPublicImpulseContext(
+            asset.impulse_context,
+          ),
+      }),
+    );
+
+  const availableAssets =
+    normalizedAssets.filter(
+      isAvailableStructureAsset,
+    );
+
+  const expansionCount =
+    countByTransition(
+      normalizedAssets,
+      (transition) =>
+        transition === "Expansion Phase" ||
+        transition === "Active Expansion",
+    );
+
+  const fragmentationCount =
+    countByTransition(
+      normalizedAssets,
+      (transition) =>
+        transition ===
+        "Fragmentation Detected",
+    );
+
+  const compressionCount =
+    countByTransition(
+      normalizedAssets,
+      (transition) =>
+        transition ===
+          "Compression Phase" ||
+        transition ===
+          "Stable Structure",
+    );
 
   return {
-    market_climate: resolvePublicMarketClimate(assets),
-    dominant_transition: resolveDominantTransition(assets),
-    activity_context: resolveActivityContext(assets),
-    impulse_context: resolveDominantImpulseContext(assets),
+    market_climate:
+      toPublicMarketClimate(
+        projection.public_market_climate,
+      ),
 
-    growth_context: resolveGrowthContext(assets),
-    core_structure: resolveCoreStructure(assets),
-    decay_context: resolveDecayContext(assets),
+    dominant_transition:
+      resolveDominantTransition(
+        normalizedAssets,
+      ),
 
-    assets_count: assets.length,
-    expansion_count: expansionCount,
-    fragmentation_count: fragmentationCount,
-    compression_count: compressionCount,
+    activity_context:
+      resolveActivityContext(
+        normalizedAssets,
+      ),
+
+    impulse_context:
+      resolveDominantImpulseContext(
+        normalizedAssets,
+      ),
+
+    growth_context:
+      toPublicGrowthContext(
+        projection.public_growth_context,
+      ),
+
+    core_structure:
+      toPublicCoreStructure(
+        projection.public_core_structure,
+      ),
+
+    decay_context:
+      toPublicDecayContext(
+        projection.public_decay_context,
+      ),
+
+    assets_count:
+      normalizedAssets.length,
+
+    available_assets_count:
+      availableAssets.length,
+
+    unavailable_assets_count:
+      Math.max(
+        0,
+        normalizedAssets.length -
+          availableAssets.length,
+      ),
+
+    expansion_count:
+      expansionCount,
+
+    fragmentation_count:
+      fragmentationCount,
+
+    compression_count:
+      compressionCount,
   };
 }

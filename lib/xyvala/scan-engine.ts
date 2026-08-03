@@ -2,60 +2,140 @@
  * FILE: lib/xyvala/scan-engine.ts
  * ----------------------------------------------------------------------------
  * TITLE
- * - Xyvala private scan enrichment engine
+ * - Xyvala private scan RFS propagation engine
  *
  * ROLE
- * - enrich private scan assets with RFS structural readings
- * - enrich private scan assets with Impulse Layer readings
- * - keep analytical computation private
- * - preserve deterministic scan output ordering
+ * - read the canonical Acquisition -> RFS input transport
+ * - execute the canonical RFS producer once per eligible private asset
+ * - propagate validated RFS-owned truths into the private scan contract
+ * - preserve truths owned by Triple Layer, Impulse Layer, Crash System and MCI
+ * - preserve deterministic asset ordering
+ * - build the private market context from enriched private assets
+ *
+ * CLASSIFICATION
+ * - PRIVATE
+ * - COMPUTE
+ * - PROPAGATION
+ * - PURE
+ * - NON-MUTATING
+ *
+ * PARENTS
+ * - Acquisition Layer
+ * - RFS score contract
+ * - RFS producer
+ * - private scan contract
+ *
+ * CONSUMERS
+ * - private scan service
+ * - private snapshot builder
+ * - private analytical aggregation
+ * - private rankings
  *
  * DIRECTIVES
  * - private engine only
  * - no UI logic
- * - no API response building
+ * - no API response construction
  * - no public wording
- * - no MCI recomputation
- * - no calibration logic
- * - no investment advice
- * - no prediction
- * - no buy / sell / hold semantics
- * - real observable data only
- * - deterministic output only
- * - same input => same output
+ * - no timestamp generation
+ * - no observation reconstruction
+ * - no sparkline-to-RFS reconstruction
+ * - no local observation sorting
+ * - no provider-data repair
+ * - no score clamping
+ * - no unavailable-to-zero substitution
+ * - no unavailable-to-neutral substitution
+ * - no Triple Layer computation
+ * - no Impulse Layer computation
+ * - no Crash System computation
+ * - no MCI computation
+ * - no calibration computation
+ * - no market score reconstruction
+ * - no confidence reconstruction
+ * - no persistence
+ * - no event publication
+ * - no runtime mutation
+ * - same canonical input and versions => same canonical output
  *
  * INPUTS
  * - PrivateScanAsset[]
+ * - canonical private RFS input transport carried by each eligible asset
  *
  * OUTPUTS
- * - enriched PrivateScanAsset[]
- * - private market context
+ * - RFS-enriched PrivateScanAsset[]
+ * - deterministic private market context
+ *
+ * OWNERSHIP
+ * - RFS owns:
+ *   - structural axes
+ *   - structural evolution detail
+ *   - pattern truth
+ *   - stability truth
+ *   - RFS regime truth
+ *   - rupture truth
+ *   - rupture evolution truth
+ *   - structural temporal context
+ *
+ * NON-OWNERSHIP
+ * - Triple Layer owns Triple Layer truths
+ * - Impulse Layer owns impulse truths
+ * - Crash System owns crash truths
+ * - Analytical Aggregation owns aggregated contexts
+ * - MCI owns opportunity, confidence and decision truths
+ * - Calibration owns decision policies and thresholds
  *
  * INVARIANTS
- * - RFS remains the structural source
- * - Impulse does not decide
- * - Impulse does not replace stability
- * - Impulse does not replace rupture
- * - Impulse reads pressure only
- * - public transformer decides what can be exposed
+ * - one eligible asset triggers exactly one RFS execution
+ * - RFS receives only the canonical transported observations and metadata
+ * - no RFS input is reconstructed from sparkline_7d
+ * - no downstream analytical truth is overwritten by RFS propagation
+ * - no invalid RFS score is silently clamped
+ * - null remains distinct from zero
+ * - missing RFS input produces an explicit degraded propagation state
+ * - RFS producer failure produces an explicit invalid lineage state
+ * - output ordering remains deterministic
+ *
+ * BOUNDARIES
+ * - Acquisition -> RFS
+ * - RFS -> PrivateScanAsset
+ * - PrivateScanAsset -> private market context
+ *
+ * FIRST DIVERGENCE
+ * - missing canonical RFS transport
+ *   => Acquisition -> RFS
+ *
+ * - valid transport rejected by RFS
+ *   => RFS producer
+ *
+ * - valid RFS result incompatible with private projection
+ *   => RFS -> PrivateScanAsset
+ *
+ * SENSITIVE ZONES
+ * - canonical input transport
+ * - score-domain validation
+ * - ownership separation
+ * - rupture evolution mapping
+ * - lineage propagation
+ * - deterministic sorting
  * ========================================================================== */
 
 import type {
-  PrivateAggregatedContext,
+  PrivateLineageStatus,
+  PrivateRuptureEvolutionState,
   PrivateScanAsset,
-  PrivateScanRegime,
   PrivateScanStatus,
 } from "@/lib/xyvala/contracts/scan-private-contract";
 
-import type { ImpulseAdaptivePolicy } from "@/lib/xyvala/calibration/impulse-adaptive-thresholds";
-
-import { runRFS } from "@/lib/xyvala/rfs-core";
+import type {
+  RfsComputationStatus,
+  RfsPropagationStatus,
+  RfsRuptureEvolutionState,
+  RfsScoreInput,
+  RfsScoreResult,
+} from "@/lib/xyvala/rfs/contracts/rfs-score-contract";
 
 import {
-  computeImpulseState,
-  type ImpulseSignatureInput,
-  type ImpulseTemporalBlock,
-} from "@/lib/xyvala/engine/impulse-state-core";
+  runRFS,
+} from "@/lib/xyvala/rfs-core";
 
 import {
   buildMarketContext,
@@ -63,509 +143,1040 @@ import {
 } from "@/lib/xyvala/market-context";
 
 /* ============================================================================
- * 1. TYPES
+ * 1. PUBLIC TYPES
  * ========================================================================== */
 
-export type ScanEngineSortKey = "stability" | "price";
-export type ScanEngineSortOrder = "asc" | "desc";
+export type ScanEngineSortKey =
+  | "stability"
+  | "price";
 
-export type ScanEngineResult = {
+export type ScanEngineSortOrder =
+  | "asc"
+  | "desc";
+
+export type ScanEngineResult = Readonly<{
   data: PrivateScanAsset[];
   market_context: MarketContext;
-};
+}>;
 
 /* ============================================================================
- * 2. CONSTANTS
+ * 2. INTERNAL TYPES
  * ========================================================================== */
 
-const MIN_RFS_PRICES = 8;
+type RfsProjectionFailureCode =
+  | "scan_engine_rfs_input_unavailable"
+  | "scan_engine_rfs_contract_violation"
+  | "scan_engine_rfs_producer_failure";
 
-/* ============================================================================
- * 3. SAFE HELPERS
- * ========================================================================== */
+type RfsProjectionBoundary =
+  | "Acquisition -> RFS"
+  | "RFS producer"
+  | "RFS -> PrivateScanAsset";
 
-function clampScore(value: unknown): number | null {
-  if (typeof value !== "number" || !Number.isFinite(value)) return null;
-  return Math.max(0, Math.min(100, Math.round(value * 100) / 100));
-}
-
-function clampRate(value: number): number {
-  if (!Number.isFinite(value)) return 0;
-  return Math.max(0, Math.min(1, value));
-}
-
-function safeNumber(value: unknown, fallback = 0): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
-}
-
-function resolvePrices(asset: PrivateScanAsset): number[] {
-  return Array.isArray(asset.sparkline_7d)
-    ? asset.sparkline_7d.filter(
-        (value): value is number =>
-          typeof value === "number" && Number.isFinite(value) && value > 0,
-      )
-    : [];
-}
-
-function resolveStatus(score: number | null): PrivateScanStatus {
-  return score === null ? "unavailable" : "computed";
-}
-
-function resolvePartialStatus(score: number | null): PrivateScanStatus {
-  return score === null ? "partial" : "computed";
-}
-
-function resolveRegime(value: unknown): PrivateScanRegime {
-  if (value === "STABLE") return "STABLE";
-  if (value === "VOLATILE") return "VOLATILE";
-  return "TRANSITION";
-}
-
-/* ============================================================================
- * 4. IMPULSE HELPERS
- * ----------------------------------------------------------------------------
- * ROLE
- * - derive deterministic private impulse inputs
- * - transform observable price structures into impulse-compatible signatures
- * - preserve analytical consistency without reconstructing RFS internals
- *
- * DIRECTIVES
- * - deterministic only
- * - no hidden randomness
- * - no predictive logic
- * - no public wording
- * - no UI logic
- * - no MCI logic
- * - no calibration logic
- * - observable price-derived helpers only
- *
- * INVARIANTS
- * - same input => same output
- * - bounded and finite outputs only
- * - no undefined propagation
- * - helpers remain isolated from public exposure
- * ========================================================================== */
-
-function computePriceReturns(prices: number[]): number[] {
-  const returns: number[] = [];
-
-  for (let index = 1; index < prices.length; index += 1) {
-    const previous = prices[index - 1];
-    const current = prices[index];
-
-    if (
-      typeof previous === "number" &&
-      typeof current === "number" &&
-      Number.isFinite(previous) &&
-      Number.isFinite(current) &&
-      previous > 0
-    ) {
-      returns.push(((current - previous) / previous) * 100);
-    }
-  }
-
-  return returns;
-}
-
-function computeAmplitudePct(prices: number[]): number {
-  if (prices.length < 2) {
-    return 0;
-  }
-
-  const min = Math.min(...prices);
-  const max = Math.max(...prices);
-
-  const last = prices[prices.length - 1];
-
-  if (
-    typeof last !== "number" ||
-    !Number.isFinite(last) ||
-    last <= 0
-  ) {
-    return 0;
-  }
-
-  return ((max - min) / last) * 100;
-}
-
-function computeSlopePct(prices: number[]): number {
-  if (prices.length < 2) {
-    return 0;
-  }
-
-  const first = prices[0];
-  const last = prices[prices.length - 1];
-
-  if (
-    typeof first !== "number" ||
-    typeof last !== "number" ||
-    !Number.isFinite(first) ||
-    !Number.isFinite(last) ||
-    first <= 0
-  ) {
-    return 0;
-  }
-
-  return ((last - first) / first) * 100;
-}
-
-function computeInstabilityScore(prices: number[]): number {
-  const returns = computePriceReturns(prices);
-
-  if (returns.length === 0) {
-    return 0;
-  }
-
-  const mean =
-    returns.reduce((sum, value) => sum + value, 0) / returns.length;
-
-  const variance =
-    returns.reduce(
-      (sum, value) => sum + (value - mean) ** 2,
-      0,
-    ) / returns.length;
-
-  const volatility = Math.sqrt(variance);
-
-  return Math.max(0, Math.min(100, volatility * 12));
-}
-
-function computeBreakRate(prices: number[]): number {
-  const returns = computePriceReturns(prices);
-
-  if (returns.length < 2) {
-    return 0;
-  }
-
-  let breaks = 0;
-
-  for (let index = 1; index < returns.length; index += 1) {
-    const previous = returns[index - 1];
-    const current = returns[index];
-
-    if (
-      typeof previous === "number" &&
-      typeof current === "number" &&
-      Number.isFinite(previous) &&
-      Number.isFinite(current) &&
-      (
-        (previous > 0 && current < 0) ||
-        (previous < 0 && current > 0) ||
-        Math.abs(current) >= 7
-      )
-    ) {
-      breaks += 1;
-    }
-  }
-
-  return clampRate(breaks / (returns.length - 1));
-}
-
-function buildImpulseSignatureFromPrices(
-  prices: number[],
-): ImpulseSignatureInput {
-  return {
-    slope_pct: computeSlopePct(prices),
-
-    amplitude_pct: computeAmplitudePct(prices),
-
-    instability_score: computeInstabilityScore(prices),
-
-    break_rate: computeBreakRate(prices),
-
-    duration_score: Math.max(
-      0,
-      Math.min(100, prices.length * 10),
-    ),
-  };
-}
-
-function buildImpulseTemporalBlock(input: {
-  change_pct: number | null;
-  slope_pct: number | null;
+type RfsProjectionValues = Readonly<{
   stability_score: number | null;
+  structure_score: number | null;
+  coherence_score: number | null;
+
+  occurrence_score: number | null;
+  frequency_score: number | null;
+  convergence_score: number | null;
+  duration_score: number | null;
+  evolution_score: number | null;
+
   rupture_score: number | null;
   rupture_probability: number | null;
-}): ImpulseTemporalBlock {
-  return {
-    change_pct: safeNumber(input.change_pct),
+  rupture_penalty_score: number | null;
 
-    slope_pct: safeNumber(
-      input.slope_pct ?? input.change_pct,
-    ),
+  rupture_occurrence_score: number | null;
+  rupture_frequency_score: number | null;
+  rupture_convergence_score: number | null;
+  rupture_duration_score: number | null;
+  rupture_evolution_score: number | null;
 
-    stability_score: safeNumber(
-      input.stability_score,
-      50,
-    ),
+  rupture_evolution_state: PrivateRuptureEvolutionState;
+  rupture_acceleration_score: number | null;
 
-    rupture_score: safeNumber(
-      input.rupture_score,
-      50,
-    ),
+  continuity_probability: number | null;
+}>;
 
-    rupture_probability: safeNumber(
-      input.rupture_probability,
-      50,
-    ),
-  };
+/* ============================================================================
+ * 3. PURE VALUE READERS
+ * ----------------------------------------------------------------------------
+ * These helpers validate and read values.
+ *
+ * They never:
+ * - clamp
+ * - normalize
+ * - repair
+ * - synthesize
+ * - mutate
+ * ========================================================================== */
+
+function isFiniteNumber(
+  value: unknown,
+): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isFinite(value)
+  );
 }
 
-function buildAggregatedContext(input: {
-  state: string;
-  status: PrivateScanStatus;
-  reason: string | null;
-}): PrivateAggregatedContext {
-  return {
-    state: input.state,
-    status: input.status,
-    reason: input.reason,
-  };
+function isScoreValue(
+  value: unknown,
+): value is number {
+  return (
+    isFiniteNumber(value) &&
+    value >= 0 &&
+    value <= 100
+  );
 }
 
-function buildNeutralImpulse(
-  status: PrivateScanStatus,
-): Pick<
-  PrivateScanAsset,
-  | "impulse_pressure_score"
-  | "impulse_instability_score"
-  | "impulse_saturation_score"
-  | "impulse_exhaustion_score"
-  | "impulse_directional_bias"
-  | "impulse_transition_state"
-  | "impulse_status"
-> {
+function readNullableScore(
+  value: unknown,
+  variableName: string,
+): number | null {
+  if (value === null) {
+    return null;
+  }
+
+  if (!isScoreValue(value)) {
+    throw new RangeError(
+      `SCAN_ENGINE_RFS_SCORE_INVALID: ${variableName} must be null or a finite score between 0 and 100`,
+    );
+  }
+
+  return value;
+}
+
+function readNullableProbability(
+  value: unknown,
+  variableName: string,
+): number | null {
+  return readNullableScore(
+    value,
+    variableName,
+  );
+}
+
+function uniqueWarnings(
+  warnings: readonly string[],
+): string[] {
+  return [
+    ...new Set(
+      warnings.filter(
+        (
+          warning,
+        ): warning is string =>
+          typeof warning === "string" &&
+          warning.trim().length > 0,
+      ),
+    ),
+  ];
+}
+
+function appendPropagationPath(
+  currentPath: readonly string[],
+  additions: readonly string[],
+): string[] {
+  return uniqueWarnings([
+    ...currentPath,
+    ...additions,
+  ]);
+}
+
+function readRfsProjectionBoundary(
+  value: string | null,
+): RfsProjectionBoundary | null {
+  switch (value) {
+    case "Acquisition -> RFS":
+    case "RFS producer":
+    case "RFS -> PrivateScanAsset":
+      return value;
+
+    case null:
+    default:
+      return null;
+  }
+}
+
+/* ============================================================================
+ * 4. CANONICAL RFS INPUT TRANSPORT
+ * ----------------------------------------------------------------------------
+ * CLASSIFICATION
+ * - OBSERVE
+ * - PURE
+ * - NON-MUTATING
+ *
+ * ROLE
+ * - read the canonical Acquisition -> RFS transport
+ *
+ * DIRECTIVES
+ * - no reconstruction from sparkline_7d
+ * - no timestamp generation
+ * - no currency inference
+ * - no version inference
+ * - no local repair
+ * ========================================================================== */
+
+function readCanonicalRfsInput(
+  asset: PrivateScanAsset,
+): Readonly<RfsScoreInput> | null {
+  return asset.rfs_input ?? null;
+}
+
+/* ============================================================================
+ * 5. STATUS MAPPERS
+ * ----------------------------------------------------------------------------
+ * These mappers convert contract vocabulary only.
+ *
+ * They do not change analytical meaning.
+ * ========================================================================== */
+
+function mapRfsComputationStatus(
+  status: RfsComputationStatus,
+): PrivateScanStatus {
+  switch (status) {
+    case "computed":
+      return "computed";
+
+    case "partial":
+    case "insufficient_data":
+      return "partial";
+
+    case "invalid":
+      return "degraded";
+
+    case "unavailable":
+    default:
+      return "unavailable";
+  }
+}
+
+function mapRfsPropagationStatus(
+  status: RfsPropagationStatus,
+): PrivateLineageStatus {
+  switch (status) {
+    case "full":
+      return "valid";
+
+    case "degraded":
+      return "partial";
+
+    case "blocked":
+    default:
+      return "invalid";
+  }
+}
+
+function mapRfsRuptureEvolutionState(
+  state: RfsRuptureEvolutionState,
+): PrivateRuptureEvolutionState {
+  switch (state) {
+    case "EXPLOSIVE":
+      return "explosive";
+
+    case "INCREASING":
+    case "PERSISTENT":
+      return "worsening";
+
+    case "DECREASING":
+      return "improving";
+
+    case "STABLE":
+      return "stable";
+
+    case "INSUFFICIENT_DATA":
+    case "UNAVAILABLE":
+    default:
+      return "unknown";
+  }
+}
+
+/* ============================================================================
+ * 6. RFS RESULT VALIDATION AND PROJECTION
+ * ----------------------------------------------------------------------------
+ * ROLE
+ * - validate the RFS -> PrivateScanAsset boundary
+ * - extract only truths legitimately owned by RFS
+ *
+ * DIRECTIVES
+ * - no score clamping
+ * - no alias creation
+ * - no market score reconstruction
+ * - no confidence reconstruction
+ * - no crash reconstruction
+ * - no decision regime overwrite
+ * - no Triple Layer growth overwrite
+ * ========================================================================== */
+
+function readRfsProjectionValues(
+  rfs: RfsScoreResult,
+): RfsProjectionValues {
   return {
-    impulse_pressure_score: null,
+    stability_score:
+      readNullableScore(
+        rfs.stability
+          .stability_score,
+        "stability.stability_score",
+      ),
 
-    impulse_instability_score: null,
+    structure_score:
+      readNullableScore(
+        rfs.stability
+          .structure_score,
+        "stability.structure_score",
+      ),
 
-    impulse_saturation_score: null,
+    coherence_score:
+      readNullableScore(
+        rfs.stability
+          .coherence_score,
+        "stability.coherence_score",
+      ),
 
-    impulse_exhaustion_score: null,
+    occurrence_score:
+      readNullableScore(
+        rfs.structural_axes
+          .occurrence_score,
+        "structural_axes.occurrence_score",
+      ),
 
-    impulse_directional_bias: "NEUTRAL",
+    frequency_score:
+      readNullableScore(
+        rfs.structural_axes
+          .frequency_score,
+        "structural_axes.frequency_score",
+      ),
 
-    impulse_transition_state: "NEUTRAL",
+    convergence_score:
+      readNullableScore(
+        rfs.structural_axes
+          .convergence_score,
+        "structural_axes.convergence_score",
+      ),
 
-    impulse_status: status,
+    duration_score:
+      readNullableScore(
+        rfs.structural_axes
+          .duration_score,
+        "structural_axes.duration_score",
+      ),
+
+    evolution_score:
+      readNullableScore(
+        rfs.structural_axes
+          .evolution_score,
+        "structural_axes.evolution_score",
+      ),
+
+    rupture_score:
+      readNullableScore(
+        rfs.rupture
+          .rupture_score,
+        "rupture.rupture_score",
+      ),
+
+    rupture_probability:
+      readNullableProbability(
+        rfs.rupture
+          .rupture_probability,
+        "rupture.rupture_probability",
+      ),
+
+    rupture_penalty_score:
+      readNullableScore(
+        rfs.rupture
+          .rupture_penalty_score,
+        "rupture.rupture_penalty_score",
+      ),
+
+    rupture_occurrence_score:
+      readNullableScore(
+        rfs.rupture.axes
+          .rupture_occurrence_score,
+        "rupture.axes.rupture_occurrence_score",
+      ),
+
+    rupture_frequency_score:
+      readNullableScore(
+        rfs.rupture.axes
+          .rupture_frequency_score,
+        "rupture.axes.rupture_frequency_score",
+      ),
+
+    rupture_convergence_score:
+      readNullableScore(
+        rfs.rupture.axes
+          .rupture_convergence_score,
+        "rupture.axes.rupture_convergence_score",
+      ),
+
+    rupture_duration_score:
+      readNullableScore(
+        rfs.rupture.axes
+          .rupture_duration_score,
+        "rupture.axes.rupture_duration_score",
+      ),
+
+    rupture_evolution_score:
+      readNullableScore(
+        rfs.rupture.axes
+          .rupture_evolution_score,
+        "rupture.axes.rupture_evolution_score",
+      ),
+
+    rupture_evolution_state:
+      mapRfsRuptureEvolutionState(
+        rfs.rupture.evolution
+          .rupture_evolution_state,
+      ),
+
+    rupture_acceleration_score:
+      readNullableScore(
+        rfs.rupture.evolution
+          .rupture_acceleration_score,
+        "rupture.evolution.rupture_acceleration_score",
+      ),
+
+    continuity_probability:
+      readNullableProbability(
+        rfs.rupture
+          .continuity_probability,
+        "rupture.continuity_probability",
+      ),
   };
 }
 
 /* ============================================================================
- * 5. RFS + IMPULSE ENRICHMENT
+ * 7. CONTROLLED RFS DEGRADATION
+ * ----------------------------------------------------------------------------
+ * These factories invalidate only RFS-owned flattened values.
+ *
+ * They deliberately preserve:
+ * - market_score
+ * - regime
+ * - crash_score
+ * - crash_state
+ * - Triple Layer values
+ * - Impulse Layer values
+ * - aggregated contexts
+ * - confidence values
+ * - opportunity values
+ * - decisions
+ * - calibration values
+ *
+ * growth_score is deliberately preserved because the current flattened private
+ * contract contains an unresolved RFS / Triple Layer identity collision.
  * ========================================================================== */
+
+function buildUnavailableRfsAsset(
+  asset: PrivateScanAsset,
+  input: {
+    status: PrivateScanStatus;
+    warning: RfsProjectionFailureCode;
+    lineage_status: PrivateLineageStatus;
+    last_valid_boundary: RfsProjectionBoundary | null;
+    first_invalid_boundary: RfsProjectionBoundary;
+  },
+): PrivateScanAsset {
+  return {
+    ...asset,
+
+    stability_score:
+      null,
+
+    stability_status:
+      input.status,
+
+    structure_score:
+      null,
+
+    coherence_score:
+      null,
+
+    occurrence_score:
+      null,
+
+    frequency_score:
+      null,
+
+    convergence_score:
+      null,
+
+    duration_score:
+      null,
+
+    evolution_score:
+      null,
+
+    rupture_score:
+      null,
+
+    rupture_probability:
+      null,
+
+    rupture_penalty_score:
+      null,
+
+    rupture_occurrence_score:
+      null,
+
+    rupture_frequency_score:
+      null,
+
+    rupture_convergence_score:
+      null,
+
+    rupture_duration_score:
+      null,
+
+    rupture_evolution_score:
+      null,
+
+    rupture_evolution_state:
+      "unknown",
+
+    rupture_acceleration_score:
+      null,
+
+    continuity_probability:
+      null,
+
+    governance: {
+      ...asset.governance,
+
+      warnings:
+        uniqueWarnings([
+          ...asset.governance
+            .warnings,
+          input.warning,
+        ]),
+
+      lineage_status:
+        input.lineage_status,
+
+      last_valid_boundary:
+        input.last_valid_boundary,
+
+      first_invalid_boundary:
+        input.first_invalid_boundary,
+    },
+  };
+}
+
+function buildMissingRfsInputAsset(
+  asset: PrivateScanAsset,
+): PrivateScanAsset {
+  return buildUnavailableRfsAsset(
+    asset,
+    {
+      status:
+        "partial",
+
+      warning:
+        "scan_engine_rfs_input_unavailable",
+
+      lineage_status:
+        asset.governance
+          .lineage_status === "invalid"
+          ? "invalid"
+          : "partial",
+
+      last_valid_boundary:
+        readRfsProjectionBoundary(
+          asset.governance
+            .last_valid_boundary,
+        ),
+
+      first_invalid_boundary:
+        "Acquisition -> RFS",
+    },
+  );
+}
+
+function buildRfsContractViolationAsset(
+  asset: PrivateScanAsset,
+): PrivateScanAsset {
+  return buildUnavailableRfsAsset(
+    asset,
+    {
+      status:
+        "degraded",
+
+      warning:
+        "scan_engine_rfs_contract_violation",
+
+      lineage_status:
+        "invalid",
+
+      last_valid_boundary:
+        "RFS producer",
+
+      first_invalid_boundary:
+        "RFS -> PrivateScanAsset",
+    },
+  );
+}
+
+function buildRfsProducerFailureAsset(
+  asset: PrivateScanAsset,
+): PrivateScanAsset {
+  return buildUnavailableRfsAsset(
+    asset,
+    {
+      status:
+        "degraded",
+
+      warning:
+        "scan_engine_rfs_producer_failure",
+
+      lineage_status:
+        "invalid",
+
+      last_valid_boundary:
+        "Acquisition -> RFS",
+
+      first_invalid_boundary:
+        "RFS producer",
+    },
+  );
+}
+
+/* ============================================================================
+ * 8. CANONICAL RFS PROPAGATION
+ * ----------------------------------------------------------------------------
+ * ROLE
+ * - execute one RFS evaluation per eligible asset
+ * - validate the producer output
+ * - propagate RFS-owned values without reconstruction
+ * - preserve all non-RFS values carried by the private asset
+ *
+ * CLASSIFICATION
+ * - COMPUTE
+ * - PRIVATE
+ * - PURE
+ * - NON-MUTATING
+ *
+ * INVARIANTS
+ * - exactly one runRFS call per eligible asset
+ * - no second analytical pass
+ * - no local fallback calculation
+ * - no crash assignment
+ * - no confidence assignment
+ * - no market_score assignment
+ * - no decision regime assignment
+ * - no growth_score assignment until collision migration is completed
+ * ========================================================================== */
+
+function projectRfsResult(
+  asset: PrivateScanAsset,
+  rfs: RfsScoreResult,
+): PrivateScanAsset {
+  const projection =
+    readRfsProjectionValues(
+      rfs,
+    );
+
+  return {
+    ...asset,
+
+    stability_score:
+      projection
+        .stability_score,
+
+    stability_status:
+      mapRfsComputationStatus(
+        rfs.stability.status,
+      ),
+
+    structure_score:
+      projection
+        .structure_score,
+
+    coherence_score:
+      projection
+        .coherence_score,
+
+    occurrence_score:
+      projection
+        .occurrence_score,
+
+    frequency_score:
+      projection
+        .frequency_score,
+
+    convergence_score:
+      projection
+        .convergence_score,
+
+    duration_score:
+      projection
+        .duration_score,
+
+    evolution_score:
+      projection
+        .evolution_score,
+
+    rupture_score:
+      projection
+        .rupture_score,
+
+    rupture_probability:
+      projection
+        .rupture_probability,
+
+    rupture_penalty_score:
+      projection
+        .rupture_penalty_score,
+
+    rupture_occurrence_score:
+      projection
+        .rupture_occurrence_score,
+
+    rupture_frequency_score:
+      projection
+        .rupture_frequency_score,
+
+    rupture_convergence_score:
+      projection
+        .rupture_convergence_score,
+
+    rupture_duration_score:
+      projection
+        .rupture_duration_score,
+
+    rupture_evolution_score:
+      projection
+        .rupture_evolution_score,
+
+    rupture_evolution_state:
+      projection
+        .rupture_evolution_state,
+
+    rupture_acceleration_score:
+      projection
+        .rupture_acceleration_score,
+
+    continuity_probability:
+      projection
+        .continuity_probability,
+
+    /*
+     * INTENTIONALLY PRESERVED NON-RFS TRUTHS
+     * ----------------------------------------
+     * The object spread preserves:
+     *
+     * - regime
+     *   Current flattened contract ownership belongs to PrivateDecisionLayer.
+     *   A distinct rfs_regime field requires a versioned migration.
+     *
+     * - growth_score
+     *   Current flattened contract contains an unresolved RFS / Triple Layer
+     *   identity collision. RFS must not overwrite Triple Layer truth.
+     *
+     * - market_score
+     *   Not present in the canonical RFS v2 result.
+     *
+     * - crash_score / crash_state
+     *   Owned by Crash System.
+     *
+     * - confidence_score / confidence_status
+     *   Owned by MCI.
+     *
+     * - all Triple Layer, Impulse, Aggregation, Decision and Calibration fields
+     *   Owned by their respective authoritative layers.
+     */
+
+    governance: {
+      ...asset.governance,
+
+      analytical_version:
+        rfs.analytical_version,
+
+      warnings:
+        uniqueWarnings([
+          ...asset.governance
+            .warnings,
+
+          ...rfs.validation_issues.map(
+            (issue) =>
+              issue.code,
+          ),
+        ]),
+
+      deterministic:
+        true,
+
+      jurisdiction:
+        "FR/EU",
+
+      default_currency:
+        "EUR",
+
+      lineage_status:
+        mapRfsPropagationStatus(
+          rfs.propagation_status,
+        ),
+
+      source_layer:
+        "RFS",
+
+      source_contract:
+        `${rfs.contract_name}@${rfs.contract_version}`,
+
+      propagation_path:
+        appendPropagationPath(
+          asset.governance
+            .propagation_path,
+          [
+            "Acquisition",
+            "RFS",
+            "PrivateScanAsset",
+          ],
+        ),
+
+      last_valid_boundary:
+        rfs.propagation_status ===
+          "blocked"
+          ? "Acquisition -> RFS"
+          : "RFS -> PrivateScanAsset",
+
+      first_invalid_boundary:
+        rfs.propagation_status ===
+          "blocked"
+          ? "RFS -> PrivateScanAsset"
+          : null,
+    },
+  };
+}
 
 export function applyRFS(
-  data: PrivateScanAsset[],
-  adaptivePolicy?: ImpulseAdaptivePolicy,
+  data: readonly PrivateScanAsset[],
 ): PrivateScanAsset[] {
-  return data.map((asset) => {
-    const prices = resolvePrices(asset);
+  return data.map(
+    (asset) => {
+      const rfsInput =
+        readCanonicalRfsInput(
+          asset,
+        );
 
-    if (prices.length < MIN_RFS_PRICES) {
-      return {
-        ...asset,
-        stability_score: null,
-        stability_status: "partial",
-        regime: "TRANSITION",
-        structure_score: null,
-        market_score: null,
-        coherence_score: null,
-        rupture_score: null,
-        rupture_probability: null,
-        rupture_penalty_score: null,
-        continuity_probability: null,
-        confidence_score: null,
-        confidence_status: "partial",
-        ...buildNeutralImpulse("partial"),
-        governance: {
-          ...asset.governance,
-          warnings: [
-            ...asset.governance.warnings,
-            "scan_engine_insufficient_rfs_prices",
-          ],
-        },
-      };
-    }
+      if (rfsInput === null) {
+        return buildMissingRfsInputAsset(
+          asset,
+        );
+      }
 
-    try {
-      const rfs = runRFS({ prices });
+      let rfs:
+        RfsScoreResult;
 
-      const stability = clampScore(rfs.stability);
-      const structure = clampScore(rfs.structure_score);
-      const market = clampScore(rfs.market_score);
-      const coherence = clampScore(rfs.coherence_score);
-      const rupture = clampScore(rfs.rupture_score);
-      const ruptureProbability = clampScore(rfs.rupture_probability);
-      const rupturePenalty = clampScore(rfs.rupture_penalty_score);
-      const continuity = clampScore(rfs.continuity_probability);
-      const confidence = clampScore(rfs.confidence_score);
+      try {
+        rfs =
+          runRFS(
+            rfsInput,
+          );
+      } catch {
+        return buildRfsProducerFailureAsset(
+          asset,
+        );
+      }
 
-      const impulse = computeImpulseState({
-        current_signature: buildImpulseSignatureFromPrices(prices),
-
-        occurrence_score: safeNumber(clampScore(rfs.occurrence_score)),
-        frequency_score: safeNumber(clampScore(rfs.frequency_score)),
-        convergence_score: safeNumber(clampScore(rfs.convergence_score)),
-        correlation_score: safeNumber(clampScore(rfs.correlation_score)),
-        duration_score: safeNumber(clampScore(rfs.duration_score)),
-
-        rupture_probability: safeNumber(ruptureProbability),
-        rupture_penalty_score: safeNumber(rupturePenalty),
-
-        stability: safeNumber(stability),
-        coherence_score: safeNumber(coherence),
-
-        rolling_7d: buildImpulseTemporalBlock({
-          change_pct: asset.chg_7d_pct,
-          slope_pct: asset.chg_7d_pct,
-          stability_score: stability,
-          rupture_score: rupture,
-          rupture_probability: ruptureProbability,
-        }),
-
-        rolling_24h: buildImpulseTemporalBlock({
-          change_pct: asset.chg_24h_pct,
-          slope_pct: asset.chg_24h_pct,
-          stability_score: stability,
-          rupture_score: rupture,
-          rupture_probability: ruptureProbability,
-        }),
-
-        ...(adaptivePolicy !== undefined
-          ? { adaptive_policy: adaptivePolicy }
-          : {}),
-      });
-
-      return {
-        ...asset,
-
-        stability_score: stability,
-        stability_status: resolveStatus(stability),
-
-        structure_score: structure,
-        market_score: market,
-        coherence_score: coherence,
-
-        occurrence_score: clampScore(rfs.occurrence_score),
-        frequency_score: clampScore(rfs.frequency_score),
-        convergence_score: clampScore(rfs.convergence_score),
-        duration_score: clampScore(rfs.duration_score),
-
-        rupture_score: rupture,
-        rupture_probability: ruptureProbability,
-        rupture_penalty_score: rupturePenalty,
-        rupture_occurrence_score: clampScore(rfs.rupture_occurrence_score),
-        rupture_frequency_score: clampScore(rfs.rupture_frequency_score),
-        rupture_convergence_score: clampScore(rfs.rupture_convergence_score),
-        rupture_duration_score: clampScore(rfs.rupture_duration_score),
-
-        crash_score: clampScore(rfs.crash_score),
-        crash_state:
-          rfs.crash_state === "NONE" ||
-          rfs.crash_state === "RISING" ||
-          rfs.crash_state === "CRASH"
-            ? rfs.crash_state
-            : "UNKNOWN",
-
-        impulse_pressure_score: impulse.impulse_pressure_score,
-        impulse_instability_score: impulse.impulse_instability_score,
-        impulse_saturation_score: impulse.impulse_saturation_score,
-        impulse_exhaustion_score: impulse.impulse_exhaustion_score,
-        impulse_directional_bias: impulse.impulse_directional_bias,
-        impulse_transition_state: impulse.impulse_transition_state,
-        impulse_status: "computed",
-
-        continuity_probability: continuity,
-
-        confidence_score: confidence,
-        confidence_status: resolvePartialStatus(confidence),
-
-        regime: resolveRegime(rfs.regime),
-
-        governance: {
-          ...asset.governance,
-          warnings: asset.governance.warnings,
-        },
-      };
-    } catch {
-      return {
-        ...asset,
-        stability_score: null,
-        stability_status: "degraded",
-        regime: "TRANSITION",
-        structure_score: null,
-        market_score: null,
-        coherence_score: null,
-        rupture_score: null,
-        rupture_probability: null,
-        rupture_penalty_score: null,
-        continuity_probability: null,
-        confidence_score: null,
-        confidence_status: "degraded",
-        ...buildNeutralImpulse("degraded"),
-        governance: {
-          ...asset.governance,
-          warnings: [...asset.governance.warnings, "scan_engine_rfs_failed"],
-        },
-      };
-    }
-  });
+      try {
+        return projectRfsResult(
+          asset,
+          rfs,
+        );
+      } catch {
+        return buildRfsContractViolationAsset(
+          asset,
+        );
+      }
+    },
+  );
 }
 
 /* ============================================================================
- * 6. SORTING
+ * 9. DETERMINISTIC INTERNAL ORDERING
+ * ----------------------------------------------------------------------------
+ * This ordering is an internal operational projection.
+ *
+ * It is not:
+ * - an opportunity ranking
+ * - a transition ranking
+ * - an Impulse ranking
+ * - a decision ranking
+ * - a public ranking
+ *
+ * Null or unavailable values are placed after valid values independently of
+ * requested sort direction.
  * ========================================================================== */
 
+function compareNullableNumbers(
+  left: number | null,
+  right: number | null,
+  direction: 1 | -1,
+): number {
+  const leftValid =
+    isFiniteNumber(left);
+
+  const rightValid =
+    isFiniteNumber(right);
+
+  if (
+    leftValid &&
+    !rightValid
+  ) {
+    return -1;
+  }
+
+  if (
+    !leftValid &&
+    rightValid
+  ) {
+    return 1;
+  }
+
+  if (
+    !leftValid &&
+    !rightValid
+  ) {
+    return 0;
+  }
+
+  if (left === right) {
+    return 0;
+  }
+
+  return (
+    (
+      left as number
+    ) -
+    (
+      right as number
+    )
+  ) * direction;
+}
+
 export function sortAssets(
-  data: PrivateScanAsset[],
+  data: readonly PrivateScanAsset[],
   key: ScanEngineSortKey,
   order: ScanEngineSortOrder,
 ): PrivateScanAsset[] {
-  const direction = order === "asc" ? 1 : -1;
+  const direction:
+    1 | -1 =
+      order === "asc"
+        ? 1
+        : -1;
 
-  return [...data].sort((a, b) => {
-    const left = key === "price" ? a.price : a.stability_score;
-    const right = key === "price" ? b.price : b.stability_score;
+  return [...data].sort(
+    (
+      leftAsset,
+      rightAsset,
+    ) => {
+      const leftValue =
+        key === "price"
+          ? leftAsset.price
+          : leftAsset
+              .stability_score;
 
-    const leftValid = typeof left === "number" && Number.isFinite(left);
-    const rightValid = typeof right === "number" && Number.isFinite(right);
+      const rightValue =
+        key === "price"
+          ? rightAsset.price
+          : rightAsset
+              .stability_score;
 
-    if (leftValid !== rightValid) return leftValid ? -1 : 1;
-    if (!leftValid && !rightValid) return a.symbol.localeCompare(b.symbol);
+      const valueComparison =
+        compareNullableNumbers(
+          leftValue,
+          rightValue,
+          direction,
+        );
 
-    if (left !== right) {
-      return ((left as number) - (right as number)) * direction;
-    }
+      if (
+        valueComparison !== 0
+      ) {
+        return valueComparison;
+      }
 
-    return a.symbol.localeCompare(b.symbol);
-  });
+      const symbolComparison =
+        leftAsset.symbol.localeCompare(
+          rightAsset.symbol,
+          "en",
+          {
+            sensitivity:
+              "base",
+          },
+        );
+
+      if (
+        symbolComparison !== 0
+      ) {
+        return symbolComparison;
+      }
+
+      return leftAsset.id.localeCompare(
+        rightAsset.id,
+        "en",
+        {
+          sensitivity:
+            "base",
+        },
+      );
+    },
+  );
 }
 
 /* ============================================================================
- * 7. PUBLIC EXECUTION
+ * 10. PRIVATE SCAN EXECUTION
+ * ----------------------------------------------------------------------------
+ * ROLE
+ * - apply canonical RFS propagation
+ * - perform deterministic internal ordering
+ * - build private market context
+ *
+ * DIRECTIVES
+ * - no public projection
+ * - no Impulse policy
+ * - no calibration policy
+ * - no ranking score creation
+ * - no mutation
  * ========================================================================== */
 
-export function buildScanEngineResult(input: {
-  data: PrivateScanAsset[];
-  key?: ScanEngineSortKey;
-  order?: ScanEngineSortOrder;
-  adaptive_policy?: ImpulseAdaptivePolicy;
-}): ScanEngineResult {
-  const enriched = applyRFS(
-    input.data,
-    input.adaptive_policy,
-  );
+export function buildScanEngineResult(
+  input: Readonly<{
+    data:
+      readonly PrivateScanAsset[];
 
-  const sorted = sortAssets(
-    enriched,
-    input.key ?? "stability",
-    input.order ?? "desc",
-  );
+    key?:
+      ScanEngineSortKey;
+
+    order?:
+      ScanEngineSortOrder;
+  }>,
+): ScanEngineResult {
+  const enriched =
+    applyRFS(
+      input.data,
+    );
+
+  const sorted =
+    sortAssets(
+      enriched,
+
+      input.key ??
+        "stability",
+
+      input.order ??
+        "desc",
+    );
 
   return {
-    data: sorted,
-    market_context: buildMarketContext(sorted),
+    data:
+      sorted,
+
+    market_context:
+      buildMarketContext(
+        sorted,
+      ),
   };
 }

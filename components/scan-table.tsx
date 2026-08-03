@@ -4,68 +4,135 @@
  * FILE: components/scan-table.tsx
  * ----------------------------------------------------------------------------
  * TITLE
- * - Xyvala public structural market interface
+ * - Xyvala canonical public structural market interface
  *
  * ROLE
- * - render public ScanAsset data
- * - display public structural labels produced upstream
- * - display governed public ranking projections
- * - keep UI components passive and deterministic
+ * - consume canonical public ScanAsset contracts
+ * - consume the canonical public display policy
+ * - render the complete public market context
+ * - render governed structural transition highlights
+ * - render searchable desktop and mobile market views
+ * - preserve one normalized public view model for every responsive projection
+ *
+ * CLASSIFICATION
+ * - PUBLIC
+ * - INTERFACE
+ * - READ / FILTER / RENDER
+ * - CLIENT COMPONENT
+ * - NON-ANALYTICAL
+ *
+ * POSITION IN OFFICIAL CHAIN
+ * - Acquisition
+ * - RFS
+ * - Triple Layer
+ * - Impulse Layer
+ * - Analytical Aggregation System
+ * - MCI
+ * - Calibration
+ * - Snapshot
+ * - Private/Public Transformers
+ * - Public Contracts
+ * - Public Rankings
+ * - Public Display Policy
+ * - API
+ * - Interface
  *
  * PARENTS
  * - lib/xyvala/contracts/scan-contract.ts
  * - lib/xyvala/public/public-structure.ts
+ * - lib/xyvala/public/public-display-policy.ts
  * - lib/xyvala/rankings/structural-transition-ranking.ts
  * - components/sparkline.tsx
  *
+ * CONSUMERS
+ * - public scan page
+ *
  * DIRECTIVES
  * - public UI only
+ * - no private contract dependency
  * - no private score usage
- * - no local structural reconstruction
- * - no local ranking policy
  * - no RFS recomputation
+ * - no Triple Layer recomputation
+ * - no Impulse Layer recomputation
  * - no MCI recomputation
  * - no calibration exposure
- * - no decision exposure
- * - no opportunity exposure
+ * - no public analytical reconstruction
+ * - no local public classification policy
+ * - no local public label policy
+ * - no local monetary formatting policy
+ * - no local availability substitution
+ * - no synthetic rank
+ * - no unavailable-to-neutral substitution
+ * - no malformed asset identity repair
+ * - no local ranking policy
+ * - no public ranking recomputation
+ * - no provider parsing
  * - no investment advice
- * - one public data source for desktop and mobile
- * - UI displays public labels and governed rankings only
- * - search affects market rows only
- * - search must not alter global market context
- * - search must not alter structural transition highlights
+ * - desktop and mobile consume the same normalized public data
+ * - search affects visible market rows only
+ * - search does not affect global market context
+ * - search does not affect transition highlights
  *
  * INPUTS
  * - public ScanAsset collection
- * - public quote
- * - optional visible market-row limit
+ * - explicit public quote
+ * - optional public language
+ * - optional public source
+ * - optional upstream update timestamp
+ * - optional visible row limit
  *
  * OUTPUTS
  * - public market context
- * - structural transition highlights
- * - searchable public market structure table
- * - searchable public mobile asset cards
+ * - governed structural transition highlights
+ * - searchable desktop market table
+ * - searchable mobile market cards
+ * - public metadata and disclaimer
+ *
+ * OWNERSHIP
+ * - public contracts own public analytical truth
+ * - public-structure.ts owns public market aggregation
+ * - structural-transition-ranking.ts owns highlight ordering
+ * - public-display-policy.ts owns labels and representation
+ * - this component owns responsive rendering and local search only
  *
  * INVARIANTS
- * - UI never creates analytical truth
- * - UI never creates ranking policy
- * - UI never recalculates public structural labels
- * - market context reads the complete normalized universe
- * - transition ranking reads the complete normalized universe
- * - search and limit affect visible market rows only
- * - desktop and mobile consume the same visible data
+ * - one public asset produces one normalized interface view model
+ * - desktop and mobile views use the same visible collection
+ * - transition cards use the same normalized asset identities
+ * - malformed public identities are rejected, never repaired
+ * - missing rank remains unavailable
+ * - missing transition remains unavailable
+ * - missing logo never blocks asset rendering
+ * - null remains unavailable
+ * - zero remains a valid public value
+ * - USDT is never displayed as EUR or USD
+ * - public display strings come from the canonical display policy
+ * - transition ranking consumes the complete qualified universe
+ * - market summary consumes the complete qualified universe
+ * - search result count is an interface-only observable
  *
- * CRITICAL DEPENDENCIES
- * - lib/xyvala/contracts/scan-contract.ts
- * - lib/xyvala/public/public-structure.ts
- * - lib/xyvala/rankings/structural-transition-ranking.ts
+ * FIRST DIVERGENCE
+ * - malformed public ScanAsset
+ *   => private/public transformer or public contract
+ *
+ * - valid public value incorrectly represented
+ *   => public-display-policy.ts
+ *
+ * - incorrect transition highlight order
+ *   => structural-transition-ranking.ts
+ *
+ * - desktop/mobile display divergence
+ *   => this component
  *
  * SENSITIVE ZONES
  * - public/private boundary
+ * - public-state validation
+ * - unavailable versus neutral semantics
+ * - responsive data consistency
  * - complete-universe preservation
- * - governed ranking consumption
- * - search isolation
- * - desktop/mobile data consistency
+ * - ranking consumption
+ * - logo rendering
+ * - European monetary representation
  * ========================================================================== */
 
 import React, {
@@ -76,7 +143,9 @@ import React, {
 
 import { Sparkline } from "./sparkline";
 
-import type { ScanAsset } from "@/lib/xyvala/contracts/scan-contract";
+import type {
+  ScanAsset,
+} from "@/lib/xyvala/contracts/scan-contract";
 
 import {
   buildPublicMarketStructureSummary,
@@ -91,6 +160,32 @@ import {
 } from "@/lib/xyvala/public/public-structure";
 
 import {
+  buildPublicAssetLogoAlt,
+  formatPublicActivityLabel,
+  formatPublicCompactMonetaryValue,
+  formatPublicCoreStructureLabel,
+  formatPublicCount,
+  formatPublicDateTime,
+  formatPublicDecayContextLabel,
+  formatPublicGrowthContextLabel,
+  formatPublicImpulseContextLabel,
+  formatPublicMarketClimateLabel,
+  formatPublicNullableText,
+  formatPublicPercentage,
+  formatPublicPrice,
+  formatPublicRank,
+  formatPublicSparklineContext7DLabel,
+  formatPublicStructureTransitionLabel,
+  getPublicDisplayDefinition,
+  getPublicDisclaimer,
+  isPublicDisplayCurrency,
+  resolvePublicDisplayPolicy,
+  type PublicDisplayCurrency,
+  type PublicDisplayLanguage,
+  type PublicDisplayPolicy,
+} from "@/lib/xyvala/public/public-display-policy";
+
+import {
   getStructuralTransitionHighlights,
 } from "@/lib/xyvala/rankings/structural-transition-ranking";
 
@@ -98,117 +193,237 @@ import {
  * 1. TYPES
  * ========================================================================== */
 
-type Quote = "EUR" | "USD" | "USDT";
+type AssetInput =
+  Partial<ScanAsset>;
 
-type AssetInput = Partial<ScanAsset>;
+type PublicAssetViewModel =
+  Readonly<{
+    key:
+      string;
 
-type Asset = {
-  key: string;
-  rank: number | null;
+    id:
+      string;
 
-  symbol: string;
-  name: string;
-  logoUrl: string | null;
+    rank:
+      number | null;
 
-  price: number | null;
-  pct24h: number | null;
-  pct7d: number | null;
+    symbol:
+      string;
 
-  marketCap: number | null;
-  volume24h: number | null;
+    name:
+      string;
 
-  sparkline: number[] | null;
+    logo_url:
+      string | null;
 
-  activity: PublicActivityLabel;
-  sparklineContext7D: PublicSparklineContext7D;
-  transition: PublicStructureTransition;
-  impulseContext: PublicImpulseContext;
-};
+    price:
+      number | null;
 
-type Props = {
-  assets: unknown;
-  quote?: Quote | string;
-  limit?: number;
-};
+    change_24h_pct:
+      number | null;
+
+    change_7d_pct:
+      number | null;
+
+    market_cap:
+      number | null;
+
+    volume_24h:
+      number | null;
+
+    sparkline_7d:
+      number[] | null;
+
+    activity:
+      PublicActivityLabel;
+
+    sparkline_context_7d:
+      PublicSparklineContext7D;
+
+    structural_transition:
+      PublicStructureTransition | null;
+
+    impulse_context:
+      PublicImpulseContext;
+  }>;
+
+type QualifiedPublicAssetViewModel =
+  PublicAssetViewModel &
+  Readonly<{
+    structural_transition:
+      PublicStructureTransition;
+  }>;
+
+type Props =
+  Readonly<{
+    assets:
+      unknown;
+
+    quote?:
+      PublicDisplayCurrency |
+      string;
+
+    language?:
+      PublicDisplayLanguage;
+
+    updatedAt?:
+      string |
+      number |
+      Date |
+      null;
+
+    dataSource?:
+      string |
+      null;
+
+    limit?:
+      number;
+  }>;
+
+type ContextCardProps =
+  Readonly<{
+    label:
+      string;
+
+    value:
+      string;
+
+    definition?:
+      string;
+
+    emphasized?:
+      boolean;
+  }>;
 
 /* ============================================================================
- * 2. SAFE HELPERS
+ * 2. SAFE PRIMITIVE READERS
+ * ----------------------------------------------------------------------------
+ * These helpers validate public contract values only.
+ *
+ * They never:
+ * - classify
+ * - translate
+ * - infer
+ * - repair identity
+ * - create analytical defaults
  * ========================================================================== */
 
-function safeString(
+function readNonEmptyString(
   value: unknown,
-  fallback = "",
-): string {
-  return typeof value === "string" &&
-    value.trim().length > 0
-    ? value.trim()
-    : fallback;
+): string | null {
+  if (
+    typeof value !== "string"
+  ) {
+    return null;
+  }
+
+  const normalized =
+    value.trim();
+
+  return normalized.length > 0
+    ? normalized
+    : null;
 }
 
-function safeNumberOrNull(
+function readFiniteNumber(
   value: unknown,
 ): number | null {
-  return typeof value === "number" &&
+  return (
+    typeof value === "number" &&
     Number.isFinite(value)
+  )
     ? value
     : null;
 }
 
-function safeRank(value: unknown): number | null {
-  const parsed = safeNumberOrNull(value);
-
-  return parsed !== null && parsed > 0
-    ? Math.trunc(parsed)
+function readPositiveInteger(
+  value: unknown,
+): number | null {
+  return (
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    Number.isInteger(value) &&
+    value > 0
+  )
+    ? value
     : null;
 }
 
-function safeArrayNumbers(
+function readNumberArray(
   value: unknown,
 ): number[] | null {
-  if (!Array.isArray(value)) {
+  if (
+    !Array.isArray(value) ||
+    value.length < 2
+  ) {
     return null;
   }
 
-  const points = value.filter(
-    (item): item is number =>
-      typeof item === "number" &&
-      Number.isFinite(item),
-  );
+  if (
+    !value.every(
+      (
+        point,
+      ): point is number =>
+        typeof point === "number" &&
+        Number.isFinite(point),
+    )
+  ) {
+    return null;
+  }
 
-  return points.length >= 2 ? points : null;
+  return [
+    ...value,
+  ];
 }
 
-function normalizeQuote(
-  value: Quote | string,
-): Quote {
-  const quote = safeString(value).toUpperCase();
+function readLogoUrl(
+  value: unknown,
+): string | null {
+  const normalized =
+    readNonEmptyString(
+      value,
+    );
 
-  if (quote === "USD") {
-    return "USD";
+  if (normalized === null) {
+    return null;
   }
 
-  if (quote === "USDT") {
-    return "USDT";
+  if (
+    normalized.startsWith(
+      "https://",
+    ) ||
+    normalized.startsWith(
+      "/",
+    )
+  ) {
+    return normalized;
   }
 
-  return "EUR";
+  return null;
 }
 
 function normalizeSourceAssets(
   value: unknown,
-): unknown[] | null {
-  if (!value) {
-    return null;
-  }
-
+): readonly unknown[] | null {
   if (Array.isArray(value)) {
     return value;
   }
 
-  if (typeof value === "object") {
-    const record = value as Record<string, unknown>;
+  if (
+    typeof value === "object" &&
+    value !== null
+  ) {
+    const record =
+      value as Record<
+        string,
+        unknown
+      >;
 
-    if (Array.isArray(record.data)) {
+    if (
+      Array.isArray(
+        record.data,
+      )
+    ) {
       return record.data;
     }
   }
@@ -216,184 +431,250 @@ function normalizeSourceAssets(
   return null;
 }
 
+function normalizeLimit(
+  value: number,
+): number {
+  if (
+    !Number.isFinite(value) ||
+    !Number.isInteger(value) ||
+    value <= 0
+  ) {
+    return 250;
+  }
+
+  return value;
+}
+
+function resolveDisplayCurrency(
+  value:
+    PublicDisplayCurrency |
+    string |
+    undefined,
+): PublicDisplayCurrency {
+  const normalized =
+    typeof value === "string"
+      ? value.trim().toUpperCase()
+      : value;
+
+  return isPublicDisplayCurrency(
+    normalized,
+  )
+    ? normalized
+    : "EUR";
+}
+
 /* ============================================================================
- * 3. PUBLIC LABEL NORMALIZERS
+ * 3. PUBLIC CONTRACT STATE READERS
+ * ----------------------------------------------------------------------------
+ * Unknown public states remain unavailable.
+ *
+ * The interface does not replace invalid or unknown states with:
+ * - Neutral
+ * - Stable
+ * - Low
+ * - any other valid analytical classification
  * ========================================================================== */
 
-function normalizePublicActivity(
+function readPublicActivity(
   value: unknown,
 ): PublicActivityLabel {
-  if (value === "Low") {
-    return "Low";
-  }
+  switch (value) {
+    case "Low":
+    case "Normal":
+    case "High":
+    case "Unavailable":
+      return value;
 
-  if (value === "Normal") {
-    return "Normal";
+    default:
+      return "Unavailable";
   }
-
-  if (value === "High") {
-    return "High";
-  }
-
-  return "Unavailable";
 }
 
-function normalizeSparklineContext7D(
+function readPublicSparklineContext7D(
   value: unknown,
 ): PublicSparklineContext7D {
-  if (value === "Compression") {
-    return "Compression";
-  }
+  switch (value) {
+    case "Compression":
+    case "Expansion":
+    case "Recovery":
+    case "Fragmented":
+    case "Stable":
+    case "Neutral":
+    case "Unavailable":
+      return value;
 
-  if (value === "Expansion") {
-    return "Expansion";
+    default:
+      return "Unavailable";
   }
-
-  if (value === "Recovery") {
-    return "Recovery";
-  }
-
-  if (value === "Fragmented") {
-    return "Fragmented";
-  }
-
-  if (value === "Stable") {
-    return "Stable";
-  }
-
-  if (value === "Neutral") {
-    return "Neutral";
-  }
-
-  return "Unavailable";
 }
 
-function normalizeStructureTransition(
+function readPublicStructureTransition(
   value: unknown,
-): PublicStructureTransition {
-  if (value === "Compression Phase") {
-    return "Compression Phase";
-  }
+): PublicStructureTransition | null {
+  switch (value) {
+    case "Compression Phase":
+    case "Expansion Phase":
+    case "Recovery Structure":
+    case "Fragmentation Detected":
+    case "Stable Structure":
+    case "Active Expansion":
+    case "Neutral Structure":
+      return value;
 
-  if (value === "Expansion Phase") {
-    return "Expansion Phase";
+    default:
+      return null;
   }
-
-  if (value === "Recovery Structure") {
-    return "Recovery Structure";
-  }
-
-  if (value === "Fragmentation Detected") {
-    return "Fragmentation Detected";
-  }
-
-  if (value === "Stable Structure") {
-    return "Stable Structure";
-  }
-
-  if (value === "Active Expansion") {
-    return "Active Expansion";
-  }
-
-  return "Neutral Structure";
 }
 
-function normalizeImpulseContext(
+function readPublicImpulseContext(
   value: unknown,
 ): PublicImpulseContext {
-  if (value === "Compression") {
-    return "Compression";
-  }
+  switch (value) {
+    case "Compression":
+    case "Pressure Building":
+    case "Release":
+    case "Exhaustion":
+    case "Neutral":
+    case "Unavailable":
+      return value;
 
-  if (value === "Pressure Building") {
-    return "Pressure Building";
+    default:
+      return "Unavailable";
   }
-
-  if (value === "Release") {
-    return "Release";
-  }
-
-  if (value === "Exhaustion") {
-    return "Exhaustion";
-  }
-
-  if (value === "Neutral") {
-    return "Neutral";
-  }
-
-  return "Unavailable";
 }
 
 /* ============================================================================
- * 4. ASSET NORMALIZATION
+ * 4. CANONICAL PUBLIC VIEW-MODEL ADAPTATION
+ * ----------------------------------------------------------------------------
+ * The UI accepts only complete public identities.
+ *
+ * Missing identity is not repaired with:
+ * - UNKNOWN
+ * - row index
+ * - symbol-derived identifiers
+ * - provider aliases
  * ========================================================================== */
 
-function normalizeAsset(input: AssetInput): Asset {
-  const symbol = safeString(
-    input.symbol,
-    "UNKNOWN",
-  ).toUpperCase();
+function adaptPublicAsset(
+  input: AssetInput,
+): PublicAssetViewModel | null {
+  const id =
+    readNonEmptyString(
+      input.id,
+    );
 
-  const name = safeString(
-    input.name,
-    symbol,
-  );
+  const symbol =
+    readNonEmptyString(
+      input.symbol,
+    );
 
-  return {
-    key: safeString(input.id, symbol),
-    rank: safeRank(input.rank),
+  const name =
+    readNonEmptyString(
+      input.name,
+    );
 
-    symbol,
+  if (
+    id === null ||
+    symbol === null ||
+    name === null
+  ) {
+    return null;
+  }
+
+  const canonicalSymbol =
+    symbol.toUpperCase();
+
+  return Object.freeze({
+    key:
+      id,
+
+    id,
+
+    rank:
+      readPositiveInteger(
+        input.rank,
+      ),
+
+    symbol:
+      canonicalSymbol,
+
     name,
 
-    logoUrl:
-      safeString(input.logo_url) || null,
+    logo_url:
+      readLogoUrl(
+        input.logo_url,
+      ),
 
     price:
-      safeNumberOrNull(input.price),
+      readFiniteNumber(
+        input.price,
+      ),
 
-    pct24h:
-      safeNumberOrNull(input.chg_24h_pct),
+    change_24h_pct:
+      readFiniteNumber(
+        input.chg_24h_pct,
+      ),
 
-    pct7d:
-      safeNumberOrNull(input.chg_7d_pct),
+    change_7d_pct:
+      readFiniteNumber(
+        input.chg_7d_pct,
+      ),
 
-    marketCap:
-      safeNumberOrNull(input.market_cap),
+    market_cap:
+      readFiniteNumber(
+        input.market_cap,
+      ),
 
-    volume24h:
-      safeNumberOrNull(input.volume_24h),
+    volume_24h:
+      readFiniteNumber(
+        input.volume_24h,
+      ),
 
-    sparkline:
-      safeArrayNumbers(input.sparkline_7d),
+    sparkline_7d:
+      readNumberArray(
+        input.sparkline_7d,
+      ),
 
     activity:
-      normalizePublicActivity(
+      readPublicActivity(
         input.public_activity,
       ),
 
-    sparklineContext7D:
-      normalizeSparklineContext7D(
-        input.public_sparkline_context_7d,
+    sparkline_context_7d:
+      readPublicSparklineContext7D(
+        input
+          .public_sparkline_context_7d,
       ),
 
-    transition:
-      normalizeStructureTransition(
-        input.public_structure_transition,
+    structural_transition:
+      readPublicStructureTransition(
+        input
+          .public_structure_transition,
       ),
 
-    impulseContext:
-      normalizeImpulseContext(
-        input.public_impulse_context,
+    impulse_context:
+      readPublicImpulseContext(
+        input
+          .public_impulse_context,
       ),
-  };
+  });
+}
+
+function isQualifiedPublicAsset(
+  asset:
+    PublicAssetViewModel,
+): asset is QualifiedPublicAssetViewModel {
+  return (
+    asset.structural_transition !==
+    null
+  );
 }
 
 /* ============================================================================
- * 5. FORMATTERS
+ * 5. PRESENTATION HELPERS
  * ========================================================================== */
 
-function resolveValueClass(
+function resolveChangeClassName(
   value: number | null,
 ): string {
   if (value === null) {
@@ -411,64 +692,142 @@ function resolveValueClass(
   return "valueNeutral";
 }
 
-function formatPrice(
-  value: number | null,
-  quote: Quote,
-): string {
-  if (value === null) {
-    return "–";
-  }
+/* ============================================================================
+ * 6. SHARED ASSET IDENTITY
+ * ----------------------------------------------------------------------------
+ * Logo rendering failure affects presentation only.
+ *
+ * It never changes:
+ * - public identity
+ * - analytical status
+ * - ranking
+ * ========================================================================== */
 
-  const currency =
-    quote === "USD" ? "USD" : "EUR";
+function AssetIdentity({
+  asset,
+  policy,
+  compact = false,
+}: {
+  asset:
+    PublicAssetViewModel;
 
-  return new Intl.NumberFormat("fr-FR", {
-    style: "currency",
-    currency,
-    maximumFractionDigits:
-      value < 1 ? 6 : 2,
-  }).format(value);
-}
+  policy:
+    PublicDisplayPolicy;
 
-function formatPct(
-  value: number | null,
-): string {
-  if (value === null) {
-    return "–";
-  }
+  compact?:
+    boolean;
+}) {
+  const [
+    imageUnavailable,
+    setImageUnavailable,
+  ] =
+    useState(false);
 
-  return `${value > 0 ? "+" : ""}${value.toFixed(2)}%`;
-}
+  const showImage =
+    asset.logo_url !== null &&
+    !imageUnavailable;
 
-function formatCompactCurrency(
-  value: number | null,
-  quote: Quote,
-): string {
-  if (value === null) {
-    return "–";
-  }
+  const logoAlt =
+    buildPublicAssetLogoAlt(
+      {
+        asset_name:
+          asset.name,
 
-  const currency =
-    quote === "USD" ? "USD" : "EUR";
+        asset_symbol:
+          asset.symbol,
+      },
 
-  return new Intl.NumberFormat("fr-FR", {
-    style: "currency",
-    currency,
-    notation: "compact",
-    maximumFractionDigits: 2,
-  }).format(value);
-}
+      policy,
+    );
 
-function formatRank(
-  value: number | null,
-  fallback: number,
-): string {
-  return String(value ?? fallback);
+  return (
+    <div
+      className={
+        compact
+          ? "assetIdentity assetIdentityCompact"
+          : "assetIdentity"
+      }
+    >
+      <div
+        className="assetLogoFrame"
+        title={
+          showImage
+            ? logoAlt
+            : policy.labels.logo_unavailable
+        }
+      >
+        {showImage ? (
+          <img
+            className="assetLogo"
+            src={asset.logo_url ?? undefined}
+            alt={logoAlt}
+            loading="lazy"
+            decoding="async"
+            referrerPolicy="no-referrer"
+            onError={() =>
+              setImageUnavailable(
+                true,
+              )
+            }
+          />
+        ) : (
+          <span
+            className="assetLogoFallback"
+            aria-label={
+              policy.labels
+                .logo_unavailable
+            }
+          >
+            {asset.symbol.slice(
+              0,
+              2,
+            )}
+          </span>
+        )}
+      </div>
+
+      <div className="assetIdentityText">
+        <strong>
+          {asset.symbol}
+        </strong>
+
+        <span>
+          {asset.name}
+        </span>
+      </div>
+    </div>
+  );
 }
 
 /* ============================================================================
- * 6. VIEW COMPONENTS
+ * 7. CONTEXT CARDS
  * ========================================================================== */
+
+function ContextCard({
+  label,
+  value,
+  definition,
+  emphasized = false,
+}: ContextCardProps) {
+  return (
+    <div
+      className={
+        emphasized
+          ? "contextCard contextCardMain"
+          : "contextCard"
+      }
+      title={definition}
+    >
+      <span>
+        {label}
+      </span>
+
+      <strong>
+        {value}
+      </strong>
+    </div>
+  );
+}
 
 function ContextBand({
   marketClimate,
@@ -478,440 +837,1277 @@ function ContextBand({
   coreStructure,
   decayContext,
   activityContext,
-  assetsCount,
+  assetsAnalysed,
+  qualifiedAssets,
+  policy,
 }: {
-  marketClimate: PublicMarketClimate;
+  marketClimate:
+    PublicMarketClimate;
+
   dominantTransition:
-    | PublicStructureTransition
-    | "Unavailable";
-  impulseContext: PublicImpulseContext;
-  growthContext: PublicGrowthContext;
-  coreStructure: PublicCoreStructure;
-  decayContext: PublicDecayContext;
-  activityContext: PublicActivityLabel;
-  assetsCount: number;
+    PublicStructureTransition |
+    "Unavailable";
+
+  impulseContext:
+    PublicImpulseContext;
+
+  growthContext:
+    PublicGrowthContext;
+
+  coreStructure:
+    PublicCoreStructure;
+
+  decayContext:
+    PublicDecayContext;
+
+  activityContext:
+    PublicActivityLabel;
+
+  assetsAnalysed:
+    number;
+
+  qualifiedAssets:
+    number;
+
+  policy:
+    PublicDisplayPolicy;
 }) {
   return (
     <div className="contextBand">
-      <div className="contextCard contextCardMain">
-        <span>Market Climate</span>
-        <strong>{marketClimate}</strong>
-      </div>
+      <ContextCard
+        emphasized
+        label={
+          policy.labels
+            .market_structure_context
+        }
+        value={
+          formatPublicMarketClimateLabel(
+            marketClimate,
+            policy,
+          )
+        }
+        definition={
+          getPublicDisplayDefinition(
+            "market_structure_context",
+            policy,
+          )
+        }
+      />
 
-      <div className="contextCard">
-        <span>Dominant Transition</span>
-        <strong>{dominantTransition}</strong>
-      </div>
+      <ContextCard
+        label={
+          policy.labels
+            .dominant_structural_transition
+        }
+        value={
+          dominantTransition ===
+          "Unavailable"
+            ? policy.labels
+                .unavailable
+            : formatPublicStructureTransitionLabel(
+                dominantTransition,
+                policy,
+              )
+        }
+        definition={
+          getPublicDisplayDefinition(
+            "dominant_structural_transition",
+            policy,
+          )
+        }
+      />
 
-      <div className="contextCard">
-        <span>Impulse Context</span>
-        <strong>{impulseContext}</strong>
-      </div>
+      <ContextCard
+        label={
+          policy.labels
+            .structural_impulse_context
+        }
+        value={
+          formatPublicImpulseContextLabel(
+            impulseContext,
+            policy,
+          )
+        }
+        definition={
+          getPublicDisplayDefinition(
+            "structural_impulse_context",
+            policy,
+          )
+        }
+      />
 
-      <div className="contextCard">
-        <span>Activity</span>
-        <strong>{activityContext}</strong>
-      </div>
+      <ContextCard
+        label={
+          policy.labels
+            .structural_activity
+        }
+        value={
+          formatPublicActivityLabel(
+            activityContext,
+            policy,
+          )
+        }
+        definition={
+          getPublicDisplayDefinition(
+            "structural_activity",
+            policy,
+          )
+        }
+      />
 
-      <div className="contextCard">
-        <span>Growth Context</span>
-        <strong>{growthContext}</strong>
-      </div>
+      <ContextCard
+        label={
+          policy.labels
+            .structural_reinforcement
+        }
+        value={
+          formatPublicGrowthContextLabel(
+            growthContext,
+            policy,
+          )
+        }
+        definition={
+          getPublicDisplayDefinition(
+            "structural_reinforcement",
+            policy,
+          )
+        }
+      />
 
-      <div className="contextCard">
-        <span>Core Structure</span>
-        <strong>{coreStructure}</strong>
-      </div>
+      <ContextCard
+        label={
+          policy.labels
+            .core_structure
+        }
+        value={
+          formatPublicCoreStructureLabel(
+            coreStructure,
+            policy,
+          )
+        }
+        definition={
+          getPublicDisplayDefinition(
+            "core_structure",
+            policy,
+          )
+        }
+      />
 
-      <div className="contextCard">
-        <span>Decay Context</span>
-        <strong>{decayContext}</strong>
-      </div>
+      <ContextCard
+        label={
+          policy.labels
+            .structural_erosion
+        }
+        value={
+          formatPublicDecayContextLabel(
+            decayContext,
+            policy,
+          )
+        }
+        definition={
+          getPublicDisplayDefinition(
+            "structural_erosion",
+            policy,
+          )
+        }
+      />
 
-      <div className="contextCard">
-        <span>Assets Read</span>
-        <strong>{assetsCount}</strong>
-      </div>
+      <ContextCard
+        label={
+          policy.labels
+            .assets_analysed
+        }
+        value={
+          formatPublicCount(
+            assetsAnalysed,
+            policy,
+          )
+        }
+        definition={
+          getPublicDisplayDefinition(
+            "assets_analysed",
+            policy,
+          )
+        }
+      />
+
+      <ContextCard
+        label={
+          policy.labels
+            .fully_qualified_assets
+        }
+        value={
+          formatPublicCount(
+            qualifiedAssets,
+            policy,
+          )
+        }
+      />
     </div>
   );
 }
 
+/* ============================================================================
+ * 8. PUBLIC METADATA
+ * ========================================================================== */
+
+function PublicMetadata({
+  updatedAt,
+  dataSource,
+  currency,
+  policy,
+}: {
+  updatedAt:
+    string |
+    number |
+    Date |
+    null;
+
+  dataSource:
+    string |
+    null;
+
+  currency:
+    PublicDisplayCurrency;
+
+  policy:
+    PublicDisplayPolicy;
+}) {
+  return (
+    <div className="publicMetadata">
+      <div>
+        <span>
+          {
+            policy.labels
+              .reference_currency
+          }
+        </span>
+
+        <strong>
+          {currency}
+        </strong>
+      </div>
+
+      {updatedAt !== null ? (
+        <div>
+          <span>
+            {
+              policy.labels
+                .last_updated
+            }
+          </span>
+
+          <strong>
+            {formatPublicDateTime(
+              updatedAt,
+              policy,
+            )}
+          </strong>
+        </div>
+      ) : null}
+
+      {dataSource !== null ? (
+        <div>
+          <span>
+            {
+              policy.labels
+                .data_source
+            }
+          </span>
+
+          <strong>
+            {formatPublicNullableText(
+              dataSource,
+              policy,
+            )}
+          </strong>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/* ============================================================================
+ * 9. STRUCTURAL TRANSITION HIGHLIGHTS
+ * ========================================================================== */
+
 function TransitionPanel({
   assets,
+  currency,
+  policy,
 }: {
-  assets: Asset[];
+  assets:
+    readonly QualifiedPublicAssetViewModel[];
+
+  currency:
+    PublicDisplayCurrency;
+
+  policy:
+    PublicDisplayPolicy;
 }) {
   return (
     <section className="transitionPanel">
       <div className="transitionPanelHeader">
-        <h2>Structural Transitions</h2>
-      </div>
+        <div>
+          <h2>
+            {
+              policy.labels
+                .structural_transitions
+            }
+          </h2>
 
-      <div className="transitionGrid">
-        {assets.map((asset) => (
-          <article
-            className="transitionCard"
-            key={`transition-${asset.key}`}
+          <p
+            title={
+              getPublicDisplayDefinition(
+                "structural_transition",
+                policy,
+              )
+            }
           >
-            <div>
-              <strong>{asset.symbol}</strong>
-              <span>{asset.name}</span>
-            </div>
-
-            <div className="transitionCardSpark">
-              <Sparkline
-                data={asset.sparkline}
-                animated
-              />
-            </div>
-
-            <div>
-              <span>Transition</span>
-              <p>{asset.transition}</p>
-            </div>
-
-            <div>
-              <span>Impulse</span>
-              <p>{asset.impulseContext}</p>
-            </div>
-          </article>
-        ))}
+            {
+              getPublicDisplayDefinition(
+                "dominant_structural_transition",
+                policy,
+              )
+            }
+          </p>
+        </div>
       </div>
+
+      {assets.length === 0 ? (
+        <div className="emptyState">
+          {
+            policy.labels
+              .no_qualified_transition
+          }
+        </div>
+      ) : (
+        <div className="transitionGrid">
+          {assets.map(
+            (
+              asset,
+            ) => (
+              <article
+                className="transitionCard"
+                key={
+                  `transition-${asset.key}`
+                }
+              >
+                <div className="transitionCardIdentity">
+                  <AssetIdentity
+                    asset={asset}
+                    policy={policy}
+                    compact
+                  />
+
+                  <span>
+                    {formatPublicRank(
+                      asset.rank,
+                      policy,
+                    )}
+                  </span>
+                </div>
+
+                <div className="transitionCardPrice">
+                  <strong>
+                    {formatPublicPrice(
+                      asset.price,
+                      currency,
+                      policy,
+                    )}
+                  </strong>
+
+                  <span
+                    className={
+                      resolveChangeClassName(
+                        asset
+                          .change_7d_pct,
+                      )
+                    }
+                  >
+                    {formatPublicPercentage(
+                      asset
+                        .change_7d_pct,
+
+                      {},
+
+                      policy,
+                    )}
+                  </span>
+                </div>
+
+                <div className="transitionCardSpark">
+                  <Sparkline
+                    data={
+                      asset.sparkline_7d
+                    }
+                    animated
+                  />
+                </div>
+
+                <div>
+                  <span>
+                    {
+                      policy.labels
+                        .structural_transition
+                    }
+                  </span>
+
+                  <p>
+                    {formatPublicStructureTransitionLabel(
+                      asset
+                        .structural_transition,
+                      policy,
+                    )}
+                  </p>
+                </div>
+
+                <div>
+                  <span>
+                    {
+                      policy.labels
+                        .structural_impulse_context
+                    }
+                  </span>
+
+                  <p>
+                    {formatPublicImpulseContextLabel(
+                      asset
+                        .impulse_context,
+                      policy,
+                    )}
+                  </p>
+                </div>
+
+                <div>
+                  <span>
+                    {
+                      policy.labels
+                        .sparkline_context_7d
+                    }
+                  </span>
+
+                  <p>
+                    {formatPublicSparklineContext7DLabel(
+                      asset
+                        .sparkline_context_7d,
+                      policy,
+                    )}
+                  </p>
+                </div>
+              </article>
+            ),
+          )}
+        </div>
+      )}
     </section>
   );
 }
 
+/* ============================================================================
+ * 10. DESKTOP MARKET TABLE
+ * ========================================================================== */
+
 function DesktopMarketTable({
   assets,
-  quote,
+  currency,
+  policy,
 }: {
-  assets: Asset[];
-  quote: Quote;
+  assets:
+    readonly PublicAssetViewModel[];
+
+  currency:
+    PublicDisplayCurrency;
+
+  policy:
+    PublicDisplayPolicy;
 }) {
   return (
     <div className="desktopMarketTable">
       <table className="table">
         <thead>
           <tr>
-            <th>#</th>
-            <th>Asset</th>
-            <th>Price</th>
-            <th>24H</th>
-            <th>7D</th>
-            <th>Activity</th>
-            <th>Impulse</th>
-            <th>Volume</th>
-            <th>Market Cap</th>
-            <th>Transition</th>
+            <th
+              title={
+                getPublicDisplayDefinition(
+                  "market_cap_rank",
+                  policy,
+                )
+              }
+            >
+              #
+            </th>
+
+            <th>
+              {
+                policy.labels
+                  .asset
+              }
+            </th>
+
+            <th>
+              {
+                policy.labels
+                  .price
+              }
+            </th>
+
+            <th>
+              {
+                policy.labels
+                  .change_24h
+              }
+            </th>
+
+            <th>
+              {
+                policy.labels
+                  .change_7d
+              }
+            </th>
+
+            <th>
+              {
+                policy.labels
+                  .sparkline_7d
+              }
+            </th>
+
+            <th
+              title={
+                getPublicDisplayDefinition(
+                  "sparkline_context_7d",
+                  policy,
+                )
+              }
+            >
+              {
+                policy.labels
+                  .sparkline_context_7d
+              }
+            </th>
+
+            <th
+              title={
+                getPublicDisplayDefinition(
+                  "structural_activity",
+                  policy,
+                )
+              }
+            >
+              {
+                policy.labels
+                  .structural_activity
+              }
+            </th>
+
+            <th
+              title={
+                getPublicDisplayDefinition(
+                  "structural_impulse_context",
+                  policy,
+                )
+              }
+            >
+              {
+                policy.labels
+                  .structural_impulse_context
+              }
+            </th>
+
+            <th>
+              {
+                policy.labels
+                  .trading_volume_24h
+              }
+            </th>
+
+            <th>
+              {
+                policy.labels
+                  .market_capitalisation
+              }
+            </th>
+
+            <th
+              title={
+                getPublicDisplayDefinition(
+                  "structural_transition",
+                  policy,
+                )
+              }
+            >
+              {
+                policy.labels
+                  .structural_transition
+              }
+            </th>
           </tr>
         </thead>
 
         <tbody>
-          {assets.map((asset, index) => (
-            <tr key={asset.key}>
-              <td>
-                {formatRank(
-                  asset.rank,
-                  index + 1,
-                )}
-              </td>
+          {assets.map(
+            (
+              asset,
+            ) => (
+              <tr key={asset.key}>
+                <td>
+                  {formatPublicRank(
+                    asset.rank,
+                    policy,
+                  )}
+                </td>
 
-              <td>
-                <strong>{asset.symbol}</strong>
-                <div>{asset.name}</div>
-              </td>
+                <td>
+                  <AssetIdentity
+                    asset={asset}
+                    policy={policy}
+                  />
+                </td>
 
-              <td className="dynamicPrice">
-                {formatPrice(
-                  asset.price,
-                  quote,
-                )}
-              </td>
+                <td className="dynamicPrice">
+                  {formatPublicPrice(
+                    asset.price,
+                    currency,
+                    policy,
+                  )}
+                </td>
 
-              <td
-                className={`dynamicPct24h ${resolveValueClass(
-                  asset.pct24h,
-                )}`}
-              >
-                {formatPct(asset.pct24h)}
-              </td>
+                <td
+                  className={
+                    `dynamicPct24h ${resolveChangeClassName(
+                      asset
+                        .change_24h_pct,
+                    )}`
+                  }
+                >
+                  {formatPublicPercentage(
+                    asset
+                      .change_24h_pct,
 
-              <td>
-                <Sparkline
-                  data={asset.sparkline}
-                  animated
-                />
-              </td>
+                    {},
 
-              <td>{asset.activity}</td>
-              <td>{asset.impulseContext}</td>
+                    policy,
+                  )}
+                </td>
 
-              <td>
-                {formatCompactCurrency(
-                  asset.volume24h,
-                  quote,
-                )}
-              </td>
+                <td
+                  className={
+                    resolveChangeClassName(
+                      asset
+                        .change_7d_pct,
+                    )
+                  }
+                >
+                  {formatPublicPercentage(
+                    asset
+                      .change_7d_pct,
 
-              <td>
-                {formatCompactCurrency(
-                  asset.marketCap,
-                  quote,
-                )}
-              </td>
+                    {},
 
-              <td>{asset.transition}</td>
-            </tr>
-          ))}
+                    policy,
+                  )}
+                </td>
+
+                <td>
+                  <Sparkline
+                    data={
+                      asset.sparkline_7d
+                    }
+                    animated
+                  />
+                </td>
+
+                <td>
+                  {formatPublicSparklineContext7DLabel(
+                    asset
+                      .sparkline_context_7d,
+                    policy,
+                  )}
+                </td>
+
+                <td>
+                  {formatPublicActivityLabel(
+                    asset.activity,
+                    policy,
+                  )}
+                </td>
+
+                <td>
+                  {formatPublicImpulseContextLabel(
+                    asset
+                      .impulse_context,
+                    policy,
+                  )}
+                </td>
+
+                <td>
+                  {formatPublicCompactMonetaryValue(
+                    asset
+                      .volume_24h,
+                    currency,
+                    policy,
+                  )}
+                </td>
+
+                <td>
+                  {formatPublicCompactMonetaryValue(
+                    asset.market_cap,
+                    currency,
+                    policy,
+                  )}
+                </td>
+
+                <td>
+                  {formatPublicStructureTransitionLabel(
+                    asset
+                      .structural_transition,
+                    policy,
+                  )}
+                </td>
+              </tr>
+            ),
+          )}
         </tbody>
       </table>
     </div>
   );
 }
 
+/* ============================================================================
+ * 11. MOBILE MARKET CARDS
+ * ========================================================================== */
+
 function MobileMarketCards({
   assets,
-  quote,
+  currency,
+  policy,
 }: {
-  assets: Asset[];
-  quote: Quote;
+  assets:
+    readonly PublicAssetViewModel[];
+
+  currency:
+    PublicDisplayCurrency;
+
+  policy:
+    PublicDisplayPolicy;
 }) {
   return (
     <div className="mobileMarketCards">
-      {assets.map((asset, index) => (
-        <article
-          className="mobileAssetCard"
-          key={`mobile-${asset.key}`}
-        >
-          <div className="mobileAssetHeader">
-            <div>
-              <span>
-                #
-                {formatRank(
-                  asset.rank,
-                  index + 1,
-                )}
-              </span>
+      {assets.map(
+        (
+          asset,
+        ) => (
+          <article
+            className="mobileAssetCard"
+            key={
+              `mobile-${asset.key}`
+            }
+          >
+            <div className="mobileAssetHeader">
+              <div>
+                <span>
+                  #
+                  {formatPublicRank(
+                    asset.rank,
+                    policy,
+                  )}
+                </span>
 
-              <strong>{asset.symbol}</strong>
-              <p>{asset.name}</p>
+                <AssetIdentity
+                  asset={asset}
+                  policy={policy}
+                  compact
+                />
+              </div>
+
+              <div className="mobileAssetPrice">
+                <strong className="dynamicPrice">
+                  {formatPublicPrice(
+                    asset.price,
+                    currency,
+                    policy,
+                  )}
+                </strong>
+
+                <span
+                  className={
+                    `dynamicPct24h ${resolveChangeClassName(
+                      asset
+                        .change_24h_pct,
+                    )}`
+                  }
+                >
+                  {formatPublicPercentage(
+                    asset
+                      .change_24h_pct,
+
+                    {},
+
+                    policy,
+                  )}
+                </span>
+              </div>
             </div>
 
-            <div className="mobileAssetPrice">
-              <strong className="dynamicPrice">
-                {formatPrice(
-                  asset.price,
-                  quote,
-                )}
-              </strong>
+            <div className="mobileSparkline">
+              <Sparkline
+                data={
+                  asset.sparkline_7d
+                }
+                animated
+              />
 
               <span
-                className={`dynamicPct24h ${resolveValueClass(
-                  asset.pct24h,
-                )}`}
+                className={
+                  resolveChangeClassName(
+                    asset
+                      .change_7d_pct,
+                  )
+                }
               >
-                {formatPct(asset.pct24h)}
+                {formatPublicPercentage(
+                  asset
+                    .change_7d_pct,
+
+                  {},
+
+                  policy,
+                )}
               </span>
             </div>
-          </div>
 
-          <div className="mobileSparkline">
-            <Sparkline
-              data={asset.sparkline}
-              animated
-            />
-          </div>
+            <div className="mobileAssetMeta">
+              <div>
+                <span>
+                  {
+                    policy.labels
+                      .structural_transition
+                  }
+                </span>
 
-          <div className="mobileAssetMeta">
-            <div>
-              <span>Transition</span>
-              <strong>{asset.transition}</strong>
+                <strong>
+                  {formatPublicStructureTransitionLabel(
+                    asset
+                      .structural_transition,
+                    policy,
+                  )}
+                </strong>
+              </div>
+
+              <div>
+                <span>
+                  {
+                    policy.labels
+                      .structural_impulse_context
+                  }
+                </span>
+
+                <strong>
+                  {formatPublicImpulseContextLabel(
+                    asset
+                      .impulse_context,
+                    policy,
+                  )}
+                </strong>
+              </div>
+
+              <div>
+                <span>
+                  {
+                    policy.labels
+                      .structural_activity
+                  }
+                </span>
+
+                <strong>
+                  {formatPublicActivityLabel(
+                    asset.activity,
+                    policy,
+                  )}
+                </strong>
+              </div>
+
+              <div>
+                <span>
+                  {
+                    policy.labels
+                      .sparkline_context_7d
+                  }
+                </span>
+
+                <strong>
+                  {formatPublicSparklineContext7DLabel(
+                    asset
+                      .sparkline_context_7d,
+                    policy,
+                  )}
+                </strong>
+              </div>
+
+              <div>
+                <span>
+                  {
+                    policy.labels
+                      .trading_volume_24h
+                  }
+                </span>
+
+                <strong>
+                  {formatPublicCompactMonetaryValue(
+                    asset
+                      .volume_24h,
+                    currency,
+                    policy,
+                  )}
+                </strong>
+              </div>
+
+              <div>
+                <span>
+                  {
+                    policy.labels
+                      .market_capitalisation
+                  }
+                </span>
+
+                <strong>
+                  {formatPublicCompactMonetaryValue(
+                    asset
+                      .market_cap,
+                    currency,
+                    policy,
+                  )}
+                </strong>
+              </div>
             </div>
-
-            <div>
-              <span>Impulse</span>
-              <strong>{asset.impulseContext}</strong>
-            </div>
-
-            <div>
-              <span>Activity</span>
-              <strong>{asset.activity}</strong>
-            </div>
-
-            <div>
-              <span>Volume</span>
-              <strong>
-                {formatCompactCurrency(
-                  asset.volume24h,
-                  quote,
-                )}
-              </strong>
-            </div>
-
-            <div>
-              <span>Market Cap</span>
-              <strong>
-                {formatCompactCurrency(
-                  asset.marketCap,
-                  quote,
-                )}
-              </strong>
-            </div>
-          </div>
-        </article>
-      ))}
+          </article>
+        ),
+      )}
     </div>
   );
 }
 
 /* ============================================================================
- * 7. MAIN COMPONENT
+ * 12. MAIN COMPONENT
  * ========================================================================== */
 
 export default function ScanTable({
   assets,
   quote = "EUR",
+  language = "en",
+  updatedAt = null,
+  dataSource = null,
   limit = 250,
 }: Props) {
-  const [query, setQuery] = useState("");
+  const [
+    query,
+    setQuery,
+  ] =
+    useState("");
 
   const deferredQuery =
-    useDeferredValue(query);
+    useDeferredValue(
+      query,
+    );
 
-  const normalizedQuote =
-    normalizeQuote(quote);
+  const currency =
+    resolveDisplayCurrency(
+      quote,
+    );
+
+  const policy =
+    useMemo(
+      () =>
+        resolvePublicDisplayPolicy({
+          language,
+
+          default_currency:
+            currency,
+        }),
+      [
+        language,
+        currency,
+      ],
+    );
 
   const sourceAssets =
-    normalizeSourceAssets(assets);
+    useMemo(
+      () =>
+        normalizeSourceAssets(
+          assets,
+        ),
+      [
+        assets,
+      ],
+    );
+
+  const normalizedLimit =
+    normalizeLimit(
+      limit,
+    );
 
   /*
    * Complete normalized public universe.
    *
    * This collection remains independent from:
-   * - UI search
-   * - UI limit
-   * - desktop/mobile projections
+   * - search
+   * - visible row limit
+   * - desktop/mobile rendering
+   * - transition highlight count
    */
-  const normalizedData = useMemo<Asset[]>(() => {
-    if (!sourceAssets) {
-      return [];
-    }
+  const normalizedData =
+    useMemo<
+      PublicAssetViewModel[]
+    >(
+      () => {
+        if (
+          sourceAssets === null
+        ) {
+          return [];
+        }
 
-    return sourceAssets.map((asset) =>
-      normalizeAsset(asset as AssetInput),
+        const normalized:
+          PublicAssetViewModel[] =
+          [];
+
+        for (
+          const candidate of
+          sourceAssets
+        ) {
+          if (
+            typeof candidate !==
+              "object" ||
+            candidate === null
+          ) {
+            continue;
+          }
+
+          const asset =
+            adaptPublicAsset(
+              candidate as
+                AssetInput,
+            );
+
+          if (asset !== null) {
+            normalized.push(
+              asset,
+            );
+          }
+        }
+
+        return normalized;
+      },
+      [
+        sourceAssets,
+      ],
     );
-  }, [sourceAssets]);
+
+  /*
+   * Qualified public universe.
+   *
+   * A qualified asset has an explicit public structural transition.
+   * Missing transition is not converted into Neutral Structure.
+   */
+  const qualifiedData =
+    useMemo<
+      QualifiedPublicAssetViewModel[]
+    >(
+      () =>
+        normalizedData.filter(
+          isQualifiedPublicAsset,
+        ),
+      [
+        normalizedData,
+      ],
+    );
 
   /*
    * Visible market rows only.
    *
-   * Search and limit must not affect:
-   * - global market summary
+   * Search and row limit do not affect:
+   * - global context
+   * - qualified count
    * - structural transition ranking
    */
-  const visibleData = useMemo<Asset[]>(() => {
-    const normalizedQuery =
-      deferredQuery.trim().toLowerCase();
+  const visibleData =
+    useMemo<
+      PublicAssetViewModel[]
+    >(
+      () => {
+        const normalizedQuery =
+          deferredQuery
+            .trim()
+            .toLowerCase();
 
-    const filtered =
-      normalizedQuery.length > 0
-        ? normalizedData.filter(
-            (asset) =>
-              asset.symbol
-                .toLowerCase()
-                .includes(normalizedQuery) ||
-              asset.name
-                .toLowerCase()
-                .includes(normalizedQuery),
-          )
-        : normalizedData;
+        const filtered =
+          normalizedQuery.length >
+          0
+            ? normalizedData.filter(
+                (
+                  asset,
+                ) =>
+                  asset.symbol
+                    .toLowerCase()
+                    .includes(
+                      normalizedQuery,
+                    ) ||
+                  asset.name
+                    .toLowerCase()
+                    .includes(
+                      normalizedQuery,
+                    ),
+              )
+            : normalizedData;
 
-    return filtered.slice(0, limit);
-  }, [
-    normalizedData,
-    deferredQuery,
-    limit,
-  ]);
-
-  /*
-   * Global summary reads the complete public universe.
-   */
-  const structuralSummary = useMemo(() => {
-    return buildPublicMarketStructureSummary(
-      normalizedData.map((asset) => ({
-        activity:
-          asset.activity,
-
-        sparkline_context_7d:
-          asset.sparklineContext7D,
-
-        structure_transition:
-          asset.transition,
-
-        impulse_context:
-          asset.impulseContext,
-      })),
+        return filtered.slice(
+          0,
+          normalizedLimit,
+        );
+      },
+      [
+        normalizedData,
+        deferredQuery,
+        normalizedLimit,
+      ],
     );
-  }, [normalizedData]);
 
   /*
-   * Governed Structural Transition Ranking.
+   * Global public summary.
    *
-   * The UI does not define:
-   * - transition priority
-   * - impulse priority
-   * - activity priority
-   * - ranking tie-breakers
+   * Only contract-qualified structural-transition records are supplied.
+   * The UI does not create a replacement transition for unavailable assets.
    */
-  const transitionHighlights = useMemo<Asset[]>(() => {
-    const ranking =
-      getStructuralTransitionHighlights(
-        normalizedData.map((asset) => ({
-          id: asset.key,
-          symbol: asset.symbol,
+  const structuralSummary =
+    useMemo(
+      () =>
+        buildPublicMarketStructureSummary(
+          qualifiedData.map(
+            (
+              asset,
+            ) => ({
+              activity:
+                asset.activity,
 
-          public_activity:
-            asset.activity,
+              sparkline_context_7d:
+                asset
+                  .sparkline_context_7d,
 
-          public_structure_transition:
-            asset.transition,
+              structure_transition:
+                asset
+                  .structural_transition,
 
-          public_impulse_context:
-            asset.impulseContext,
-        })),
-        3,
-      );
-
-    if (!ranking.validation.valid) {
-      return [];
-    }
-
-    const assetsByIdentity = new Map(
-      normalizedData.map((asset) => [
-        asset.key,
-        asset,
-      ]),
-    );
-
-    return ranking.data
-      .map((rankedAsset) =>
-        assetsByIdentity.get(
-          safeString(
-            rankedAsset.id,
-            rankedAsset.symbol,
+              impulse_context:
+                asset
+                  .impulse_context,
+            }),
           ),
         ),
-      )
-      .filter(
-        (asset): asset is Asset =>
-          asset !== undefined,
-      );
-  }, [normalizedData]);
+      [
+        qualifiedData,
+      ],
+    );
 
-  if (!sourceAssets) {
+  /*
+   * Governed structural-transition highlights.
+   *
+   * Ranking priority, tie-breakers and validation remain owned by:
+   * - structural-transition-ranking.ts
+   */
+  const transitionHighlights =
+    useMemo<
+      QualifiedPublicAssetViewModel[]
+    >(
+      () => {
+        const ranking =
+          getStructuralTransitionHighlights(
+            qualifiedData.map(
+              (
+                asset,
+              ) => ({
+                id:
+                  asset.id,
+
+                symbol:
+                  asset.symbol,
+
+                public_activity:
+                  asset.activity,
+
+                public_structure_transition:
+                  asset
+                    .structural_transition,
+
+                public_impulse_context:
+                  asset
+                    .impulse_context,
+              }),
+            ),
+            3,
+          );
+
+        if (
+          !ranking.validation
+            .valid
+        ) {
+          return [];
+        }
+
+        const assetsByIdentity =
+          new Map<
+            string,
+            QualifiedPublicAssetViewModel
+          >(
+            qualifiedData.map(
+              (
+                asset,
+              ) => [
+                asset.id,
+                asset,
+              ],
+            ),
+          );
+
+        return ranking.data
+          .map(
+            (
+              rankedAsset,
+            ) => {
+              const id =
+                readNonEmptyString(
+                  rankedAsset.id,
+                );
+
+              return id === null
+                ? undefined
+                : assetsByIdentity.get(
+                    id,
+                  );
+            },
+          )
+          .filter(
+            (
+              asset,
+            ): asset is
+              QualifiedPublicAssetViewModel =>
+              asset !==
+              undefined,
+          );
+      },
+      [
+        qualifiedData,
+      ],
+    );
+
+  if (
+    sourceAssets === null
+  ) {
     return (
       <div className="emptyState">
-        No data
+        {
+          policy.labels
+            .no_data
+        }
       </div>
     );
   }
@@ -919,82 +2115,216 @@ export default function ScanTable({
   return (
     <section className="section">
       <header className="header">
-        <h1>Xyvala</h1>
+        <h1>
+          {
+            policy.labels
+              .product_name
+          }
+        </h1>
 
         <p>
-          European Market Structure Intelligence
+          {
+            policy.labels
+              .product_positioning
+          }
         </p>
 
         <p>
-          Read structural market transitions
-          before they become obvious.
+          {
+            policy.labels
+              .product_description
+          }
         </p>
+
+        <PublicMetadata
+          updatedAt={
+            updatedAt
+          }
+          dataSource={
+            dataSource
+          }
+          currency={
+            currency
+          }
+          policy={
+            policy
+          }
+        />
       </header>
 
       <ContextBand
         marketClimate={
-          structuralSummary.market_climate
+          structuralSummary
+            .market_climate
         }
         dominantTransition={
-          structuralSummary.dominant_transition
+          structuralSummary
+            .dominant_transition
         }
         impulseContext={
-          structuralSummary.impulse_context
+          structuralSummary
+            .impulse_context
         }
         activityContext={
-          structuralSummary.activity_context
+          structuralSummary
+            .activity_context
         }
         growthContext={
-          structuralSummary.growth_context
+          structuralSummary
+            .growth_context
         }
         coreStructure={
-          structuralSummary.core_structure
+          structuralSummary
+            .core_structure
         }
         decayContext={
-          structuralSummary.decay_context
+          structuralSummary
+            .decay_context
         }
-        assetsCount={
-          structuralSummary.assets_count
+        assetsAnalysed={
+          normalizedData.length
+        }
+        qualifiedAssets={
+          qualifiedData.length
+        }
+        policy={
+          policy
         }
       />
 
       <div className="toolbar">
         <div className="marketState">
-          Structural Market Context:{" "}
-          {structuralSummary.market_climate}
+          <span>
+            {
+              policy.labels
+                .market_structure_context
+            }
+          </span>
+
+          <strong>
+            {formatPublicMarketClimateLabel(
+              structuralSummary
+                .market_climate,
+              policy,
+            )}
+          </strong>
         </div>
 
-        <input
-          type="search"
-          placeholder="BTC, ETH, SOL..."
-          value={query}
-          onChange={(event) =>
-            setQuery(event.target.value)
-          }
-        />
+        <div className="searchControl">
+          <input
+            type="search"
+            placeholder={
+              policy.labels
+                .search_placeholder
+            }
+            aria-label={
+              policy.labels
+                .search_placeholder
+            }
+            value={query}
+            onChange={(
+              event,
+            ) =>
+              setQuery(
+                event.target
+                  .value,
+              )
+            }
+          />
+
+          <span>
+            {
+              policy.labels
+                .search_results
+            }
+            :{" "}
+            {formatPublicCount(
+              visibleData.length,
+              policy,
+            )}
+          </span>
+        </div>
       </div>
 
       <TransitionPanel
-        assets={transitionHighlights}
+        assets={
+          transitionHighlights
+        }
+        currency={
+          currency
+        }
+        policy={
+          policy
+        }
       />
 
       <section className="marketSection">
         <div className="marketSectionHeader">
-          <h2>Market Structure</h2>
+          <h2>
+            {
+              policy.labels
+                .market_structure_context
+            }
+          </h2>
         </div>
 
-        <DesktopMarketTable
-          assets={visibleData}
-          quote={normalizedQuote}
-        />
+        {visibleData.length ===
+        0 ? (
+          <div className="emptyState">
+            {
+              deferredQuery
+                .trim()
+                .length > 0
+                ? policy.labels
+                    .no_matching_assets
+                : policy.labels
+                    .no_data
+            }
+          </div>
+        ) : (
+          <>
+            <DesktopMarketTable
+              assets={
+                visibleData
+              }
+              currency={
+                currency
+              }
+              policy={
+                policy
+              }
+            />
 
-        <MobileMarketCards
-          assets={visibleData}
-          quote={normalizedQuote}
-        />
+            <MobileMarketCards
+              assets={
+                visibleData
+              }
+              currency={
+                currency
+              }
+              policy={
+                policy
+              }
+            />
+          </>
+        )}
       </section>
 
-      <p>Not investment advice.</p>
+      <footer className="publicDisclaimer">
+        <p>
+          {getPublicDisclaimer(
+            policy,
+          )}
+        </p>
+
+        <p>
+          {
+            policy.labels
+              .reference_currency
+          }
+          : {currency}
+        </p>
+      </footer>
     </section>
   );
 }

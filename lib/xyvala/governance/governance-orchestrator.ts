@@ -78,6 +78,10 @@ import type {
   VariableLineageEntry,
 } from "@/lib/xyvala/governance/variable-lineage-registry";
 
+import type {
+  LineageGovernanceScope,
+} from "@/lib/xyvala/governance/lineage-reconciliation/lineage-types";
+
 /* ============================================================================
  * 1. TYPES
  * ========================================================================== */
@@ -91,6 +95,7 @@ export type GovernanceOrchestrationInput = {
   traces?: readonly RuntimeTraceInput[];
   boundaries?: readonly BoundaryProtectionInput[];
   registry?: readonly VariableLineageEntry[];
+  scope?: LineageGovernanceScope;
 };
 
 export type GovernanceBoundarySummary = {
@@ -192,35 +197,65 @@ function resolveStatus(input: {
 export function orchestrateGovernance(
   input: GovernanceOrchestrationInput = {},
 ): GovernanceOrchestrationResult {
-  const traces = normalizeTraces(input.traces);
-  const boundaries = normalizeBoundaries(input.boundaries);
+  const traces =
+    normalizeTraces(input.traces);
 
-  const report = buildGovernanceReport({
-  traces,
-  ...(input.registry
-    ? {
-        registry: input.registry,
-      }
-    : {}),
-});
+  const boundaries =
+    normalizeBoundaries(
+      input.boundaries,
+    );
 
-  const boundarySummary = buildBoundarySummary(boundaries);
+  const report =
+    buildGovernanceReport({
+      traces,
 
-  const status = resolveStatus({
-    report,
-    boundaries: boundarySummary,
-  });
+      ...(input.registry !== undefined
+        ? {
+            registry:
+              input.registry,
+          }
+        : {}),
 
-  const warnings = uniqueWarnings(
-    report.warnings,
-    ...boundarySummary.results.map((item) => item.warnings),
-  );
+      ...(input.scope !== undefined
+        ? {
+            scope:
+              input.scope,
+          }
+        : {}),
+    });
+
+  const boundarySummary =
+    buildBoundarySummary(
+      boundaries,
+    );
+
+  const status =
+    resolveStatus({
+      report,
+      boundaries:
+        boundarySummary,
+    });
+
+  const warnings =
+    uniqueWarnings(
+      report.warnings,
+
+      ...boundarySummary.results.map(
+        (item) =>
+          item.warnings,
+      ),
+    );
 
   return {
-    ok: status === "COMPLIANT",
+    ok:
+      status === "COMPLIANT",
+
     status,
     report,
-    boundaries: boundarySummary,
+
+    boundaries:
+      boundarySummary,
+
     warnings,
   };
 }

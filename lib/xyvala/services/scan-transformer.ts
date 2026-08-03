@@ -2,35 +2,66 @@
  * FILE: lib/xyvala/services/scan-transformer.ts
  * ----------------------------------------------------------------------------
  * TITLE
- * - Xyvala public scan transformer
+ * - Xyvala canonical public scan transformer
  *
  * ROLE
- * - project private scan assets into the public ScanAsset contract
- * - normalize unknown scan-like inputs into public-safe market assets
- * - preserve observable market data only
- * - produce public descriptive structure labels from observable fields only
- * - propagate public-safe impulse context without exposing private scores
- * - prevent scoring, regime, decision, opportunity, confidence, rupture and broker leakage
+ * - project validated private scan assets into the public ScanAsset contract
+ * - validate already-public scan assets without analytical reconstruction
+ * - map authorized private truths to canonical public-safe labels
+ * - preserve observable market values without inventing fallback data
+ * - provide one deterministic public projection pipeline
+ *
+ * CLASSIFICATION
+ * - TRANSFORMER
+ * - OBSERVE / VALIDATE / PROJECT
+ * - no analytical COMPUTE
+ * - no MUTATE
+ *
+ * UPSTREAM
+ * - lib/xyvala/contracts/scan-private-contract.ts
+ * - private snapshot producers
+ * - validated public snapshot producers
+ *
+ * DOWNSTREAM
+ * - lib/xyvala/services/scan-service.ts
+ * - public snapshot
+ * - public rankings
+ * - public APIs
+ * - passive interfaces
  *
  * DIRECTIVES
  * - transformer boundary only
  * - public output only
+ * - private calculates, public displays
  * - no RFS recomputation
+ * - no Triple Layer recomputation
+ * - no Impulse Layer recomputation
+ * - no Analytical Aggregation recomputation
  * - no MCI recomputation
  * - no calibration logic
- * - no API logic
+ * - no decision logic
+ * - no opportunity logic
+ * - no confidence logic
+ * - no rupture probability exposure
+ * - no crash-state exposure
+ * - no private score exposure
+ * - no API shaping
  * - no UI logic
- * - no broker / affiliation exposure
+ * - no broker or affiliate exposure
  * - no fake fallback data
+ * - no synthetic identity
+ * - no silent data repair
+ * - no uncontrolled aliases
  * - undefined must never be exposed
  * - null means explicitly unavailable
- * - number means confirmed observable value
- * - READ -> VALIDATE -> NORMALIZE -> PROJECT
+ * - Unavailable means a public analytical label is unavailable
+ * - number means a confirmed observable number
+ * - READ -> VALIDATE -> MAP -> PROJECT
  *
  * INPUTS
  * - PrivateScanAsset
  * - ScanAsset
- * - Record<string, unknown>
+ * - strictly validated Record<string, unknown>
  *
  * OUTPUTS
  * - ScanAsset
@@ -39,20 +70,39 @@
  *
  * INVARIANTS
  * - public output remains descriptive only
- * - public impulse mapping comes from public-structure.ts only
+ * - public labels are propagated or explicitly mapped from validated truths
+ * - public labels are never reconstructed from observable market fields
+ * - global structure never comes from 24H or 7D data
+ * - missing structure never becomes neutral
+ * - missing identity causes rejection
+ * - invalid observable data becomes null
+ * - invalid public labels become Unavailable
+ * - invalid arrays are rejected, never repaired
  * - private fields never cross the public boundary
- * - UI displays fields, it never rebuilds them
+ * - every public ScanAsset follows the same canonical projection path
+ * - same input + same transformer version => same output
  *
- * CRITICAL DEPENDENCIES
- * - lib/xyvala/contracts/scan-contract.ts
- * - lib/xyvala/contracts/scan-private-contract.ts
- * - lib/xyvala/public/public-structure.ts
- * - lib/xyvala/structures/structure-7d.ts
+ * PUBLIC LINEAGE
+ * - public_structure_transition
+ *   <- validated private structural_transition
+ *   OR already-propagated public_structure_transition
+ *
+ * - public_impulse_context
+ *   <- validated private impulse_transition_state
+ *   OR already-propagated public_impulse_context
+ *
+ * - public_activity
+ *   <- already-propagated public_activity only
+ *
+ * - public_sparkline_context_7d
+ *   <- already-propagated public_sparkline_context_7d only
  *
  * SENSITIVE ZONES
  * - private/public boundary
- * - public impulse context propagation
- * - descriptive public labels
+ * - structural-transition projection
+ * - impulse-context projection
+ * - canonical identity
+ * - unavailable-state preservation
  * ========================================================================== */
 
 import type { ScanAsset } from "@/lib/xyvala/contracts/scan-contract";
@@ -60,8 +110,14 @@ import type { PrivateScanAsset } from "@/lib/xyvala/contracts/scan-private-contr
 
 import {
   buildPublicStructure,
+  toPublicActivityLabel,
   toPublicImpulseContext,
+  toPublicSparklineContext7D,
+  toPublicStructureTransition,
+  type PublicActivityLabel,
   type PublicImpulseContext,
+  type PublicSparklineContext7D,
+  type PublicStructureTransition,
 } from "@/lib/xyvala/public/public-structure";
 
 import {
@@ -73,7 +129,11 @@ import {
  * 1. TYPES
  * ========================================================================== */
 
-export type ScanTransformerSource = "snapshot" | "scan" | "fallback" | "unknown";
+export type ScanTransformerSource =
+  | "snapshot"
+  | "scan"
+  | "fallback"
+  | "unknown";
 
 export type ScanTransformerInput =
   | PrivateScanAsset
@@ -96,9 +156,12 @@ export type ScanTransformerItem = {
   structure_7d: Structure7D;
 
   public_activity: ScanAsset["public_activity"];
-  public_sparkline_context_7d: ScanAsset["public_sparkline_context_7d"];
-  public_structure_transition: ScanAsset["public_structure_transition"];
-  public_impulse_context: ScanAsset["public_impulse_context"];
+  public_sparkline_context_7d:
+    ScanAsset["public_sparkline_context_7d"];
+  public_structure_transition:
+    ScanAsset["public_structure_transition"];
+  public_impulse_context:
+    ScanAsset["public_impulse_context"];
 
   rank: number | null;
   logo_url: string | null;
@@ -115,101 +178,123 @@ export type ScanTransformerResult = {
   warnings: string[];
 };
 
-/* ============================================================================
- * 2. SAFE HELPERS
- * ========================================================================== */
+type CanonicalIdentity = {
+  id: string;
+  symbol: string;
+  name: string;
+};
 
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isFiniteNumber(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value);
-}
-
-function safeString(value: unknown, fallback = ""): string {
-  return typeof value === "string" && value.trim().length > 0
-    ? value.trim()
-    : fallback;
-}
-
-function safeUpper(value: unknown): string {
-  return safeString(value).toUpperCase();
-}
-
-function safeLower(value: unknown): string {
-  return safeString(value).toLowerCase();
-}
-
-function safeNumber(value: unknown): number | null {
-  if (isFiniteNumber(value)) return value;
-
-  if (typeof value === "string" && value.trim().length > 0) {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : null;
-  }
-
-  return null;
-}
-
-function round(value: number, precision: number): number {
-  if (!Number.isFinite(value)) return 0;
-
-  const factor = 10 ** precision;
-  return Math.round(value * factor) / factor;
-}
-
-function round8(value: number): number {
-  return round(value, 8);
-}
-
-function uniqueWarnings(
-  ...groups: Array<string[] | undefined | null>
-): string[] {
-  return [
-    ...new Set(
-      groups
-        .flatMap((group) => (Array.isArray(group) ? group : []))
-        .filter(
-          (item): item is string =>
-            typeof item === "string" && item.trim().length > 0,
-        ),
-    ),
-  ];
-}
+type ProjectedPublicLabels = {
+  activity: PublicActivityLabel;
+  sparkline_context_7d: PublicSparklineContext7D;
+  structure_transition: PublicStructureTransition;
+  impulse_context: PublicImpulseContext;
+};
 
 /* ============================================================================
- * 3. FIELD NORMALIZERS
+ * 2. VERSION
  * ========================================================================== */
 
-function normalizeNullableNumber(value: unknown): number | null {
-  const parsed = safeNumber(value);
-  return parsed === null ? null : round8(parsed);
+export const SCAN_TRANSFORMER_VERSION = "2.0.0" as const;
+
+/* ============================================================================
+ * 3. SAFE PRIMITIVE HELPERS
+ * ========================================================================== */
+
+function isPlainObject(
+  value: unknown,
+): value is Record<string, unknown> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value)
+  );
 }
 
-function normalizeRank(value: unknown): number | null {
-  const parsed = safeNumber(value);
+function hasOwn(
+  source: Record<string, unknown>,
+  key: string,
+): boolean {
+  return Object.prototype.hasOwnProperty.call(
+    source,
+    key,
+  );
+}
 
-  if (parsed === null || parsed <= 0) {
+function isFiniteNumber(
+  value: unknown,
+): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isFinite(value)
+  );
+}
+
+function normalizeRequiredString(
+  value: unknown,
+): string | null {
+  if (typeof value !== "string") {
     return null;
   }
 
-  return Math.trunc(parsed);
+  const normalized = value.trim();
+
+  return normalized.length > 0
+    ? normalized
+    : null;
 }
 
-function normalizeNullableString(value: unknown): string | null {
-  const normalized = safeString(value);
-  return normalized.length > 0 ? normalized : null;
+function normalizeNullableNumber(
+  value: unknown,
+): number | null {
+  return isFiniteNumber(value)
+    ? value
+    : null;
 }
 
-function normalizeUrl(value: unknown): string | null {
-  const normalized = safeString(value);
+function normalizePositiveInteger(
+  value: unknown,
+): number | null {
+  if (
+    !isFiniteNumber(value) ||
+    !Number.isInteger(value) ||
+    value <= 0
+  ) {
+    return null;
+  }
 
-  if (!normalized) return null;
+  return value;
+}
+
+function normalizeNumberArray(
+  value: unknown,
+): number[] | null {
+  if (
+    !Array.isArray(value) ||
+    value.length < 2
+  ) {
+    return null;
+  }
+
+  if (!value.every(isFiniteNumber)) {
+    return null;
+  }
+
+  return [...value];
+}
+
+function normalizePublicUrl(
+  value: unknown,
+): string | null {
+  const normalized =
+    normalizeRequiredString(value);
+
+  if (!normalized) {
+    return null;
+  }
 
   if (
     normalized.startsWith("https://") ||
-    normalized.startsWith("http://") ||
     normalized.startsWith("/")
   ) {
     return normalized;
@@ -218,169 +303,751 @@ function normalizeUrl(value: unknown): string | null {
   return null;
 }
 
-function normalizeNumberArray(value: unknown): number[] | null {
-  if (!Array.isArray(value)) return null;
+function compareDeterministicStrings(
+  left: string,
+  right: string,
+): number {
+  if (left < right) {
+    return -1;
+  }
 
-  const points = value.filter(isFiniteNumber);
+  if (left > right) {
+    return 1;
+  }
 
-  return points.length >= 2 ? points : null;
+  return 0;
+}
+
+function uniqueWarnings(
+  ...groups: Array<
+    readonly string[] | undefined | null
+  >
+): string[] {
+  const warnings = groups
+    .flatMap((group) =>
+      Array.isArray(group)
+        ? group
+        : [],
+    )
+    .filter(
+      (warning): warning is string =>
+        typeof warning === "string" &&
+        warning.trim().length > 0,
+    )
+    .map((warning) => warning.trim());
+
+  return [
+    ...new Set(warnings),
+  ].sort(compareDeterministicStrings);
 }
 
 /* ============================================================================
- * 4. RAW FIELD READERS
+ * 4. STRICT FIELD READER
+ * ----------------------------------------------------------------------------
+ * No fallback names are accepted here.
+ *
+ * Any legacy alias must be migrated upstream rather than silently supported at
+ * the canonical private/public boundary.
  * ========================================================================== */
 
-function readField(
+function readCanonicalField(
   asset: Record<string, unknown>,
-  primary: string,
-  fallback?: string,
+  key: string,
 ): unknown {
-  if (Object.prototype.hasOwnProperty.call(asset, primary)) {
-    return asset[primary];
-  }
-
-  if (fallback && Object.prototype.hasOwnProperty.call(asset, fallback)) {
-    return asset[fallback];
-  }
-
-  return undefined;
+  return hasOwn(asset, key)
+    ? asset[key]
+    : undefined;
 }
 
-function readIdentity(asset: Record<string, unknown>): {
-  id: string;
-  symbol: string;
-  name: string;
-  warnings: string[];
-} | null {
-  const symbol = safeUpper(readField(asset, "symbol"));
+/* ============================================================================
+ * 5. CANONICAL IDENTITY
+ * ----------------------------------------------------------------------------
+ * Identity is never reconstructed from aliases or from another field.
+ *
+ * Missing id, symbol or name causes rejection.
+ * ========================================================================== */
 
-  if (!symbol) {
+function readCanonicalIdentity(
+  asset: Record<string, unknown>,
+): CanonicalIdentity | null {
+  const id =
+    normalizeRequiredString(
+      readCanonicalField(asset, "id"),
+    );
+
+  const symbol =
+    normalizeRequiredString(
+      readCanonicalField(asset, "symbol"),
+    );
+
+  const name =
+    normalizeRequiredString(
+      readCanonicalField(asset, "name"),
+    );
+
+  if (!id || !symbol || !name) {
     return null;
   }
 
-  const id =
-    safeLower(readField(asset, "id")) ||
-    safeLower(readField(asset, "key")) ||
-    symbol.toLowerCase();
-
-  const name = safeString(readField(asset, "name"), symbol);
-
   return {
-    id,
-    symbol,
+    id: id.toLowerCase(),
+    symbol: symbol.toUpperCase(),
     name,
-    warnings: [],
   };
 }
 
-function readLogo(asset: Record<string, unknown>): string | null {
-  return (
-    normalizeUrl(readField(asset, "logo_url")) ??
-    normalizeUrl(readField(asset, "logo")) ??
-    normalizeUrl(readField(asset, "logoUrl")) ??
-    normalizeUrl(readField(asset, "image")) ??
-    normalizeNullableString(readField(asset, "logo_url")) ??
-    normalizeNullableString(readField(asset, "logo")) ??
-    normalizeNullableString(readField(asset, "logoUrl")) ??
-    normalizeNullableString(readField(asset, "image"))
-  );
+/* ============================================================================
+ * 6. PRIVATE STRUCTURAL-TRANSITION PROJECTION
+ * ----------------------------------------------------------------------------
+ * This mapper does not detect, calculate or reconstruct a transition.
+ *
+ * It only converts the canonical validated private structural-transition
+ * contract into an authorized public descriptive label.
+ *
+ * SOURCE OF TRUTH
+ * - PrivateScanAsset.structural_transition
+ *
+ * INVARIANTS
+ * - structural_transition_status controls availability
+ * - UNKNOWN and CONFLICTED states are never exposed as valid transitions
+ * - unsupported private kinds remain unavailable
+ * - no private score participates in the mapping
+ * - no observable market value participates in the mapping
+ * - no legacy alias is accepted
+ * ========================================================================== */
+
+function normalizePrivateEnum(
+  value: unknown,
+): string | null {
+  const normalized =
+    normalizeRequiredString(value);
+
+  return normalized
+    ? normalized
+        .replace(/[\s-]+/g, "_")
+        .toUpperCase()
+    : null;
 }
 
-function readPublicImpulseContext(
-  asset: Record<string, unknown>,
-): PublicImpulseContext {
-  const publicValue = readField(
-    asset,
-    "public_impulse_context",
-    "impulse_context",
-  );
+type ReadPrivateStructuralTransition = {
+  status: string | null;
+  kind: string | null;
+  state: string | null;
+  evolution: string | null;
+};
 
-  const normalizedPublicValue = toPublicImpulseContext(publicValue);
-
-  if (normalizedPublicValue !== "Unavailable") {
-    return normalizedPublicValue;
+function readPrivateStructuralTransitionValue(
+  value: unknown,
+): ReadPrivateStructuralTransition | null {
+  if (!isPlainObject(value)) {
+    return null;
   }
 
-  const transitionValue = readField(asset, "impulse_transition_state");
+  return {
+    status: normalizePrivateEnum(
+      readCanonicalField(
+        value,
+        "structural_transition_status",
+      ),
+    ),
 
-  return toPublicImpulseContext(transitionValue);
+    kind: normalizePrivateEnum(
+      readCanonicalField(
+        value,
+        "structural_transition_kind",
+      ),
+    ),
+
+    state: normalizePrivateEnum(
+      readCanonicalField(
+        value,
+        "structural_transition_state",
+      ),
+    ),
+
+    evolution: normalizePrivateEnum(
+      readCanonicalField(
+        value,
+        "structural_transition_evolution",
+      ),
+    ),
+  };
+}
+
+function isAvailablePrivateStatus(
+  status: string | null,
+): boolean {
+  return (
+    status === "COMPUTED" ||
+    status === "PARTIAL" ||
+    status === "DEGRADED"
+  );
+}
+
+function projectPrivateStructuralTransition(
+  value: unknown,
+): PublicStructureTransition {
+  const transition =
+    readPrivateStructuralTransitionValue(
+      value,
+    );
+
+  if (!transition) {
+    return "Unavailable";
+  }
+
+  if (
+    !isAvailablePrivateStatus(
+      transition.status,
+    )
+  ) {
+    return "Unavailable";
+  }
+
+  if (
+    transition.kind === null ||
+    transition.kind === "UNKNOWN" ||
+    transition.state === null ||
+    transition.state === "UNKNOWN" ||
+    transition.state === "CONFLICTED"
+  ) {
+    return "Unavailable";
+  }
+
+  switch (transition.kind) {
+    case "FRAGMENTATION":
+      return "Fragmentation Detected";
+
+    case "COMPRESSION":
+      return "Compression Phase";
+
+    case "EXPANSION":
+      return transition.state === "PERSISTENT"
+        ? "Active Expansion"
+        : "Expansion Phase";
+
+    case "RECOVERY":
+      return "Recovery Structure";
+
+    case "NONE":
+      return transition.state === "NONE"
+        ? "Stable Structure"
+        : "Neutral Structure";
+
+    /*
+     * The current public contract does not expose a dedicated label for
+     * reversal or reconfiguration.
+     *
+     * These states must remain unavailable rather than being converted into
+     * an unrelated public transition.
+     */
+    case "REVERSAL":
+    case "RECONFIGURATION":
+    default:
+      return "Unavailable";
+  }
 }
 
 /* ============================================================================
- * 5. STRUCTURE ADAPTERS
+ * 7. PRIVATE IMPULSE PROJECTION
+ * ----------------------------------------------------------------------------
+ * This mapper does not calculate or reconstruct impulse truth.
+ *
+ * SOURCE OF TRUTH
+ * - PrivateScanAsset.impulse_transition_state
+ * - PrivateScanAsset.impulse_status
+ *
+ * INVARIANTS
+ * - impulse_status controls availability
+ * - NEUTRAL is exposed only when it is a validated neutral observation
+ * - unavailable never becomes neutral
+ * - no fallback to impulse_context or another alias is permitted
  * ========================================================================== */
 
-function buildStructureFromAsset(asset: Record<string, unknown>): Structure7D {
-  return buildStructure7D({
-    sparkline_7d: readField(asset, "sparkline_7d", "sparkline"),
-    chg_7d_pct: readField(asset, "chg_7d_pct"),
+function projectPrivateImpulseContext(
+  state: unknown,
+  status: unknown,
+): PublicImpulseContext {
+  const normalizedStatus =
+    normalizePrivateEnum(status);
 
-    rolling_7d_price_path: readField(asset, "rolling_7d_price_path"),
-    initial_7d_price_path: readField(asset, "initial_7d_price_path"),
+  if (
+    !isAvailablePrivateStatus(
+      normalizedStatus,
+    )
+  ) {
+    return "Unavailable";
+  }
 
-    initial_7d_structure_score: readField(asset, "initial_7d_structure_score"),
-    initial_7d_structure_status: readField(asset, "initial_7d_structure_status"),
+  const normalizedState =
+    normalizePrivateEnum(state);
 
-    intro_7d_score: readField(asset, "intro_7d_score"),
-    intro_7d_status: readField(asset, "intro_7d_status"),
+  switch (normalizedState) {
+    case "COMPRESSION":
+      return "Compression";
+
+    case "PRESSURE_BUILDING":
+      return "Pressure Building";
+
+    case "RELEASE":
+      return "Release";
+
+    case "EXHAUSTION":
+      return "Exhaustion";
+
+    case "NEUTRAL":
+      return "Neutral";
+
+    default:
+      return "Unavailable";
+  }
+}
+
+/* ============================================================================
+ * 8. CANONICAL PUBLIC-LABEL PROJECTION
+ * ----------------------------------------------------------------------------
+ * This function validates canonical public labels only.
+ *
+ * It does not:
+ * - read observable market data
+ * - infer missing labels
+ * - reconstruct analytical truth
+ * - convert unavailable values into neutral values
+ * ========================================================================== */
+
+function buildProjectedPublicLabels(input: {
+  activity?: unknown;
+  sparklineContext7D?: unknown;
+  transition?: unknown;
+  impulse?: unknown;
+}): ProjectedPublicLabels {
+  return buildPublicStructure({
+    public_activity_label:
+      toPublicActivityLabel(
+        input.activity,
+      ),
+
+    public_sparkline_context_7d:
+      toPublicSparklineContext7D(
+        input.sparklineContext7D,
+      ),
+
+    public_transition_label:
+      toPublicStructureTransition(
+        input.transition,
+      ),
+
+    public_impulse_context:
+      toPublicImpulseContext(
+        input.impulse,
+      ),
   });
 }
 
-function buildPublicStructureFromValues(input: {
+/* ============================================================================
+ * 9. PRIVATE -> PUBLIC LABEL MAPPING
+ * ----------------------------------------------------------------------------
+ * Private truths are explicitly mapped here.
+ *
+ * PUBLIC LINEAGE
+ * - public_structure_transition
+ *   <- structural_transition
+ *
+ * - public_impulse_context
+ *   <- impulse_transition_state + impulse_status
+ *
+ * CURRENTLY UNAVAILABLE
+ * - public_activity
+ * - public_sparkline_context_7d
+ *
+ * These two values do not currently exist in PrivateScanAsset and must remain
+ * unavailable until their legitimate upstream producers are identified and
+ * governed.
+ *
+ * Observable market fields never participate in public-label production.
+ * ========================================================================== */
+
+function projectPrivateLabels(
+  asset: Record<string, unknown>,
+): ProjectedPublicLabels {
+  const projectedTransition =
+    projectPrivateStructuralTransition(
+      readCanonicalField(
+        asset,
+        "structural_transition",
+      ),
+    );
+
+  const projectedImpulse =
+    projectPrivateImpulseContext(
+      readCanonicalField(
+        asset,
+        "impulse_transition_state",
+      ),
+
+      readCanonicalField(
+        asset,
+        "impulse_status",
+      ),
+    );
+
+  return buildProjectedPublicLabels({
+    activity: "Unavailable",
+
+    sparklineContext7D:
+      "Unavailable",
+
+    transition:
+      projectedTransition,
+
+    impulse:
+      projectedImpulse,
+  });
+}
+
+/* ============================================================================
+ * 10. PUBLIC -> PUBLIC LABEL VALIDATION
+ * ----------------------------------------------------------------------------
+ * Already-public values are validated without reinterpretation.
+ * ========================================================================== */
+
+function validatePublicLabels(
+  asset: Record<string, unknown>,
+): ProjectedPublicLabels {
+  return buildProjectedPublicLabels({
+    activity:
+      readCanonicalField(
+        asset,
+        "public_activity",
+      ),
+
+    sparklineContext7D:
+      readCanonicalField(
+        asset,
+        "public_sparkline_context_7d",
+      ),
+
+    transition:
+      readCanonicalField(
+        asset,
+        "public_structure_transition",
+      ),
+
+    impulse:
+      readCanonicalField(
+        asset,
+        "public_impulse_context",
+      ),
+  });
+}
+
+/* ============================================================================
+ * 11. INPUT CLASSIFICATION
+ * ----------------------------------------------------------------------------
+ * Classification only selects the authorized projection path.
+ *
+ * It does not change analytical values.
+ * ========================================================================== */
+
+function isPrivateProjectionInput(
+  asset: Record<string, unknown>,
+): boolean {
+  return (
+    hasOwn(asset, "structural_transition") ||
+    hasOwn(asset, "impulse_transition_state")
+  );
+}
+
+/* ============================================================================
+ * 12. DESCRIPTIVE 7D ADAPTER
+ * ----------------------------------------------------------------------------
+ * Structure7D remains a descriptive service adapter.
+ *
+ * Its result is never used to produce:
+ * - public_activity
+ * - public_sparkline_context_7d
+ * - public_structure_transition
+ * - public_impulse_context
+ * - global structure
+ * - regime
+ * - decision
+ * - ranking priority
+ * ========================================================================== */
+
+function buildDescriptiveStructure7D(
+  asset: Record<string, unknown>,
+): Structure7D {
+  return buildStructure7D({
+    sparkline_7d:
+      readCanonicalField(
+        asset,
+        "sparkline_7d",
+      ),
+
+    chg_7d_pct:
+      readCanonicalField(
+        asset,
+        "chg_7d_pct",
+      ),
+
+    rolling_7d_price_path:
+      readCanonicalField(
+        asset,
+        "rolling_7d_price_path",
+      ),
+
+    initial_7d_price_path:
+      readCanonicalField(
+        asset,
+        "initial_7d_price_path",
+      ),
+
+    initial_7d_structure_score:
+      readCanonicalField(
+        asset,
+        "initial_7d_structure_score",
+      ),
+
+    initial_7d_structure_status:
+      readCanonicalField(
+        asset,
+        "initial_7d_structure_status",
+      ),
+
+    intro_7d_score:
+      readCanonicalField(
+        asset,
+        "intro_7d_score",
+      ),
+
+    intro_7d_status:
+      readCanonicalField(
+        asset,
+        "intro_7d_status",
+      ),
+  });
+}
+
+/* ============================================================================
+ * 13. WARNING RESOLUTION
+ * ========================================================================== */
+
+function buildItemWarnings(input: {
+  price: number | null;
   chg24h: number | null;
   chg7d: number | null;
-  volume24h: number | null;
   marketCap: number | null;
+  volume24h: number | null;
   sparkline7d: number[] | null;
-  impulseTransitionState?: unknown;
-  publicImpulseContext?: unknown;
-}) {
-  return buildPublicStructure({
-    pct_24h: input.chg24h,
-    pct_7d: input.chg7d,
-    volume_24h: input.volume24h,
-    market_cap: input.marketCap,
-    sparkline_7d: input.sparkline7d,
-    impulse_transition_state: input.impulseTransitionState,
-    public_impulse_context: input.publicImpulseContext,
-  });
+  rank: number | null;
+  logoUrl: string | null;
+  labels: ProjectedPublicLabels;
+  rawRank: unknown;
+  rawLogo: unknown;
+  rawSparkline: unknown;
+}): string[] {
+  const warnings: string[] = [];
+
+  if (input.price === null) {
+    warnings.push(
+      "scan_transformer_price_unavailable",
+    );
+  }
+
+  if (input.chg24h === null) {
+    warnings.push(
+      "scan_transformer_chg_24h_unavailable",
+    );
+  }
+
+  if (input.chg7d === null) {
+    warnings.push(
+      "scan_transformer_chg_7d_unavailable",
+    );
+  }
+
+  if (input.marketCap === null) {
+    warnings.push(
+      "scan_transformer_market_cap_unavailable",
+    );
+  }
+
+  if (input.volume24h === null) {
+    warnings.push(
+      "scan_transformer_volume_24h_unavailable",
+    );
+  }
+
+  if (input.sparkline7d === null) {
+    warnings.push(
+      Array.isArray(input.rawSparkline)
+        ? "scan_transformer_sparkline_7d_invalid"
+        : "scan_transformer_sparkline_7d_unavailable",
+    );
+  }
+
+  if (
+    input.rawRank !== undefined &&
+    input.rank === null
+  ) {
+    warnings.push(
+      "scan_transformer_rank_invalid",
+    );
+  }
+
+  if (
+    input.rawLogo !== undefined &&
+    input.logoUrl === null
+  ) {
+    warnings.push(
+      "scan_transformer_logo_url_invalid",
+    );
+  }
+
+  if (
+    input.labels.activity ===
+    "Unavailable"
+  ) {
+    warnings.push(
+      "scan_transformer_public_activity_unavailable",
+    );
+  }
+
+  if (
+    input.labels.sparkline_context_7d ===
+    "Unavailable"
+  ) {
+    warnings.push(
+      "scan_transformer_public_sparkline_context_7d_unavailable",
+    );
+  }
+
+  if (
+    input.labels.structure_transition ===
+    "Unavailable"
+  ) {
+    warnings.push(
+      "scan_transformer_public_structure_transition_unavailable",
+    );
+  }
+
+  if (
+    input.labels.impulse_context ===
+    "Unavailable"
+  ) {
+    warnings.push(
+      "scan_transformer_public_impulse_context_unavailable",
+    );
+  }
+
+  return uniqueWarnings(warnings);
 }
 
 /* ============================================================================
- * 6. PRIVATE -> PUBLIC PROJECTION
+ * 14. CANONICAL INTERNAL ITEM BUILDER
+ * ----------------------------------------------------------------------------
+ * Every accepted input reaches this single builder.
  * ========================================================================== */
 
-export function privateScanAssetToPublicScanAsset(
-  asset: PrivateScanAsset,
-): ScanAsset {
-  const symbol = safeString(asset.symbol, "UNKNOWN").toUpperCase();
+function buildCanonicalScanTransformerItem(input: {
+  asset: Record<string, unknown>;
+  identity: CanonicalIdentity;
+  labels: ProjectedPublicLabels;
+  source: ScanTransformerSource;
+}): ScanTransformerItem {
+  const price =
+    normalizeNullableNumber(
+      readCanonicalField(
+        input.asset,
+        "price",
+      ),
+    );
 
-  const price = normalizeNullableNumber(asset.price);
-  const chg24h = normalizeNullableNumber(asset.chg_24h_pct);
-  const chg7d = normalizeNullableNumber(asset.chg_7d_pct);
-  const marketCap = normalizeNullableNumber(asset.market_cap);
-  const volume24h = normalizeNullableNumber(asset.volume_24h);
-  const sparkline7d = normalizeNumberArray(asset.sparkline_7d);
+  const chg24h =
+    normalizeNullableNumber(
+      readCanonicalField(
+        input.asset,
+        "chg_24h_pct",
+      ),
+    );
 
-  const publicStructure = buildPublicStructureFromValues({
-  chg24h,
-  chg7d,
-  volume24h,
-  marketCap,
-  sparkline7d,
-  impulseTransitionState: asset.impulse_transition_state,
-});
+  const chg7d =
+    normalizeNullableNumber(
+      readCanonicalField(
+        input.asset,
+        "chg_7d_pct",
+      ),
+    );
 
-console.log("XYVALA_PRIVATE_TO_PUBLIC_IMPULSE", {
-  symbol,
-  impulse_transition_state: asset.impulse_transition_state,
-  public_impulse_context: publicStructure.impulse_context,
-});
+  const marketCap =
+    normalizeNullableNumber(
+      readCanonicalField(
+        input.asset,
+        "market_cap",
+      ),
+    );
+
+  const volume24h =
+    normalizeNullableNumber(
+      readCanonicalField(
+        input.asset,
+        "volume_24h",
+      ),
+    );
+
+  const rawSparkline =
+    readCanonicalField(
+      input.asset,
+      "sparkline_7d",
+    );
+
+  const sparkline7d =
+    normalizeNumberArray(
+      rawSparkline,
+    );
+
+  const rawRank =
+    readCanonicalField(
+      input.asset,
+      "rank",
+    );
+
+  const rank =
+    normalizePositiveInteger(
+      rawRank,
+    );
+
+  const rawLogo =
+    readCanonicalField(
+      input.asset,
+      "logo_url",
+    );
+
+  const logoUrl =
+    normalizePublicUrl(
+      rawLogo,
+    );
+
+  const warnings =
+    buildItemWarnings({
+      price,
+      chg24h,
+      chg7d,
+      marketCap,
+      volume24h,
+      sparkline7d,
+      rank,
+      logoUrl,
+      labels: input.labels,
+      rawRank,
+      rawLogo,
+      rawSparkline,
+    });
 
   return {
-    id: safeString(asset.id, symbol.toLowerCase()),
-    symbol,
-    name: safeString(asset.name, symbol),
+    id: input.identity.id,
+    symbol: input.identity.symbol,
+    name: input.identity.name,
 
     price,
     chg_24h_pct: chg24h,
@@ -391,24 +1058,83 @@ console.log("XYVALA_PRIVATE_TO_PUBLIC_IMPULSE", {
 
     sparkline_7d: sparkline7d,
 
-    public_activity: publicStructure.activity,
-    public_sparkline_context_7d: publicStructure.sparkline_context_7d,
-    public_structure_transition: publicStructure.structure_transition,
-    public_impulse_context: publicStructure.impulse_context,
+    structure_7d:
+      buildDescriptiveStructure7D(
+        input.asset,
+      ),
 
-    rank: normalizeRank(asset.rank),
-    logo_url: normalizeNullableString(asset.logo_url),
+    public_activity:
+      input.labels.activity,
+
+    public_sparkline_context_7d:
+      input.labels.sparkline_context_7d,
+
+    public_structure_transition:
+      input.labels.structure_transition,
+
+    public_impulse_context:
+      input.labels.impulse_context,
+
+    rank,
+    logo_url: logoUrl,
+
+    transformer_source:
+      input.source,
+
+    transformer_warnings:
+      warnings,
   };
+}
+
+/* ============================================================================
+ * 15. PRIVATE -> PUBLIC PROJECTION
+ * ========================================================================== */
+
+export function privateScanAssetToPublicScanAsset(
+  asset: PrivateScanAsset,
+): ScanAsset {
+  const source =
+    asset as unknown as Record<
+      string,
+      unknown
+    >;
+
+  const identity =
+    readCanonicalIdentity(source);
+
+  if (!identity) {
+    throw new Error(
+      "scan_transformer_invalid_private_asset_identity",
+    );
+  }
+
+  const item =
+    buildCanonicalScanTransformerItem({
+      asset: source,
+      identity,
+      labels:
+        projectPrivateLabels(source),
+      source: "scan",
+    });
+
+  return toPublicScanAsset(item);
 }
 
 export function privateScanAssetsToPublicScanAssets(
   assets: readonly PrivateScanAsset[],
 ): ScanAsset[] {
-  return assets.map(privateScanAssetToPublicScanAsset);
+  return assets.map(
+    privateScanAssetToPublicScanAsset,
+  );
 }
 
 /* ============================================================================
- * 7. PUBLIC TRANSFORMER
+ * 16. PUBLIC / GENERIC TRANSFORMER
+ * ----------------------------------------------------------------------------
+ * Private-like inputs are routed through the private mapper.
+ *
+ * Already-public inputs are validated without reconstruction.
+ * Invalid identities are rejected.
  * ========================================================================== */
 
 export function toScanServiceItem(
@@ -419,92 +1145,24 @@ export function toScanServiceItem(
     return null;
   }
 
-  const identity = readIdentity(input);
+  const identity =
+    readCanonicalIdentity(input);
 
   if (!identity) {
     return null;
   }
 
-  const warnings: string[] = [...identity.warnings];
-  const structure7d = buildStructureFromAsset(input);
+  const labels =
+    isPrivateProjectionInput(input)
+      ? projectPrivateLabels(input)
+      : validatePublicLabels(input);
 
-  const price = normalizeNullableNumber(readField(input, "price"));
-
-  const chg24h = normalizeNullableNumber(
-    readField(input, "chg_24h_pct", "pct24h"),
-  );
-
-  const chg7d =
-    normalizeNullableNumber(structure7d.chg_7d_pct) ??
-    normalizeNullableNumber(readField(input, "chg_7d_pct"));
-
-  const sparkline7d =
-    structure7d.sparkline_7d ??
-    normalizeNumberArray(readField(input, "sparkline_7d", "sparkline"));
-
-  const marketCap = normalizeNullableNumber(readField(input, "market_cap"));
-  const volume24h = normalizeNullableNumber(readField(input, "volume_24h"));
-  const publicImpulseContext = readPublicImpulseContext(input);
-
-console.log("XYVALA_TRANSFORMER_IMPULSE_MAPPING", {
-  symbol: identity.symbol,
-  raw_public_impulse_context: readField(input, "public_impulse_context"),
-  raw_impulse_context: readField(input, "impulse_context"),
-  raw_impulse_transition_state: readField(input, "impulse_transition_state"),
-  resolved_public_impulse_context: publicImpulseContext,
-});
-
-  const publicStructure = buildPublicStructureFromValues({
-  chg24h,
-  chg7d,
-  volume24h,
-  marketCap,
-  sparkline7d,
-  impulseTransitionState: readField(input, "impulse_transition_state"),
-  publicImpulseContext,
-});
-  if (price === null) {
-    warnings.push("scan_transformer_price_unavailable");
-  }
-
-  if (chg24h === null) {
-    warnings.push("scan_transformer_chg_24h_unavailable");
-  }
-
-  if (chg7d === null) {
-    warnings.push("scan_transformer_chg_7d_unavailable");
-  }
-
-  if (!sparkline7d) {
-    warnings.push("scan_transformer_sparkline_7d_unavailable");
-  }
-
-  return {
-    id: identity.id,
-    symbol: identity.symbol,
-    name: identity.name,
-
-    price,
-    chg_24h_pct: chg24h,
-    chg_7d_pct: chg7d,
-
-    market_cap: marketCap,
-    volume_24h: volume24h,
-
-    sparkline_7d: sparkline7d,
-    structure_7d: structure7d,
-
-    public_activity: publicStructure.activity,
-    public_sparkline_context_7d: publicStructure.sparkline_context_7d,
-    public_structure_transition: publicStructure.structure_transition,
-    public_impulse_context: publicStructure.impulse_context,
-
-    rank: normalizeRank(readField(input, "rank")),
-    logo_url: readLogo(input),
-
-    transformer_source: source,
-    transformer_warnings: uniqueWarnings(warnings),
-  };
+  return buildCanonicalScanTransformerItem({
+    asset: input,
+    identity,
+    labels,
+    source,
+  });
 }
 
 export function toScanServiceItems(
@@ -518,7 +1176,11 @@ export function toScanServiceItems(
   const items: ScanTransformerItem[] = [];
 
   for (const asset of assets) {
-    const item = toScanServiceItem(asset as ScanTransformerInput, source);
+    const item =
+      toScanServiceItem(
+        asset as ScanTransformerInput,
+        source,
+      );
 
     if (item !== null) {
       items.push(item);
@@ -533,7 +1195,8 @@ export function transformScanAssets(input: {
   source?: ScanTransformerSource;
   warnings?: string[];
 }): ScanTransformerResult {
-  const source = input.source ?? "unknown";
+  const source =
+    input.source ?? "unknown";
 
   if (!Array.isArray(input.assets)) {
     return {
@@ -541,52 +1204,86 @@ export function transformScanAssets(input: {
       source,
       data: [],
       rejected_count: 0,
-      warnings: uniqueWarnings(input.warnings, [
-        "scan_transformer_assets_not_array",
-      ]),
+      warnings: uniqueWarnings(
+        input.warnings,
+        [
+          "scan_transformer_assets_not_array",
+        ],
+      ),
     };
   }
 
-  const data = toScanServiceItems(input.assets, source);
-  const rejectedCount = input.assets.length - data.length;
+  const data =
+    toScanServiceItems(
+      input.assets,
+      source,
+    );
+
+  const rejectedCount =
+    input.assets.length -
+    data.length;
 
   return {
     ok: true,
     source,
     data,
-    rejected_count: rejectedCount,
+
+    rejected_count:
+      rejectedCount,
+
     warnings: uniqueWarnings(
       input.warnings,
+
       rejectedCount > 0
-        ? [`scan_transformer_rejected_assets:${rejectedCount}`]
+        ? [
+            `scan_transformer_rejected_assets:${rejectedCount}`,
+          ]
         : [],
     ),
   };
 }
 
 /* ============================================================================
- * 8. CONTRACT BRIDGE HELPERS
+ * 17. CONTRACT BRIDGE
+ * ----------------------------------------------------------------------------
+ * This is the only ScanTransformerItem -> ScanAsset projection.
  * ========================================================================== */
 
-export function toPublicScanAsset(item: ScanTransformerItem): ScanAsset {
+export function toPublicScanAsset(
+  item: ScanTransformerItem,
+): ScanAsset {
   return {
     id: item.id,
     symbol: item.symbol,
     name: item.name,
 
     price: item.price,
-    chg_24h_pct: item.chg_24h_pct,
-    chg_7d_pct: item.chg_7d_pct,
+    chg_24h_pct:
+      item.chg_24h_pct,
+    chg_7d_pct:
+      item.chg_7d_pct,
 
-    market_cap: item.market_cap,
-    volume_24h: item.volume_24h,
+    market_cap:
+      item.market_cap,
+    volume_24h:
+      item.volume_24h,
 
-    sparkline_7d: item.sparkline_7d,
+    sparkline_7d:
+      item.sparkline_7d
+        ? [...item.sparkline_7d]
+        : null,
 
-    public_activity: item.public_activity,
-    public_sparkline_context_7d: item.public_sparkline_context_7d,
-    public_structure_transition: item.public_structure_transition,
-    public_impulse_context: item.public_impulse_context,
+    public_activity:
+      item.public_activity,
+
+    public_sparkline_context_7d:
+      item.public_sparkline_context_7d,
+
+    public_structure_transition:
+      item.public_structure_transition,
+
+    public_impulse_context:
+      item.public_impulse_context,
 
     rank: item.rank,
     logo_url: item.logo_url,
@@ -596,5 +1293,7 @@ export function toPublicScanAsset(item: ScanTransformerItem): ScanAsset {
 export function toPublicScanAssets(
   items: readonly ScanTransformerItem[],
 ): ScanAsset[] {
-  return items.map(toPublicScanAsset);
+  return items.map(
+    toPublicScanAsset,
+  );
 }

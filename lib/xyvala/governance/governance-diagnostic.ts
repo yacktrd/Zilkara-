@@ -72,6 +72,10 @@ import type {
   VariableLineageEntry,
 } from "@/lib/xyvala/governance/variable-lineage-registry";
 
+import type {
+  LineageGovernanceScope,
+} from "@/lib/xyvala/governance/lineage-reconciliation/lineage-types";
+
 /* ============================================================================
  * 1. TYPES
  * ========================================================================== */
@@ -193,13 +197,26 @@ function extractBlockedBoundaries(
 export function buildGovernanceDiagnostic(input: {
   traces?: readonly RuntimeTraceInput[];
   registry?: readonly VariableLineageEntry[];
+  scope?: LineageGovernanceScope;
 }): GovernanceDiagnosticResult {
+
   const traces = normalizeTraces(input.traces);
 
   const lineage = reconcileLineage({
-    traces,
-    ...(input.registry !== undefined ? { registry: input.registry } : {}),
-  });
+  traces,
+
+  ...(input.registry !== undefined
+    ? {
+        registry: input.registry,
+      }
+    : {}),
+
+  ...(input.scope !== undefined
+    ? {
+        scope: input.scope,
+      }
+    : {}),
+});
 
   const boundaryAudit = auditRuntimeBoundaries({
     traces,

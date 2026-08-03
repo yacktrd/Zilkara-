@@ -27,7 +27,7 @@ const DEFAULT_SORT = "rank" as const;
 const DEFAULT_ORDER = "asc" as const;
 
 const CANONICAL_SCAN_SNAPSHOT_LIMIT = 250;
-const SNAPSHOT_TTL_MS = 15 * 60_000;
+
 const PREVIEW_LIMIT = 5;
 
 type RawAssetsResult = Awaited<ReturnType<typeof loadRawAssets>>;
@@ -262,10 +262,9 @@ export async function GET(req: Request) {
     }
 
     const writeResult = await writeScanSnapshot({
-      quote,
-      snapshot,
-      ttl_ms: SNAPSHOT_TTL_MS,
-    });
+  quote,
+  snapshot,
+});
 
     if (!writeResult.ok) {
       return json(

@@ -2,58 +2,75 @@
  * FILE: lib/xyvala/governance/traceability-governor.ts
  * ----------------------------------------------------------------------------
  * TITLE
- * - Xyvala traceability governor
+ * - Xyvala private runtime traceability governor
  *
  * ROLE
- * - convert private scan assets into deterministic runtime trace inputs
- * - connect existing private analytical variables to governance runtime
- * - execute lineage, propagation, divergence, health and governance diagnostics
- * - provide an operational traceability governance result without mutation
+ * - read governed private variables from PrivateScanAsset
+ * - convert runtime-active private variables into deterministic traces
+ * - connect private analytical contracts to governance runtime
+ * - expose explicit unavailable traces without analytical reconstruction
+ * - execute lineage, propagation, divergence and governance diagnostics
  *
  * PARENTS
  * - lib/xyvala/contracts/scan-private-contract.ts
+ * - lib/xyvala/governance/variable-lineage-registry.ts
  * - lib/xyvala/governance/governance-layer-order.ts
  * - lib/xyvala/governance/governance-runtime.ts
  * - lib/xyvala/governance/runtime-traceability.ts
+ * - lib/xyvala/governance/runtime-observation-scopes.ts
  *
  * DIRECTIVES
  * - governance adapter only
+ * - OBSERVE / COMPUTE boundary only
  * - no market computation
  * - no RFS recomputation
+ * - no Triple Layer recomputation
+ * - no Impulse Layer recomputation
+ * - no Analytical Aggregation computation
  * - no MCI recomputation
- * - no calibration logic
+ * - no calibration computation
+ * - no snapshot generation
  * - no public projection
  * - no API logic
  * - no UI logic
  * - no cache mutation
  * - no persistence
  * - no event bus
+ * - no runtime mutation
  * - deterministic output only
- * - use GovernanceLayer as the only layer source of truth
+ * - use the active private runtime lineage view as source of governance truth
  *
  * INPUTS
  * - PrivateScanAsset[]
  *
  * OUTPUTS
+ * - RuntimeTraceInput[]
  * - TraceabilityGovernorResult
  *
  * INVARIANTS
  * - governor never creates analytical truth
+ * - governor never reconstructs unavailable variables
+ * - governor never changes variable meaning
  * - governor never mutates runtime state
- * - governor reads already computed private variables only
- * - missing values become explicit unavailable traces
+ * - blocked variables are excluded from active runtime governance
+ * - deprecated variables are excluded from active runtime governance
+ * - public projection variables are not read from PrivateScanAsset
+ * - missing values produce explicit unavailable traces
+ * - same assets and registry version produce the same traces
  * - first divergence remains the priority diagnostic
  *
  * CRITICAL DEPENDENCIES
  * - PrivateScanAsset
- * - GovernanceLayer
+ * - VariableLineageEntry
+ * - listPrivateScanRuntimeVariableLineageEntries
  * - RuntimeTraceInput
  * - buildGovernanceRuntimeState
  *
  * SENSITIVE ZONES
  * - private analytical variables
- * - decision leakage
- * - public/private boundary
+ * - variable aliases
+ * - ownership-layer attribution
+ * - private/public boundary
  * - propagation trace construction
  * ========================================================================== */
 
@@ -62,12 +79,9 @@ import type {
 } from "@/lib/xyvala/contracts/scan-private-contract";
 
 import {
-  listVariableLineageEntries,
+  listPrivateScanRuntimeVariableLineageEntries,
+  type VariableLineageEntry,
 } from "@/lib/xyvala/governance/variable-lineage-registry";
-
-import type {
-  GovernanceLayer,
-} from "@/lib/xyvala/governance/governance-layer-order";
 
 import {
   buildGovernanceRuntimeState,
@@ -77,6 +91,10 @@ import {
 import type {
   RuntimeTraceInput,
 } from "@/lib/xyvala/governance/runtime-traceability";
+
+import {
+  CANONICAL_SCAN_REBUILD_SCOPE,
+} from "@/lib/xyvala/governance/runtime-observation-scopes";
 
 /* ============================================================================
  * 1. TYPES
@@ -92,411 +110,505 @@ export type TraceabilityGovernorStatus =
 export type TraceabilityGovernorResult = {
   ok: boolean;
   status: TraceabilityGovernorStatus;
+
   asset_count: number;
   trace_count: number;
+
   governance: GovernanceRuntimeState;
+
   warnings: string[];
   error: string | null;
 };
 
-/* ============================================================================
- * 2. CONSTANTS
- * ========================================================================== */
+type VariableReadResult = {
+  value: unknown;
+  source_field: string | null;
+};
 
-const LAYERS = {
-  RFS: "RFS",
-  TRIPLE_LAYER: "TRIPLE_LAYER",
-  IMPULSE_LAYER: "IMPULSE_LAYER",
-  CRASH_SYSTEM: "CRASH_SYSTEM",
-  MCI: "MCI",
-  CALIBRATION: "CALIBRATION",
-} as const satisfies Record<string, GovernanceLayer>;
+type TraceBuildContext = {
+  asset: PrivateScanAsset;
+  reference: string;
+};
 
 /* ============================================================================
- * 3. SAFE HELPERS
+ * 2. SAFE HELPERS
  * ========================================================================== */
 
-function isPresent(value: unknown): boolean {
-  return value !== null && value !== undefined;
+function isPresent(
+  value: unknown,
+): boolean {
+  return (
+    value !== null &&
+    value !== undefined
+  );
 }
 
-function safeString(value: unknown, fallback = ""): string {
-  return typeof value === "string" && value.trim().length > 0
+function safeString(
+  value: unknown,
+  fallback = "",
+): string {
+  return (
+    typeof value === "string" &&
+    value.trim().length > 0
+  )
     ? value.trim()
     : fallback;
 }
 
 function uniqueWarnings(
-  ...groups: Array<string[] | undefined | null>
+  ...groups: Array<
+    readonly string[] |
+    undefined |
+    null
+  >
 ): string[] {
   return [
     ...new Set(
       groups
-        .flatMap((group) => (Array.isArray(group) ? group : []))
+        .flatMap(
+          (group) =>
+            Array.isArray(group)
+              ? group
+              : [],
+        )
         .filter(
           (item): item is string =>
-            typeof item === "string" && item.trim().length > 0,
+            typeof item === "string" &&
+            item.trim().length > 0,
+        )
+        .map(
+          (item) =>
+            item.trim(),
         ),
     ),
   ];
 }
 
-function statusFromValue(value: unknown): RuntimeTraceInput["status"] {
-  return isPresent(value) ? "valid" : "unavailable";
-}
-
-function buildAssetReference(asset: PrivateScanAsset): string {
-  return `${safeString(asset.symbol, "UNKNOWN")}:${safeString(asset.id, "unknown")}`;
-}
-
-function trace(input: {
-  variable_name: string;
-  layer: RuntimeTraceInput["layer"];
-  value: unknown;
-  source?: RuntimeTraceInput["source"];
-  reference?: string | null;
-  reason?: string | null;
-}): RuntimeTraceInput {
-  const valuePresent = isPresent(input.value);
-
-  return {
-    variable_name: input.variable_name,
-    layer: input.layer,
-    status: statusFromValue(input.value),
-    source: input.source ?? "governance",
-    reference: input.reference ?? null,
-    reason:
-      input.reason ??
-      (valuePresent ? null : "variable_unavailable"),
-  };
-}
-
-/* ============================================================================
- * 4. TRACE BUILDERS — SOURCE LAYERS
- * ========================================================================== */
-
-function buildRfsTraces(asset: PrivateScanAsset): RuntimeTraceInput[] {
-  const reference = buildAssetReference(asset);
-
-  return [
-    trace({
-      variable_name: "stability_score",
-      layer: LAYERS.RFS,
-      value: asset.stability_score,
-      source: "engine",
-      reference,
-    }),
-    trace({
-      variable_name: "regime",
-      layer: LAYERS.RFS,
-      value: asset.regime,
-      source: "engine",
-      reference,
-    }),
-    trace({
-      variable_name: "rupture_score",
-      layer: LAYERS.RFS,
-      value: asset.rupture_score,
-      source: "engine",
-      reference,
-    }),
-    trace({
-      variable_name: "rupture_probability",
-      layer: LAYERS.RFS,
-      value: asset.rupture_probability,
-      source: "engine",
-      reference,
-    }),
-    trace({
-      variable_name: "continuity_probability",
-      layer: LAYERS.RFS,
-      value: asset.continuity_probability,
-      source: "engine",
-      reference,
-    }),
-  ];
-}
-
-function buildTripleLayerTraces(
+function buildAssetReference(
   asset: PrivateScanAsset,
-): RuntimeTraceInput[] {
-  const reference = buildAssetReference(asset);
+): string {
+  const symbol =
+    safeString(
+      asset.symbol,
+      "UNKNOWN",
+    );
 
-  return [
-    trace({
-      variable_name: "growth_layer",
-      layer: LAYERS.TRIPLE_LAYER,
-      value: asset.growth_score,
-      source: "engine",
-      reference,
-    }),
-    trace({
-      variable_name: "core_pattern_layer",
-      layer: LAYERS.TRIPLE_LAYER,
-      value: asset.core_pattern_score,
-      source: "engine",
-      reference,
-    }),
-    trace({
-      variable_name: "decay_layer",
-      layer: LAYERS.TRIPLE_LAYER,
-      value: asset.decay_score,
-      source: "engine",
-      reference,
-    }),
-  ];
+  const id =
+    safeString(
+      asset.id,
+      "unknown",
+    );
+
+  return `${symbol}:${id}`;
 }
 
-function buildImpulseLayerTraces(
-  asset: PrivateScanAsset,
-): RuntimeTraceInput[] {
-  const reference = buildAssetReference(asset);
+function readRecordField(
+  source: unknown,
+  field: string,
+): unknown {
+  if (
+    typeof source !== "object" ||
+    source === null
+  ) {
+    return null;
+  }
 
-  return [
-    trace({
-      variable_name: "impulse_pressure_score",
-      layer: LAYERS.IMPULSE_LAYER,
-      value: asset.impulse_pressure_score,
-      source: "engine",
-      reference,
-    }),
-    trace({
-      variable_name: "impulse_instability_score",
-      layer: LAYERS.IMPULSE_LAYER,
-      value: asset.impulse_instability_score,
-      source: "engine",
-      reference,
-    }),
-    trace({
-      variable_name: "impulse_saturation_score",
-      layer: LAYERS.IMPULSE_LAYER,
-      value: asset.impulse_saturation_score,
-      source: "engine",
-      reference,
-    }),
-    trace({
-      variable_name: "impulse_exhaustion_score",
-      layer: LAYERS.IMPULSE_LAYER,
-      value: asset.impulse_exhaustion_score,
-      source: "engine",
-      reference,
-    }),
-    trace({
-      variable_name: "impulse_directional_bias",
-      layer: LAYERS.IMPULSE_LAYER,
-      value: asset.impulse_directional_bias,
-      source: "engine",
-      reference,
-    }),
-    trace({
-      variable_name: "impulse_transition_state",
-      layer: LAYERS.IMPULSE_LAYER,
-      value: asset.impulse_transition_state,
-      source: "engine",
-      reference,
-    }),
-  ];
-}
-
-function buildCrashSystemTraces(
-  asset: PrivateScanAsset,
-): RuntimeTraceInput[] {
-  const reference = buildAssetReference(asset);
-
-  return [
-    trace({
-      variable_name: "crash_score",
-      layer: LAYERS.CRASH_SYSTEM,
-      value: asset.crash_score,
-      source: "engine",
-      reference,
-    }),
-    trace({
-      variable_name: "crash_state",
-      layer: LAYERS.CRASH_SYSTEM,
-      value: asset.crash_state,
-      source: "engine",
-      reference,
-    }),
-  ];
-}
-
-function buildMciTraces(asset: PrivateScanAsset): RuntimeTraceInput[] {
-  const reference = buildAssetReference(asset);
-
-  return [
-    trace({
-      variable_name: "decision",
-      layer: LAYERS.MCI,
-      value: asset.decision,
-      source: "engine",
-      reference,
-    }),
-  ];
-}
-
-function buildCalibrationTraces(
-  asset: PrivateScanAsset,
-): RuntimeTraceInput[] {
-  return [];
-}
-
- 
-
-/* ============================================================================
- * 5. TRACE BUILDERS — LINEAGE PROPAGATION
- * ==========================================================================
- *
- * ROLE
- * - generate propagation traces from the official variable lineage registry
- * - read only values already present on PrivateScanAsset
- * - expose unavailable variables explicitly without reconstruction
- *
- * DIRECTIVES
- * - trace propagation only
- * - no analytical computation
- * - no reconstruction of missing values
- * - no mutation
- * - deterministic output only
- * ========================================================================== */
-
-function readRecordField(source: unknown, field: string): unknown {
-  if (typeof source !== "object" || source === null) return null;
-
-  return (source as Record<string, unknown>)[field] ?? null;
+  return (
+    source as Record<string, unknown>
+  )[field] ?? null;
 }
 
 function readNestedRecordField(
   source: unknown,
   path: readonly string[],
 ): unknown {
-  let current: unknown = source;
+  let current: unknown =
+    source;
 
-  for (const key of path) {
-    if (typeof current !== "object" || current === null) return null;
+  for (
+    const field of path
+  ) {
+    if (
+      typeof current !== "object" ||
+      current === null
+    ) {
+      return null;
+    }
 
-    current = (current as Record<string, unknown>)[key];
+    current = (
+      current as Record<
+        string,
+        unknown
+      >
+    )[field];
   }
 
   return current ?? null;
 }
 
-function readFirstAvailableValue(values: readonly unknown[]): unknown {
-  return values.find(isPresent) ?? null;
+function readFirstAvailableValue(
+  candidates: readonly {
+    field: string;
+    value: unknown;
+  }[],
+): VariableReadResult {
+  const availableCandidate =
+    candidates.find(
+      (candidate) =>
+        isPresent(
+          candidate.value,
+        ),
+    );
+
+  if (!availableCandidate) {
+    return {
+      value: null,
+      source_field: null,
+    };
+  }
+
+  return {
+    value:
+      availableCandidate.value,
+
+    source_field:
+      availableCandidate.field,
+  };
 }
 
-function readAssetVariableValue(input: {
+function statusFromValue(
+  value: unknown,
+): RuntimeTraceInput["status"] {
+  return isPresent(value)
+    ? "valid"
+    : "unavailable";
+}
+
+/* ============================================================================
+ * 3. TRACE FACTORY
+ * ========================================================================== */
+
+function buildTrace(input: {
+  variable_name: string;
+  layer: RuntimeTraceInput["layer"];
+  value: unknown;
+
+  source:
+    RuntimeTraceInput["source"];
+
+  reference: string;
+
+  reason?: string | null;
+}): RuntimeTraceInput {
+  const valuePresent =
+    isPresent(input.value);
+
+  return {
+    variable_name:
+      input.variable_name,
+
+    layer:
+      input.layer,
+
+    status:
+      statusFromValue(
+        input.value,
+      ),
+
+    source:
+      input.source,
+
+    reference:
+      input.reference,
+
+    reason:
+      input.reason ??
+      (
+        valuePresent
+          ? null
+          : "variable_unavailable"
+      ),
+  };
+}
+
+/* ============================================================================
+ * 4. PRIVATE CONTRACT VARIABLE READER
+ * ==========================================================================
+ *
+ * ROLE
+ * - read an already-produced value from PrivateScanAsset
+ * - resolve explicit contract aliases
+ * - preserve the canonical variable identity
+ *
+ * DIRECTIVES
+ * - no computation
+ * - no normalization of analytical meaning
+ * - no default analytical value
+ * - no reconstruction
+ * - null means unavailable
+ * ========================================================================== */
+
+function readPrivateAssetVariable(input: {
   asset: PrivateScanAsset;
   variableName: string;
-}): unknown {
-  const asset = input.asset;
+}): VariableReadResult {
+  const asset =
+    input.asset;
 
-    switch (input.variableName) {
+  switch (
+    input.variableName
+  ) {
     /* ------------------------------------------------------------------------
-     * Acquisition / market inputs
+     * Acquisition
      * ---------------------------------------------------------------------- */
 
     case "id":
-      return readRecordField(asset, "id");
+      return {
+        value:
+          readRecordField(
+            asset,
+            "id",
+          ),
+
+        source_field:
+          "id",
+      };
 
     case "symbol":
-      return asset.symbol;
+      return {
+        value:
+          readRecordField(
+            asset,
+            "symbol",
+          ),
+
+        source_field:
+          "symbol",
+      };
 
     case "name":
-      return asset.name;
+      return {
+        value:
+          readRecordField(
+            asset,
+            "name",
+          ),
+
+        source_field:
+          "name",
+      };
 
     case "price_eur":
       return readFirstAvailableValue([
-        readRecordField(asset, "price_eur"),
-        readRecordField(asset, "price"),
-        readNestedRecordField(asset, ["market", "price_eur"]),
+        {
+          field:
+            "price_eur",
+
+          value:
+            readRecordField(
+              asset,
+              "price_eur",
+            ),
+        },
+        {
+          field:
+            "price",
+
+          value:
+            readRecordField(
+              asset,
+              "price",
+            ),
+        },
+        {
+          field:
+            "market.price_eur",
+
+          value:
+            readNestedRecordField(
+              asset,
+              [
+                "market",
+                "price_eur",
+              ],
+            ),
+        },
       ]);
 
     case "chg_24h_pct":
-      return asset.chg_24h_pct;
+      return {
+        value:
+          readRecordField(
+            asset,
+            "chg_24h_pct",
+          ),
+
+        source_field:
+          "chg_24h_pct",
+      };
 
     case "chg_7d_pct":
-      return asset.chg_7d_pct;
+      return {
+        value:
+          readRecordField(
+            asset,
+            "chg_7d_pct",
+          ),
+
+        source_field:
+          "chg_7d_pct",
+      };
 
     case "sparkline_7d":
-      return asset.sparkline_7d;
+      return {
+        value:
+          readRecordField(
+            asset,
+            "sparkline_7d",
+          ),
+
+        source_field:
+          "sparkline_7d",
+      };
 
     case "market_cap_eur":
       return readFirstAvailableValue([
-        readRecordField(asset, "market_cap_eur"),
-        readRecordField(asset, "market_cap"),
+        {
+          field:
+            "market_cap_eur",
+
+          value:
+            readRecordField(
+              asset,
+              "market_cap_eur",
+            ),
+        },
+        {
+          field:
+            "market_cap",
+
+          value:
+            readRecordField(
+              asset,
+              "market_cap",
+            ),
+        },
       ]);
 
     case "volume_24h_eur":
       return readFirstAvailableValue([
-        readRecordField(asset, "volume_24h_eur"),
-        readRecordField(asset, "volume_24h"),
+        {
+          field:
+            "volume_24h_eur",
+
+          value:
+            readRecordField(
+              asset,
+              "volume_24h_eur",
+            ),
+        },
+        {
+          field:
+            "volume_24h",
+
+          value:
+            readRecordField(
+              asset,
+              "volume_24h",
+            ),
+        },
       ]);
 
     case "rank":
-      return asset.rank;
+      return {
+        value:
+          readRecordField(
+            asset,
+            "rank",
+          ),
+
+        source_field:
+          "rank",
+      };
 
     case "logo_url":
       return readFirstAvailableValue([
-        readRecordField(asset, "logo_url"),
-        readRecordField(asset, "logo"),
+        {
+          field:
+            "logo_url",
+
+          value:
+            readRecordField(
+              asset,
+              "logo_url",
+            ),
+        },
+        {
+          field:
+            "logo",
+
+          value:
+            readRecordField(
+              asset,
+              "logo",
+            ),
+        },
       ]);
 
     /* ------------------------------------------------------------------------
-     * RFS core truth
+     * RFS core and support truths
      * ---------------------------------------------------------------------- */
 
     case "stability_score":
-      return asset.stability_score;
-
+    case "stability_status":
     case "regime":
-      return asset.regime;
-
+    case "structure_score":
+    case "market_score":
+    case "coherence_score":
+    case "occurrence_score":
+    case "frequency_score":
+    case "convergence_score":
+    case "duration_score":
+    case "evolution_score":
+    case "growth_score":
     case "rupture_score":
-      return asset.rupture_score;
-
     case "rupture_probability":
-      return asset.rupture_probability;
-
+    case "rupture_penalty_score":
+    case "rupture_occurrence_score":
+    case "rupture_frequency_score":
+    case "rupture_convergence_score":
+    case "rupture_duration_score":
+    case "rupture_evolution_score":
+    case "rupture_evolution_state":
+    case "rupture_acceleration_score":
     case "continuity_probability":
-      return asset.continuity_probability;
+      return {
+        value:
+          readRecordField(
+            asset,
+            input.variableName,
+          ),
 
-    case "crash_score":
-      return asset.crash_score;
-
-    case "crash_state":
-      return asset.crash_state;
+        source_field:
+          input.variableName,
+      };
 
     /* ------------------------------------------------------------------------
-     * RFS support variables
+     * Crash System
      * ---------------------------------------------------------------------- */
 
-    case "structure_score":
-      return readRecordField(asset, "structure_score");
+    case "crash_score":
+    case "crash_state":
+      return {
+        value:
+          readRecordField(
+            asset,
+            input.variableName,
+          ),
 
-    case "market_score":
-      return readRecordField(asset, "market_score");
-
-    case "coherence_score":
-      return readRecordField(asset, "coherence_score");
-
-    case "occurrence_score":
-      return readRecordField(asset, "occurrence_score");
-
-    case "frequency_score":
-      return readRecordField(asset, "frequency_score");
-
-    case "convergence_score":
-      return readRecordField(asset, "convergence_score");
-
-    case "duration_score":
-      return readRecordField(asset, "duration_score");
-
-    case "evolution_score":
-      return readRecordField(asset, "evolution_score");
-
-    case "growth_score":
-      return readRecordField(asset, "growth_score");
+        source_field:
+          input.variableName,
+      };
 
     /* ------------------------------------------------------------------------
      * Triple Layer
@@ -504,252 +616,606 @@ function readAssetVariableValue(input: {
 
     case "growth_layer":
       return readFirstAvailableValue([
-        readRecordField(asset, "growth_layer"),
-        readRecordField(asset, "growth_layer_score"),
-        readRecordField(asset, "growth_score"),
+        {
+          field:
+            "growth_layer",
+
+          value:
+            readRecordField(
+              asset,
+              "growth_layer",
+            ),
+        },
+        {
+          field:
+            "growth_layer_score",
+
+          value:
+            readRecordField(
+              asset,
+              "growth_layer_score",
+            ),
+        },
+        {
+          field:
+            "growth_score",
+
+          value:
+            readRecordField(
+              asset,
+              "growth_score",
+            ),
+        },
       ]);
 
     case "core_pattern_layer":
       return readFirstAvailableValue([
-        readRecordField(asset, "core_pattern_layer"),
-        readRecordField(asset, "core_pattern_score"),
+        {
+          field:
+            "core_pattern_layer",
+
+          value:
+            readRecordField(
+              asset,
+              "core_pattern_layer",
+            ),
+        },
+        {
+          field:
+            "core_pattern_score",
+
+          value:
+            readRecordField(
+              asset,
+              "core_pattern_score",
+            ),
+        },
       ]);
 
     case "decay_layer":
       return readFirstAvailableValue([
-        readRecordField(asset, "decay_layer"),
-        readRecordField(asset, "decay_score"),
+        {
+          field:
+            "decay_layer",
+
+          value:
+            readRecordField(
+              asset,
+              "decay_layer",
+            ),
+        },
+        {
+          field:
+            "decay_score",
+
+          value:
+            readRecordField(
+              asset,
+              "decay_score",
+            ),
+        },
       ]);
+
+    case "triple_layer_state":
+      return readFirstAvailableValue([
+        {
+          field:
+            "triple_layer_state",
+
+          value:
+            readRecordField(
+              asset,
+              "triple_layer_state",
+            ),
+        },
+        {
+          field:
+            "state",
+
+          value:
+            readRecordField(
+              asset,
+              "state",
+            ),
+        },
+        {
+          field:
+            "triple_layer.state",
+
+          value:
+            readNestedRecordField(
+              asset,
+              [
+                "triple_layer",
+                "state",
+              ],
+            ),
+        },
+      ]);
+
+    case "core_pattern_score":
+    case "decay_score":
+      return {
+        value:
+          readRecordField(
+            asset,
+            input.variableName,
+          ),
+
+        source_field:
+          input.variableName,
+      };
 
     /* ------------------------------------------------------------------------
      * Impulse Layer
      * ---------------------------------------------------------------------- */
 
     case "impulse_pressure_score":
-      return asset.impulse_pressure_score;
-
+    case "impulse_acceleration_score":
+    case "impulse_alignment_score":
     case "impulse_instability_score":
-      return asset.impulse_instability_score;
-
     case "impulse_saturation_score":
-      return asset.impulse_saturation_score;
-
     case "impulse_exhaustion_score":
-      return asset.impulse_exhaustion_score;
-
     case "impulse_directional_bias":
-      return asset.impulse_directional_bias;
-
     case "impulse_transition_state":
-      return asset.impulse_transition_state;
+    case "impulse_status":
+      return readFirstAvailableValue([
+        {
+          field:
+            input.variableName,
+
+          value:
+            readRecordField(
+              asset,
+              input.variableName,
+            ),
+        },
+        {
+          field:
+            `impulse.${input.variableName}`,
+
+          value:
+            readNestedRecordField(
+              asset,
+              [
+                "impulse",
+                input.variableName,
+              ],
+            ),
+        },
+      ]);
 
     /* ------------------------------------------------------------------------
-     * Analytical aggregation
-     * ---------------------------------------------------------------------- */
-
-    case "structural_context":
-      return readRecordField(asset, "structural_context");
-
-    case "transition_context":
-      return readRecordField(asset, "transition_context");
-
-    case "risk_context":
-      return readRecordField(asset, "risk_context");
-
-    case "temporal_context":
-      return readRecordField(asset, "temporal_context");
-
-    /* ------------------------------------------------------------------------
-     * MCI private decision layer
+     * MCI runtime variables
      * ---------------------------------------------------------------------- */
 
     case "decision":
-      return asset.decision;
-
-    case "decision_score":
-      return readFirstAvailableValue([
-        readRecordField(asset, "decision_score"),
-        readNestedRecordField(asset, ["decision_layer", "decision_score"]),
-        readNestedRecordField(asset, ["mci", "decision_score"]),
-      ]);
-
-    case "confidence_score":
-      return readRecordField(asset, "confidence_score");
-
-    case "confidence_status":
-      return readRecordField(asset, "confidence_status");
-
-    case "opportunity_score":
-      return readRecordField(asset, "opportunity_score");
-
-    case "opportunity_status":
-      return readRecordField(asset, "opportunity_status");
-
     case "decision_status":
-      return readRecordField(asset, "decision_status");
+    case "opportunity_score":
+    case "opportunity_status":
+    case "confidence_score":
+    case "confidence_status":
+    case "neutralized":
+    case "neutralization_reason":
+    case "neutralization_severity":
+    case "neutralization_validity":
+      return readFirstAvailableValue([
+        {
+          field:
+            input.variableName,
+
+          value:
+            readRecordField(
+              asset,
+              input.variableName,
+            ),
+        },
+        {
+          field:
+            `mci.${input.variableName}`,
+
+          value:
+            readNestedRecordField(
+              asset,
+              [
+                "mci",
+                input.variableName,
+              ],
+            ),
+        },
+        {
+          field:
+            `decision_layer.${input.variableName}`,
+
+          value:
+            readNestedRecordField(
+              asset,
+              [
+                "decision_layer",
+                input.variableName,
+              ],
+            ),
+        },
+      ]);
 
     /* ------------------------------------------------------------------------
-     * Calibration
+     * Defensive fallback
      * ---------------------------------------------------------------------- */
 
-    case "calibration_allow_threshold":
-      return readFirstAvailableValue([
-        readRecordField(asset, "calibration_allow_threshold"),
-        readNestedRecordField(asset, ["calibration", "calibration_allow_threshold"]),
-      ]);
+    default:
+      return {
+        value:
+          readRecordField(
+            asset,
+            input.variableName,
+          ),
 
-    case "calibration_watch_threshold":
-      return readFirstAvailableValue([
-        readRecordField(asset, "calibration_watch_threshold"),
-        readNestedRecordField(asset, ["calibration", "calibration_watch_threshold"]),
-      ]);
-
-    case "calibration_block_threshold":
-      return readFirstAvailableValue([
-        readRecordField(asset, "calibration_block_threshold"),
-        readNestedRecordField(asset, ["calibration", "calibration_block_threshold"]),
-      ]);
-
-    /* ------------------------------------------------------------------------
-     * Public projection / UI
-     * ---------------------------------------------------------------------- */
-
-    case "public_impulse_context":
-      return readRecordField(asset, "public_impulse_context");
-
-    case "public_structure_transition":
-      return readRecordField(asset, "public_structure_transition");
-
-    case "ui_stability_label":
-      return readRecordField(asset, "ui_stability_label");
-
-        default:
-      return readRecordField(asset, input.variableName);
+        source_field:
+          input.variableName,
+      };
   }
 }
 
-function buildLineagePropagationTraces(
-  asset: PrivateScanAsset,
-): RuntimeTraceInput[] {
-  const reference = buildAssetReference(asset);
+/* ============================================================================
+ * 5. LINEAGE TRACE CONSTRUCTION
+ * ==========================================================================
+ *
+ * ROLE
+ * - select variables legitimately observable from PrivateScanAsset
+ * - create traces from the runtime observation path only
+ * - use the registry as the only variable-list source of truth
+ *
+ * TRACE POLICY
+ * - REQUIRED variables are always traced
+ * - OPTIONAL variables are traced only when their value exists
+ * - OUT_OF_SCOPE variables are never traced
+ * - BLOCKED and DEPRECATED variables are never traced
+ * - ownership-layer traces use source "engine"
+ * - downstream observation traces use source "governance"
+ * - unavailable required values remain explicit
+ * - no value is reconstructed for a downstream layer
+ * ========================================================================== */
 
-  return listVariableLineageEntries().flatMap((entry) => {
-    const value = readAssetVariableValue({
+function shouldTraceRegistryEntry(input: {
+  asset: PrivateScanAsset;
+  entry: Readonly<VariableLineageEntry>;
+}): boolean {
+  const {
+    asset,
+    entry,
+  } = input;
+
+  /*
+   * Only active entries can participate in runtime observation.
+   */
+  if (
+    entry.lineage_status !==
+    "ACTIVE"
+  ) {
+    return false;
+  }
+
+  /*
+   * This governor is exclusively attached to the PrivateScanAsset boundary.
+   */
+  if (
+    entry.runtime_scope !==
+    "PRIVATE_SCAN"
+  ) {
+    return false;
+  }
+
+  /*
+   * A variable without an observation path cannot produce runtime traces.
+   */
+  if (
+    entry.runtime_observation_path.length ===
+    0
+  ) {
+    return false;
+  }
+
+  /*
+   * Canonical-only or explicitly excluded variables never enter runtime.
+   */
+  if (
+    entry.runtime_requirement ===
+    "OUT_OF_SCOPE"
+  ) {
+    return false;
+  }
+
+  /*
+   * Required variables must remain observable even when unavailable.
+   *
+   * Their absence is a legitimate runtime divergence.
+   */
+  if (
+    entry.runtime_requirement ===
+    "REQUIRED"
+  ) {
+    return true;
+  }
+
+  /*
+   * Optional variables enter traceability only when their source value exists.
+   */
+  const readResult =
+    readPrivateAssetVariable({
       asset,
-      variableName: entry.variable_name,
+
+      variableName:
+        entry.variable_name,
     });
 
-    return entry.propagation_path.map((layer) =>
-      trace({
-        variable_name: entry.variable_name,
-        layer,
-        value,
-        source: "governance",
-        reference,
-        reason: isPresent(value)
-          ? "lineage_propagation_observed"
-          : "lineage_value_unavailable",
-      }),
-    );
-  });
+  return isPresent(
+    readResult.value,
+  );
 }
 
-/* ============================================================================
- * 6. TRACE BUILDERS — PUBLIC ENTRY
- * ========================================================================== */
+function buildEntryTraces(input: {
+  context: TraceBuildContext;
+  entry: Readonly<VariableLineageEntry>;
+}): RuntimeTraceInput[] {
+  const {
+    context,
+    entry,
+  } = input;
+
+  const readResult =
+    readPrivateAssetVariable({
+      asset:
+        context.asset,
+
+      variableName:
+        entry.variable_name,
+    });
+
+  const valueAvailable =
+    isPresent(
+      readResult.value,
+    );
+
+  return entry
+    .runtime_observation_path
+    .map(
+      (
+        layer,
+      ): RuntimeTraceInput => {
+        const ownershipTrace =
+          layer ===
+          entry.ownership_layer;
+
+        const reason =
+          valueAvailable
+            ? ownershipTrace
+              ? (
+                  readResult.source_field
+                    ? `source_value_observed:${readResult.source_field}`
+                    : "source_value_observed"
+                )
+              : "runtime_propagation_observed"
+            : ownershipTrace
+              ? "required_source_value_unavailable"
+              : "required_runtime_value_unavailable";
+
+        return buildTrace({
+          variable_name:
+            entry.variable_name,
+
+          layer,
+
+          value:
+            readResult.value,
+
+          source:
+            ownershipTrace
+              ? "engine"
+              : "governance",
+
+          reference:
+            context.reference,
+
+          reason,
+        });
+      },
+    );
+}
 
 export function buildPrivateAssetTraces(
   asset: PrivateScanAsset,
 ): RuntimeTraceInput[] {
-  return [
-    ...buildRfsTraces(asset),
-    ...buildTripleLayerTraces(asset),
-    ...buildImpulseLayerTraces(asset),
-    ...buildCrashSystemTraces(asset),
-    ...buildMciTraces(asset),
-    ...buildCalibrationTraces(asset),
-    ...buildLineagePropagationTraces(asset),
-  ];
+  const context:
+    TraceBuildContext = {
+      asset,
+
+      reference:
+        buildAssetReference(
+          asset,
+        ),
+    };
+
+  const runtimeEntries =
+    listPrivateScanRuntimeVariableLineageEntries({
+      include_optional:
+        true,
+    });
+
+  return runtimeEntries
+    .filter(
+      (
+        registryEntry:
+          Readonly<VariableLineageEntry>,
+      ) =>
+        shouldTraceRegistryEntry({
+          asset,
+
+          entry:
+            registryEntry,
+        }),
+    )
+    .flatMap(
+      (
+        registryEntry:
+          Readonly<VariableLineageEntry>,
+      ) =>
+        buildEntryTraces({
+          context,
+
+          entry:
+            registryEntry,
+        }),
+    );
 }
 
 function buildPrivateAssetsTraces(
-  assets: readonly PrivateScanAsset[],
+  assets:
+    readonly PrivateScanAsset[],
 ): RuntimeTraceInput[] {
-  return assets.flatMap(buildPrivateAssetTraces);
+  return assets.flatMap(
+    (
+      asset,
+    ) =>
+      buildPrivateAssetTraces(
+        asset,
+      ),
+  );
 }
 
 /* ============================================================================
- * 7. STATUS RESOLUTION
+ * 6. STATUS RESOLUTION
  * ========================================================================== */
 
 function resolveGovernorStatus(
-  governance: GovernanceRuntimeState,
+  governance:
+    GovernanceRuntimeState,
 ): TraceabilityGovernorStatus {
-  if (governance.status === "READY") return "governed";
-  if (governance.status === "DEGRADED") return "degraded";
-  if (governance.status === "BLOCKED") return "blocked";
+  switch (
+    governance.status
+  ) {
+    case "READY":
+      return "governed";
 
-  return "invalid";
+    case "DEGRADED":
+      return "degraded";
+
+    case "BLOCKED":
+      return "blocked";
+
+    default:
+      return "invalid";
+  }
 }
 
 /* ============================================================================
- * 8. PUBLIC GOVERNOR API
+ * 7. GOVERNOR RESULT
  * ========================================================================== */
 
 export function buildTraceabilityGovernorResult(input: {
-  assets: readonly PrivateScanAsset[];
+  assets:
+    readonly PrivateScanAsset[];
 }): TraceabilityGovernorResult {
-  if (!Array.isArray(input.assets) || input.assets.length === 0) {
-    const governance = buildGovernanceRuntimeState({
-      traces: [],
-    });
+  if (
+    !Array.isArray(
+      input.assets,
+    ) ||
+    input.assets.length === 0
+  ) {
+    const governance =
+      buildGovernanceRuntimeState({
+        traces: [],
+        scope:
+          CANONICAL_SCAN_REBUILD_SCOPE,
+      });
 
     return {
       ok: true,
       status: "empty",
+
       asset_count: 0,
       trace_count: 0,
+
       governance,
-      warnings: ["traceability_governor_assets_empty"],
+
+      warnings: [
+        "traceability_governor_assets_empty",
+      ],
+
       error: null,
     };
   }
 
-  const traces = buildPrivateAssetsTraces(input.assets);
+  const traces =
+    buildPrivateAssetsTraces(
+      input.assets,
+    );
 
-  const governance = buildGovernanceRuntimeState({
-    traces,
-  });
+  const governance =
+    buildGovernanceRuntimeState({
+      traces,
 
-  const warnings = uniqueWarnings(
-    !governance.ok
-      ? [`traceability_governor_${governance.status.toLowerCase()}`]
-      : [],
-    governance.warnings,
-  );
+      scope:
+        CANONICAL_SCAN_REBUILD_SCOPE,
+    });
+
+  const warnings =
+    uniqueWarnings(
+      !governance.ok
+        ? [
+            `traceability_governor_${governance.status.toLowerCase()}`,
+          ]
+        : [],
+
+      governance.warnings,
+    );
 
   return {
-    ok: governance.ok,
-    status: resolveGovernorStatus(governance),
-    asset_count: input.assets.length,
-    trace_count: traces.length,
+    ok:
+      governance.ok,
+
+    status:
+      resolveGovernorStatus(
+        governance,
+      ),
+
+    asset_count:
+      input.assets.length,
+
+    trace_count:
+      traces.length,
+
     governance,
+
     warnings,
-    error: governance.error,
+
+    error:
+      governance.error,
   };
 }
 
-export function assertTraceabilityGoverned(input: {
-  assets: readonly PrivateScanAsset[];
-}): void {
-  const result = buildTraceabilityGovernorResult(input);
+/* ============================================================================
+ * 8. ASSERTION API
+ * ========================================================================== */
 
-  if (!result.ok) {
-    throw new Error(
-      `traceability_governor_failed:${[
-        result.status,
-        result.error ?? "unknown_error",
-      ].join(":")}`,
+export function assertTraceabilityGoverned(input: {
+  assets:
+    readonly PrivateScanAsset[];
+}): void {
+  const result =
+    buildTraceabilityGovernorResult(
+      input,
     );
+
+  if (result.ok) {
+    return;
   }
+
+  throw new Error(
+    [
+      "traceability_governor_failed",
+      result.status,
+      result.error ??
+        "unknown_error",
+    ].join(":"),
+  );
 }

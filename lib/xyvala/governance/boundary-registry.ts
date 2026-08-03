@@ -388,19 +388,14 @@ export const BOUNDARY_REGISTRY = Object.freeze([
       "threshold_public_exposure",
     ],
     expected_variables: [
-      "decision",
-      "decision_score",
-      "allow_raw_score",
-      "block_raw_score",
-      "decision_reason",
-    ],
-    protected_private_variables: [
-      "decision",
-      "decision_score",
-      "allow_raw_score",
-      "block_raw_score",
-      "decision_reason",
-    ],
+  "decision",
+  "decision_score",
+],
+protected_private_variables: [
+  "decision",
+  "decision_score",
+],
+
     validation_required: true,
     mutation_allowed: false,
     reconstruction_allowed: false,

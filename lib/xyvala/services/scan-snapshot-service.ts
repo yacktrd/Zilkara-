@@ -65,7 +65,8 @@ import {
  * 1. CONFIG
  * ========================================================================== */
 
-const DEFAULT_SNAPSHOT_TTL_MS = 300_000;
+const DEFAULT_SNAPSHOT_RETENTION_MS = 604_800_000;
+const DEFAULT_SNAPSHOT_FRESHNESS_MS = 300_000;
 
 /* ============================================================================
  * 2. TYPES
@@ -117,7 +118,7 @@ export type ClearScanSnapshotInput = {
 function normalizeTtlMs(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) && value > 0
     ? Math.trunc(value)
-    : DEFAULT_SNAPSHOT_TTL_MS;
+    : DEFAULT_SNAPSHOT_RETENTION_MS;
 }
 
 function uniqueWarnings(
@@ -155,7 +156,10 @@ export async function writeScanSnapshot(
   input: WriteScanSnapshotInput,
 ): Promise<ScanSnapshotWriteResult> {
   const key = getCanonicalScanSnapshotKey(input.quote);
-  const ttlMs = normalizeTtlMs(input.ttl_ms);
+
+  const ttlMs = normalizeTtlMs(
+    input.ttl_ms ?? DEFAULT_SNAPSHOT_RETENTION_MS,
+  );
 
   if (!isScanSnapshot(input.snapshot)) {
     return {
@@ -180,15 +184,20 @@ export async function writeScanSnapshot(
   }
 
   try {
-    await setToCache(key, input.snapshot, ttlMs);
-  
-  
+    await setToCache(
+      key,
+      input.snapshot,
+      ttlMs,
+    );
+
     return {
       ok: true,
       key,
       snapshot_saved: true,
       count: input.snapshot.count,
-      warnings: uniqueWarnings(input.snapshot.meta?.warnings),
+      warnings: uniqueWarnings(
+        input.snapshot.meta?.warnings,
+      ),
       error: null,
     };
   } catch (error) {
@@ -198,7 +207,10 @@ export async function writeScanSnapshot(
       snapshot_saved: false,
       count: input.snapshot.count,
       warnings: ["scan_snapshot_write_failed"],
-      error: errorMessage(error, "scan_snapshot_write_failed"),
+      error: errorMessage(
+        error,
+        "scan_snapshot_write_failed",
+      ),
     };
   }
 }

@@ -2,1017 +2,1885 @@
  * FILE: lib/xyvala/calibration/impulse-adaptive-thresholds.ts
  * ----------------------------------------------------------------------------
  * TITLE
- * - Xyvala impulse adaptive thresholds
+ * - Xyvala canonical Impulse Layer adaptive threshold calibration
  *
  * ROLE
- * - derive bounded adaptive impulse transition thresholds from real samples
- * - preserve impulse pressure as the primary impulse axis
- * - keep acceleration and alignment as contextual validation axes
- * - use Triple Layer scores as calibration context only
+ * - consume real previously computed Impulse Layer samples
+ * - validate and normalize calibration samples without repairing them
+ * - classify unlabeled bootstrap samples through the canonical Impulse resolver
+ * - derive bounded adaptive transition thresholds from observed distributions
+ * - preserve pressure as the primary Impulse transition axis
+ * - use Triple Layer readings as contextual calibration evidence only
+ * - produce an immutable policy consumed by the canonical Impulse resolver
+ *
+ * CLASSIFICATION
+ * - PRIVATE CALIBRATION ENGINE
+ * - COMPUTE
+ * - PURE
+ * - DETERMINISTIC
+ * - NON-MUTATING
+ *
+ * POSITION IN OFFICIAL CHAIN
+ * - Acquisition
+ * - RFS
+ * - Triple Layer
+ * - Impulse Layer
+ * - Analytical Aggregation System
+ * - MCI
+ * - Calibration
+ * - Snapshot
+ * - Transformers
+ * - Rankings
+ * - API
+ * - Interface
+ *
+ * PARENTS
+ * - governed Impulse calibration orchestrator
+ * - governed calibration sample store
+ * - canonical Impulse Layer resolver contract
+ *
+ * CONSUMERS
+ * - private calibration orchestrator
+ * - Impulse Layer policy injection adapter
+ * - private calibration observability
+ * - calibration distribution store
  *
  * DIRECTIVES
- * - deterministic only
- * - calibration layer only
- * - no mutation
- * - no persistence
+ * - calibration logic only
  * - no RFS recomputation
+ * - no Triple Layer recomputation
+ * - no Impulse score recomputation
+ * - no final Impulse state propagation
  * - no MCI recomputation
- * - no public projection
- * - no UI logic
+ * - no decision computation
+ * - no snapshot construction
+ * - no transformer logic
+ * - no ranking logic
  * - no API logic
- * - no snapshot mutation
+ * - no UI logic
+ * - no public projection
+ * - no persistence
+ * - no runtime mutation
+ * - no local clock access
+ * - no generated timestamp
+ * - no sample repair
+ * - no missing-value neutralization
+ * - no invalid-value clamping into validity
+ * - no synthetic sample generation
  * - no buy / sell / hold semantics
- * - insufficient samples fallback to static defaults
- * - neutral remains fallback, not calibration target dominance
+ * - same canonical samples and resolver version => same policy
  *
  * INPUTS
- * - impulse score samples
- * - optional Triple Layer context scores
+ * - real computed Impulse score samples
+ * - optional canonical Triple Layer context readings
+ * - optional previously resolved Impulse transition labels
  *
  * OUTPUTS
- * - ImpulseAdaptivePolicy
+ * - canonical ImpulseResolvedPolicy
+ *
+ * OWNERSHIP
+ * - Calibration owns threshold policy
+ * - Impulse Layer owns Impulse scores
+ * - Impulse Layer owns the final propagated transition state
+ * - Triple Layer owns growth, core pattern and decay truths
  *
  * INVARIANTS
- * - pressure remains primary
- * - acceleration validates release dynamics
- * - alignment validates coherent pressure building
- * - instability supports release / exhaustion detection
- * - saturation supports pressure building / exhaustion detection
- * - Triple Layer remains contextual only
- * - thresholds remain bounded
+ * - calibration modifies thresholds only
+ * - calibration never modifies source samples
+ * - calibration never changes Impulse score formulas
+ * - calibration never becomes an alternative Impulse resolver
+ * - the canonical resolver remains impulse-state-core.ts
+ * - provided transition labels are never reconstructed
+ * - absent transition labels may be classified for bootstrap calibration only
+ * - inferred bootstrap labels are explicitly reported
+ * - invalid required score samples are rejected
+ * - optional Triple Layer values remain null when unavailable
+ * - pressure remains the primary transition axis
+ * - acceleration validates transition dynamics
+ * - alignment validates coherent pressure
+ * - instability contextualizes release and exhaustion
+ * - saturation contextualizes pressure building and exhaustion
+ * - Triple Layer remains contextual and never modifies Impulse scores
+ * - thresholds remain finite and inside their governed bounds
+ * - insufficient samples fall back to canonical static thresholds
+ * - bootstrap and adaptive policies remain explicitly distinguishable
+ * - state distribution dominance produces an explicit warning
+ *
+ * FIRST DIVERGENCE
+ * - invalid source sample
+ *   => calibration sample boundary
+ *
+ * - valid samples but invalid threshold policy
+ *   => adaptive threshold producer
+ *
+ * - valid policy altered by the Impulse resolver
+ *   => Calibration -> Impulse Layer policy boundary
+ *
+ * CRITICAL DEPENDENCIES
+ * - lib/xyvala/engine/impulse-state-core.ts
+ *
+ * SENSITIVE ZONES
+ * - required score validation
+ * - optional Triple Layer nullability
+ * - bootstrap state classification
+ * - state sample distribution
+ * - percentile selection
+ * - threshold bounding
+ * - fallback selection
+ * - deterministic warning ordering
  * ========================================================================== */
+
+import {
+  DEFAULT_IMPULSE_POLICY,
+  resolveImpulseTransitionState,
+  type CalibratableImpulseTransitionState,
+  type ImpulseResolvedPolicy,
+  type ImpulseResolvedThresholds,
+  type ImpulseScoreSet,
+  type ImpulseStateSampleSize,
+  type NormalizedImpulseTripleLayerContext,
+} from "@/lib/xyvala/engine/impulse-state-core";
 
 /* ============================================================================
- * 1. TYPES
+ * 1. PUBLIC INPUT CONTRACT
+ * ----------------------------------------------------------------------------
+ * This module owns only the calibration sample transport.
+ *
+ * It does not own:
+ * - ImpulseResolvedPolicy
+ * - ImpulseResolvedThresholds
+ * - CalibratableImpulseTransitionState
+ * - ImpulseScoreSet
+ *
+ * Those identities remain owned by impulse-state-core.ts.
  * ========================================================================== */
 
-export type ImpulseAdaptiveState =
-  | "COMPRESSION"
-  | "PRESSURE_BUILDING"
-  | "RELEASE"
-  | "EXHAUSTION"
-  | "NEUTRAL";
-
-export type ImpulseAdaptiveSource = "adaptive" | "fallback";
-
-export type ImpulseAdaptiveSample = {
+export type ImpulseAdaptiveSample = Readonly<{
+  compression_score: number;
   pressure_score: number;
-  acceleration_score?: number;
-  alignment_score?: number;
+  acceleration_score: number;
+  alignment_score: number;
   instability_score: number;
   saturation_score: number;
   exhaustion_score: number;
 
   growth_score: number | null;
-  core_score: number | null;
+  core_pattern_score: number | null;
   decay_score: number | null;
 
-  transition_state?: ImpulseAdaptiveState;
-};
-
-export type ImpulseAdaptiveThresholds = {
-  compression: {
-    pressure_min: number;
-    instability_max: number;
-    exhaustion_max: number;
-    alignment_min: number;
-    core_min: number;
-  };
-
-  pressure_building: {
-    pressure_min: number;
-    saturation_min: number;
-    instability_min: number;
-    acceleration_min: number;
-    alignment_min: number;
-    growth_min: number;
-  };
-
-  release: {
-    pressure_min: number;
-    instability_min: number;
-    saturation_min: number;
-    acceleration_min: number;
-    alignment_min: number;
-    growth_min: number;
-    decay_max: number;
-  };
-
-  exhaustion: {
-    exhaustion_min: number;
-    instability_min: number;
-    saturation_min: number;
-    acceleration_min: number;
-    decay_min: number;
-  };
-
-  neutral: {
-    pressure_max: number;
-    instability_max: number;
-    saturation_max: number;
-    exhaustion_max: number;
-  };
-};
-
-export type ImpulseAdaptivePolicy = {
-  source: ImpulseAdaptiveSource;
-  sample_size: number;
-  state_sample_size: Record<ImpulseAdaptiveState, number>;
-  thresholds: ImpulseAdaptiveThresholds;
-  warnings: string[];
-};
+  transition_state?:
+    CalibratableImpulseTransitionState;
+}>;
 
 /* ============================================================================
- * 2. CONSTANTS
+ * 2. INTERNAL CONTRACTS
  * ========================================================================== */
 
-const MIN_GLOBAL_SAMPLE = 40;
-const MIN_STATE_SAMPLE = 8;
+type SanitizedImpulseAdaptiveSample = Readonly<{
+  scores:
+    Readonly<ImpulseScoreSet>;
 
-const FALLBACK_THRESHOLDS: ImpulseAdaptiveThresholds = {
-  compression: {
-    pressure_min: 35,
-    instability_max: 58,
-    exhaustion_max: 55,
-    alignment_min: 40,
-    core_min: 45,
-  },
+  triple_layer:
+    Readonly<NormalizedImpulseTripleLayerContext>;
 
-  pressure_building: {
-    pressure_min: 45,
-    saturation_min: 38,
-    instability_min: 28,
-    acceleration_min: 30,
-    alignment_min: 40,
-    growth_min: 38,
-  },
+  transition_state:
+    CalibratableImpulseTransitionState | null;
+}>;
 
-  release: {
-    pressure_min: 52,
-    instability_min: 42,
-    saturation_min: 42,
-    acceleration_min: 45,
-    alignment_min: 42,
-    growth_min: 42,
-    decay_max: 72,
-  },
+type ClassifiedImpulseAdaptiveSample = Readonly<{
+  sample:
+    SanitizedImpulseAdaptiveSample;
 
-  exhaustion: {
-    exhaustion_min: 62,
-    instability_min: 45,
-    saturation_min: 48,
-    acceleration_min: 35,
-    decay_min: 45,
-  },
+  state:
+    CalibratableImpulseTransitionState;
 
-  neutral: {
-    pressure_max: 34,
-    instability_max: 34,
-    saturation_max: 34,
-    exhaustion_max: 34,
-  },
-};
+  state_source:
+    "provided" | "inferred";
+}>;
 
-/* ============================================================================
- * 3. SAFE HELPERS
- * ========================================================================== */
+type CalibrationSource =
+  | "adaptive"
+  | "bootstrap"
+  | "fallback";
 
-function isFiniteNumber(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value);
-}
+type SampleSanitationResult = Readonly<{
+  samples:
+    readonly SanitizedImpulseAdaptiveSample[];
 
-function clamp(value: number, min: number, max: number): number {
-  if (!Number.isFinite(value)) return min;
-  return Math.max(min, Math.min(max, value));
-}
+  rejected_sample_count:
+    number;
+}>;
 
-function round2(value: number): number {
-  if (!Number.isFinite(value)) return 0;
-  return Math.round(value * 100) / 100;
-}
-
-function normalizeScore(value: unknown): number | null {
-  if (!isFiniteNumber(value)) return null;
-  return round2(clamp(value, 0, 100));
-}
-
-function percentile(values: number[], p: number): number {
-  if (values.length === 0) return 0;
-
-  const sorted = [...values].sort((a, b) => a - b);
-  const index = (p / 100) * (sorted.length - 1);
-  const lower = Math.floor(index);
-  const upper = Math.ceil(index);
-
-  if (lower === upper) {
-    return sorted[lower] ?? 0;
-  }
-
-  const weight = index - lower;
-  const lowerValue = sorted[lower] ?? 0;
-  const upperValue = sorted[upper] ?? lowerValue;
-
-  return lowerValue + (upperValue - lowerValue) * weight;
-}
-
-function boundedPercentile(input: {
-  values: number[];
-  fallback: number[];
+type ThresholdBound = Readonly<{
+  fallback: number;
   percentile: number;
-  min: number;
-  max: number;
-}): number {
-  return round2(
-    clamp(
-      percentile(
-        input.values.length > 0 ? input.values : input.fallback,
-        input.percentile,
-      ),
-      input.min,
-      input.max,
+  minimum: number;
+  maximum: number;
+}>;
+
+/* ============================================================================
+ * 3. GOVERNED CONSTANTS
+ * ========================================================================== */
+
+const IMPULSE_ADAPTIVE_POLICY_VERSION =
+  "impulse-adaptive-v2" as const;
+
+const MINIMUM_BOOTSTRAP_SAMPLE_COUNT =
+  30;
+
+const MINIMUM_GLOBAL_SAMPLE_COUNT =
+  80;
+
+const MINIMUM_STATE_SAMPLE_COUNT =
+  8;
+
+const STATE_DOMINANCE_WARNING_RATIO =
+  0.7;
+
+const SCORE_MINIMUM =
+  0;
+
+const SCORE_MAXIMUM =
+  100;
+
+const CALIBRATABLE_IMPULSE_STATES:
+  readonly CalibratableImpulseTransitionState[] =
+  Object.freeze([
+    "COMPRESSION",
+    "PRESSURE_BUILDING",
+    "RELEASE",
+    "EXHAUSTION",
+    "NEUTRAL",
+  ]);
+
+/* ============================================================================
+ * 4. PURE NUMERIC HELPERS
+ * ----------------------------------------------------------------------------
+ * These helpers do not convert invalid values into valid observations.
+ *
+ * Required invalid scores cause sample rejection.
+ * Optional invalid contextual values remain unavailable.
+ * ========================================================================== */
+
+function isFiniteNumber(
+  value: unknown,
+): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isFinite(value)
+  );
+}
+
+function isScoreValue(
+  value: unknown,
+): value is number {
+  return (
+    isFiniteNumber(value) &&
+    value >= SCORE_MINIMUM &&
+    value <= SCORE_MAXIMUM
+  );
+}
+
+function roundToTwoDecimals(
+  value: number,
+): number {
+  return (
+    Math.round(value * 100) /
+    100
+  );
+}
+
+function clampThreshold(
+  value: number,
+  minimum: number,
+  maximum: number,
+): number {
+  return Math.max(
+    minimum,
+    Math.min(
+      maximum,
+      value,
     ),
   );
 }
 
-function getValues(
-  samples: ImpulseAdaptiveSample[],
-  selector: (sample: ImpulseAdaptiveSample) => number | null | undefined,
-): number[] {
-  return samples
-    .map(selector)
-    .filter((value): value is number => isFiniteNumber(value))
-    .map(round2);
-}
-
-function inferAdaptiveState(
-  sample: ImpulseAdaptiveSample,
-): ImpulseAdaptiveState {
-  const pressure = normalizeScore(sample.pressure_score) ?? 0;
-  const acceleration = normalizeScore(sample.acceleration_score) ?? 50;
-  const alignment = normalizeScore(sample.alignment_score) ?? 50;
-  const instability = normalizeScore(sample.instability_score) ?? 0;
-  const saturation = normalizeScore(sample.saturation_score) ?? 0;
-  const exhaustion = normalizeScore(sample.exhaustion_score) ?? 0;
-
-  const growth = normalizeScore(sample.growth_score) ?? 50;
-  const core = normalizeScore(sample.core_score) ?? 50;
-  const decay = normalizeScore(sample.decay_score) ?? 50;
-
-  const structuralPressure =
-    pressure >= 56 &&
-    alignment >= 55 &&
-    saturation >= 31 &&
-    exhaustion <= 45;
-
-  const earlyPressureBuilding =
-    pressure >= 54 &&
-    alignment >= 60 &&
-    saturation >= 30 &&
-    acceleration >= 8 &&
-    exhaustion <= 42;
-
-  if (structuralPressure || earlyPressureBuilding) {
-    return "PRESSURE_BUILDING";
+function readRequiredScore(
+  value: unknown,
+): number | null {
+  if (!isScoreValue(value)) {
+    return null;
   }
 
-  if (
-    pressure >= 58 &&
-    acceleration >= 36 &&
-    saturation >= 36 &&
-    alignment >= 48 &&
-    instability >= 18 &&
-    exhaustion <= 58
-  ) {
-    return "RELEASE";
-  }
-
-  if (
-    exhaustion >= 52 &&
-    saturation >= 40 &&
-    instability >= 28 &&
-    decay >= 45
-  ) {
-    return "EXHAUSTION";
-  }
-
-  if (
-    pressure >= 34 &&
-    instability <= 42 &&
-    exhaustion <= 42 &&
-    saturation <= 34 &&
-    core >= 45
-  ) {
-    return "COMPRESSION";
-  }
-
-  if (
-    pressure <= 36 &&
-    instability <= 34 &&
-    saturation <= 34 &&
-    exhaustion <= 34
-  ) {
-    return "NEUTRAL";
-  }
-
-  return "NEUTRAL";
+  return roundToTwoDecimals(
+    value,
+  );
 }
 
-function resolveSampleState(
-  sample: ImpulseAdaptiveSample,
-): ImpulseAdaptiveState {
-  const inferred = inferAdaptiveState(sample);
+function readOptionalScore(
+  value: unknown,
+): number | null {
+  if (value === null) {
+    return null;
+  }
 
-  console.log("XYVALA_IMPULSE_CALIBRATION_CLASSIFIER", {
-    pressure: sample.pressure_score,
-    acceleration: sample.acceleration_score,
-    alignment: sample.alignment_score,
-    instability: sample.instability_score,
-    saturation: sample.saturation_score,
-    exhaustion: sample.exhaustion_score,
-    growth: sample.growth_score,
-    core: sample.core_score,
-    decay: sample.decay_score,
-    stored_state: sample.transition_state ?? null,
-    inferred_state: inferred,
-  });
-
-  return inferred;
+  return readRequiredScore(
+    value,
+  );
 }
 
-function getStateSamples(
-  samples: ImpulseAdaptiveSample[],
-  state: ImpulseAdaptiveState,
-): ImpulseAdaptiveSample[] {
-  return samples.filter((sample) => resolveSampleState(sample) === state);
+function uniqueWarnings(
+  warnings: readonly string[],
+): string[] {
+  const seen =
+    new Set<string>();
+
+  const result:
+    string[] = [];
+
+  for (const warning of warnings) {
+    if (
+      typeof warning !== "string"
+    ) {
+      continue;
+    }
+
+    const normalized =
+      warning.trim();
+
+    if (
+      normalized.length === 0 ||
+      seen.has(normalized)
+    ) {
+      continue;
+    }
+
+    seen.add(normalized);
+    result.push(normalized);
+  }
+
+  return result;
 }
 
-function countStateSamples(
-  samples: ImpulseAdaptiveSample[],
-): Record<ImpulseAdaptiveState, number> {
-  return {
-    COMPRESSION: getStateSamples(samples, "COMPRESSION").length,
-    PRESSURE_BUILDING: getStateSamples(samples, "PRESSURE_BUILDING").length,
-    RELEASE: getStateSamples(samples, "RELEASE").length,
-    EXHAUSTION: getStateSamples(samples, "EXHAUSTION").length,
-    NEUTRAL: getStateSamples(samples, "NEUTRAL").length,
-  };
-}
-
-/* ============================================================================
- * 4. SANITIZATION
- * ========================================================================== */
-
-function sanitizeSample(
-  sample: ImpulseAdaptiveSample,
-): ImpulseAdaptiveSample | null {
-  const pressure = normalizeScore(sample.pressure_score);
-  const instability = normalizeScore(sample.instability_score);
-  const saturation = normalizeScore(sample.saturation_score);
-  const exhaustion = normalizeScore(sample.exhaustion_score);
-
+function percentile(
+  values: readonly number[],
+  percentileValue: number,
+): number | null {
   if (
-    pressure === null ||
-    instability === null ||
-    saturation === null ||
-    exhaustion === null
+    values.length === 0 ||
+    !isFiniteNumber(
+      percentileValue,
+    )
   ) {
     return null;
   }
 
-  const acceleration = normalizeScore(sample.acceleration_score);
-  const alignment = normalizeScore(sample.alignment_score);
+  const sorted =
+    [...values].sort(
+      (left, right) =>
+        left - right,
+    );
+
+  const boundedPercentile =
+    clampThreshold(
+      percentileValue,
+      0,
+      100,
+    );
+
+  const index =
+    (
+      boundedPercentile /
+      100
+    ) *
+    (
+      sorted.length - 1
+    );
+
+  const lowerIndex =
+    Math.floor(index);
+
+  const upperIndex =
+    Math.ceil(index);
+
+  const lowerValue =
+    sorted[lowerIndex];
+
+  const upperValue =
+    sorted[upperIndex];
+
+  if (
+    lowerValue === undefined ||
+    upperValue === undefined
+  ) {
+    return null;
+  }
+
+  if (
+    lowerIndex ===
+    upperIndex
+  ) {
+    return roundToTwoDecimals(
+      lowerValue,
+    );
+  }
+
+  const interpolationWeight =
+    index -
+    lowerIndex;
+
+  return roundToTwoDecimals(
+    lowerValue +
+      (
+        upperValue -
+        lowerValue
+      ) *
+        interpolationWeight,
+  );
+}
+
+function resolveBoundedPercentile(
+  values: readonly number[],
+  bound: ThresholdBound,
+): number {
+  const observedValue =
+    percentile(
+      values,
+      bound.percentile,
+    );
+
+  return roundToTwoDecimals(
+    clampThreshold(
+      observedValue ??
+        bound.fallback,
+      bound.minimum,
+      bound.maximum,
+    ),
+  );
+}
+
+/* ============================================================================
+ * 5. SAMPLE SANITATION
+ * ----------------------------------------------------------------------------
+ * Required Impulse scores:
+ * - must all be finite
+ * - must already belong to [0, 100]
+ * - are never clamped into validity
+ *
+ * Optional Triple Layer scores:
+ * - remain null when unavailable or invalid
+ * - never cause source Impulse scores to be changed
+ * ========================================================================== */
+
+function sanitizeSample(
+  sample: ImpulseAdaptiveSample,
+): SanitizedImpulseAdaptiveSample | null {
+  if (
+    sample === null ||
+    typeof sample !== "object"
+  ) {
+    return null;
+  }
+
+  const compressionScore =
+    readRequiredScore(
+      sample.compression_score,
+    );
+
+  const pressureScore =
+    readRequiredScore(
+      sample.pressure_score,
+    );
+
+  const accelerationScore =
+    readRequiredScore(
+      sample.acceleration_score,
+    );
+
+  const alignmentScore =
+    readRequiredScore(
+      sample.alignment_score,
+    );
+
+  const instabilityScore =
+    readRequiredScore(
+      sample.instability_score,
+    );
+
+  const saturationScore =
+    readRequiredScore(
+      sample.saturation_score,
+    );
+
+  const exhaustionScore =
+    readRequiredScore(
+      sample.exhaustion_score,
+    );
+
+  if (
+    compressionScore === null ||
+    pressureScore === null ||
+    accelerationScore === null ||
+    alignmentScore === null ||
+    instabilityScore === null ||
+    saturationScore === null ||
+    exhaustionScore === null
+  ) {
+    return null;
+  }
+
+  const growthScore =
+    readOptionalScore(
+      sample.growth_score,
+    );
+
+  const corePatternScore =
+    readOptionalScore(
+      sample.core_pattern_score,
+    );
+
+  const decayScore =
+    readOptionalScore(
+      sample.decay_score,
+    );
+
+  const availableTripleLayerScoreCount =
+    [
+      growthScore,
+      corePatternScore,
+      decayScore,
+    ].filter(
+      (
+        value,
+      ): value is number =>
+        value !== null,
+    ).length;
+
+  const tripleLayerAvailable =
+    availableTripleLayerScoreCount ===
+    3;
+
+  const tripleLayerPartial =
+    availableTripleLayerScoreCount > 0 &&
+    availableTripleLayerScoreCount < 3;
 
   return {
-    pressure_score: pressure,
+    scores: {
+      compression_score:
+        compressionScore,
 
-    ...(acceleration !== null ? { acceleration_score: acceleration } : {}),
-    ...(alignment !== null ? { alignment_score: alignment } : {}),
+      pressure_score:
+        pressureScore,
 
-    instability_score: instability,
-    saturation_score: saturation,
-    exhaustion_score: exhaustion,
+      acceleration_score:
+        accelerationScore,
 
-    growth_score: normalizeScore(sample.growth_score),
-    core_score: normalizeScore(sample.core_score),
-    decay_score: normalizeScore(sample.decay_score),
+      alignment_score:
+        alignmentScore,
 
-    ...(sample.transition_state !== undefined
-      ? { transition_state: sample.transition_state }
-      : {}),
+      instability_score:
+        instabilityScore,
+
+      saturation_score:
+        saturationScore,
+
+      exhaustion_score:
+        exhaustionScore,
+    },
+
+    triple_layer: {
+      available:
+        tripleLayerAvailable ||
+        tripleLayerPartial,
+
+      partial:
+        tripleLayerPartial,
+
+      neutralized:
+        false,
+
+      triple_layer_state:
+        null,
+
+      growth_score:
+        growthScore,
+
+      core_pattern_score:
+        corePatternScore,
+
+      decay_score:
+        decayScore,
+    },
+
+    transition_state:
+      sample.transition_state ??
+      null,
   };
 }
 
 function sanitizeSamples(
-  samples: readonly ImpulseAdaptiveSample[],
-): ImpulseAdaptiveSample[] {
-  return samples
-    .map(sanitizeSample)
-    .filter((sample): sample is ImpulseAdaptiveSample => sample !== null);
-}
+  samples:
+    readonly ImpulseAdaptiveSample[],
+): SampleSanitationResult {
+  const sanitizedSamples:
+    SanitizedImpulseAdaptiveSample[] =
+    [];
 
-/* ============================================================================
- * 5. FALLBACK POLICY
- * ========================================================================== */
+  let rejectedSampleCount =
+    0;
 
-function buildFallbackPolicy(
-  samples: ImpulseAdaptiveSample[],
-  warnings: string[],
-): ImpulseAdaptivePolicy {
-  return {
-    source: "fallback",
-    sample_size: samples.length,
-    state_sample_size: countStateSamples(samples),
-    thresholds: FALLBACK_THRESHOLDS,
-    warnings,
-  };
-}
+  for (const sample of samples) {
+    const sanitizedSample =
+      sanitizeSample(
+        sample,
+      );
 
-/* ============================================================================
- * 6. ADAPTIVE THRESHOLD BUILDER
- * ========================================================================== */
+    if (
+      sanitizedSample === null
+    ) {
+      rejectedSampleCount += 1;
+      continue;
+    }
 
-export function buildImpulseAdaptivePolicy(
-  inputSamples: readonly ImpulseAdaptiveSample[],
-): ImpulseAdaptivePolicy {
-  const samples = sanitizeSamples(inputSamples);
-  const warnings: string[] = [];
-
-  console.log("XYVALA_BUILD_POLICY_ENTRY", {
-  inputSamples: inputSamples.length,
-  samples: samples.length,
-});
-
-  if (samples.length < MIN_GLOBAL_SAMPLE) {
-    warnings.push("impulse_adaptive_thresholds_insufficient_global_sample");
-    return buildFallbackPolicy(samples, warnings);
-  }
-
-  const compressionSamples = getStateSamples(samples, "COMPRESSION");
-  const pressureSamples = getStateSamples(samples, "PRESSURE_BUILDING");
-  const releaseSamples = getStateSamples(samples, "RELEASE");
-  const exhaustionSamples = getStateSamples(samples, "EXHAUSTION");
-  const neutralSamples = getStateSamples(samples, "NEUTRAL");
-
-  const stateCounts = countStateSamples(samples);
-
-  const useCompressionCalibration =
-    stateCounts.COMPRESSION >= MIN_STATE_SAMPLE;
-
-  const usePressureCalibration =
-    stateCounts.PRESSURE_BUILDING >= MIN_STATE_SAMPLE;
-
-  const useReleaseCalibration =
-    stateCounts.RELEASE >= MIN_STATE_SAMPLE;
-
-  const useExhaustionCalibration =
-    stateCounts.EXHAUSTION >= MIN_STATE_SAMPLE;
-
-  const useNeutralCalibration =
-    stateCounts.NEUTRAL >= MIN_STATE_SAMPLE;
-
-  const compressionRatio = compressionSamples.length / samples.length;
-  const pressureRatio = pressureSamples.length / samples.length;
-  const releaseRatio = releaseSamples.length / samples.length;
-  const exhaustionRatio = exhaustionSamples.length / samples.length;
-  const neutralRatio = neutralSamples.length / samples.length;
-
-  if (!useCompressionCalibration) {
-    warnings.push("impulse_adaptive_thresholds_insufficient_compression_sample");
-  }
-
-  if (!usePressureCalibration) {
-    warnings.push(
-      "impulse_adaptive_thresholds_insufficient_pressure_building_sample",
+    sanitizedSamples.push(
+      sanitizedSample,
     );
   }
 
-  if (!useReleaseCalibration) {
-    warnings.push("impulse_adaptive_thresholds_insufficient_release_sample");
-  }
-
-  if (!useExhaustionCalibration) {
-    warnings.push("impulse_adaptive_thresholds_insufficient_exhaustion_sample");
-  }
-
-  if (!useNeutralCalibration) {
-    warnings.push("impulse_adaptive_thresholds_insufficient_neutral_sample");
-  }
-
-  if (compressionRatio > 0.7) {
-    warnings.push("impulse_adaptive_thresholds_compression_dominance");
-  }
-
-  if (pressureRatio > 0.7) {
-    warnings.push("impulse_adaptive_thresholds_pressure_building_dominance");
-  }
-
-  if (releaseRatio > 0.7) {
-    warnings.push("impulse_adaptive_thresholds_release_dominance");
-  }
-
-  if (exhaustionRatio > 0.7) {
-    warnings.push("impulse_adaptive_thresholds_exhaustion_dominance");
-  }
-
-  if (neutralRatio > 0.7) {
-    warnings.push("impulse_adaptive_thresholds_neutral_dominance");
-  }
-
-  const globalPressure = getValues(samples, (sample) => sample.pressure_score);
-  const globalAcceleration = getValues(
-    samples,
-    (sample) => sample.acceleration_score,
-  );
-  const globalAlignment = getValues(samples, (sample) => sample.alignment_score);
-  const globalInstability = getValues(
-    samples,
-    (sample) => sample.instability_score,
-  );
-  const globalSaturation = getValues(
-    samples,
-    (sample) => sample.saturation_score,
-  );
-  const globalExhaustion = getValues(
-    samples,
-    (sample) => sample.exhaustion_score,
-  );
-  const globalGrowth = getValues(samples, (sample) => sample.growth_score);
-  const globalCore = getValues(samples, (sample) => sample.core_score);
-  const globalDecay = getValues(samples, (sample) => sample.decay_score);
-
-  function distributionAudit(values: number[]) {
   return {
-    count: values.length,
-    p10: boundedPercentile({ values, fallback: [0], percentile: 10, min: 0, max: 100 }),
-    p25: boundedPercentile({ values, fallback: [0], percentile: 25, min: 0, max: 100 }),
-    p50: boundedPercentile({ values, fallback: [0], percentile: 50, min: 0, max: 100 }),
-    p75: boundedPercentile({ values, fallback: [0], percentile: 75, min: 0, max: 100 }),
-    p90: boundedPercentile({ values, fallback: [0], percentile: 90, min: 0, max: 100 }),
-  };
-}
+    samples:
+      sanitizedSamples,
 
-console.log("XYVALA_IMPULSE_DISTRIBUTION_AUDIT", {
-  pressure: distributionAudit(globalPressure),
-  acceleration: distributionAudit(globalAcceleration),
-  alignment: distributionAudit(globalAlignment),
-  instability: distributionAudit(globalInstability),
-  saturation: distributionAudit(globalSaturation),
-  exhaustion: distributionAudit(globalExhaustion),
-  growth: distributionAudit(globalGrowth),
-  core: distributionAudit(globalCore),
-  decay: distributionAudit(globalDecay),
-});
-
-
-  const pressureFallback =
-    globalPressure.length > 0
-      ? globalPressure
-      : [FALLBACK_THRESHOLDS.pressure_building.pressure_min];
-
-  const accelerationFallback =
-    globalAcceleration.length > 0
-      ? globalAcceleration
-      : [FALLBACK_THRESHOLDS.pressure_building.acceleration_min];
-
-  const alignmentFallback =
-    globalAlignment.length > 0
-      ? globalAlignment
-      : [FALLBACK_THRESHOLDS.pressure_building.alignment_min];
-
-  const instabilityFallback =
-    globalInstability.length > 0
-      ? globalInstability
-      : [FALLBACK_THRESHOLDS.pressure_building.instability_min];
-
-  const saturationFallback =
-    globalSaturation.length > 0
-      ? globalSaturation
-      : [FALLBACK_THRESHOLDS.pressure_building.saturation_min];
-
-  const exhaustionFallback =
-    globalExhaustion.length > 0
-      ? globalExhaustion
-      : [FALLBACK_THRESHOLDS.exhaustion.exhaustion_min];
-
-  const growthFallback =
-    globalGrowth.length > 0
-      ? globalGrowth
-      : [FALLBACK_THRESHOLDS.pressure_building.growth_min];
-
-  const coreFallback =
-    globalCore.length > 0
-      ? globalCore
-      : [FALLBACK_THRESHOLDS.compression.core_min];
-
-  const decayFallback =
-    globalDecay.length > 0
-      ? globalDecay
-      : [FALLBACK_THRESHOLDS.exhaustion.decay_min];
-
-  const thresholds: ImpulseAdaptiveThresholds = {
-    compression: {
-  pressure_min: boundedPercentile({
-    values: useCompressionCalibration
-      ? getValues(compressionSamples, (sample) => sample.pressure_score)
-      : [],
-    fallback: [FALLBACK_THRESHOLDS.compression.pressure_min],
-    percentile: 45,
-    min: 30,
-    max: 58,
-  }),
-  instability_max: boundedPercentile({
-    values: useCompressionCalibration
-      ? getValues(compressionSamples, (sample) => sample.instability_score)
-      : [],
-    fallback: [FALLBACK_THRESHOLDS.compression.instability_max],
-    percentile: 62,
-    min: 42,
-    max: 68,
-  }),
-  exhaustion_max: boundedPercentile({
-    values: useCompressionCalibration
-      ? getValues(compressionSamples, (sample) => sample.exhaustion_score)
-      : [],
-    fallback: [FALLBACK_THRESHOLDS.compression.exhaustion_max],
-    percentile: 62,
-    min: 38,
-    max: 66,
-  }),
-  alignment_min: boundedPercentile({
-    values: useCompressionCalibration
-      ? getValues(compressionSamples, (sample) => sample.alignment_score)
-      : [],
-    fallback: [FALLBACK_THRESHOLDS.compression.alignment_min],
-    percentile: 42,
-    min: 30,
-    max: 62,
-  }),
-  core_min: boundedPercentile({
-    values: useCompressionCalibration
-      ? getValues(compressionSamples, (sample) => sample.core_score)
-      : [],
-    fallback: [FALLBACK_THRESHOLDS.compression.core_min],
-    percentile: 45,
-    min: 35,
-    max: 55,
-  }),
-},
-
-    pressure_building: {
-      pressure_min: boundedPercentile({
-        values: usePressureCalibration
-          ? getValues(pressureSamples, (sample) => sample.pressure_score)
-          : [],
-        fallback: pressureFallback,
-        percentile: 55,
-        min: 38,
-        max: 68,
-      }),
-      saturation_min: boundedPercentile({
-        values: usePressureCalibration
-          ? getValues(pressureSamples, (sample) => sample.saturation_score)
-          : [],
-        fallback: saturationFallback,
-        percentile: 45,
-        min: 32,
-        max: 65,
-      }),
-      instability_min: boundedPercentile({
-        values: usePressureCalibration
-          ? getValues(pressureSamples, (sample) => sample.instability_score)
-          : [],
-        fallback: instabilityFallback,
-        percentile: 38,
-        min: 24,
-        max: 62,
-      }),
-      acceleration_min: boundedPercentile({
-        values: usePressureCalibration
-          ? getValues(pressureSamples, (sample) => sample.acceleration_score)
-          : [],
-        fallback: accelerationFallback,
-        percentile: 42,
-        min: 28,
-        max: 66,
-      }),
-      alignment_min: boundedPercentile({
-        values: usePressureCalibration
-          ? getValues(pressureSamples, (sample) => sample.alignment_score)
-          : [],
-        fallback: alignmentFallback,
-        percentile: 45,
-        min: 30,
-        max: 66,
-      }),
-      growth_min: boundedPercentile({
-        values: usePressureCalibration
-          ? getValues(pressureSamples, (sample) => sample.growth_score)
-          : [],
-        fallback: growthFallback,
-        percentile: 42,
-        min: 30,
-        max: 62,
-      }),
-    },
-
-    release: {
-      pressure_min: boundedPercentile({
-        values: useReleaseCalibration
-          ? getValues(releaseSamples, (sample) => sample.pressure_score)
-          : [],
-        fallback: [FALLBACK_THRESHOLDS.release.pressure_min],
-        percentile: 58,
-        min: 42,
-        max: 72,
-      }),
-      instability_min: boundedPercentile({
-        values: useReleaseCalibration
-          ? getValues(releaseSamples, (sample) => sample.instability_score)
-          : [],
-        fallback: [FALLBACK_THRESHOLDS.release.instability_min],
-        percentile: 50,
-        min: 34,
-        max: 70,
-      }),
-      saturation_min: boundedPercentile({
-        values: useReleaseCalibration
-          ? getValues(releaseSamples, (sample) => sample.saturation_score)
-          : [],
-        fallback: [FALLBACK_THRESHOLDS.release.saturation_min],
-        percentile: 48,
-        min: 34,
-        max: 68,
-      }),
-      acceleration_min: boundedPercentile({
-        values: useReleaseCalibration
-          ? getValues(releaseSamples, (sample) => sample.acceleration_score)
-          : [],
-        fallback: [FALLBACK_THRESHOLDS.release.acceleration_min],
-        percentile: 55,
-        min: 36,
-        max: 72,
-      }),
-      alignment_min: boundedPercentile({
-        values: useReleaseCalibration
-          ? getValues(releaseSamples, (sample) => sample.alignment_score)
-          : [],
-        fallback: [FALLBACK_THRESHOLDS.release.alignment_min],
-        percentile: 48,
-        min: 32,
-        max: 70,
-      }),
-      growth_min: boundedPercentile({
-        values: useReleaseCalibration
-          ? getValues(releaseSamples, (sample) => sample.growth_score)
-          : [],
-        fallback: [FALLBACK_THRESHOLDS.release.growth_min],
-        percentile: 48,
-        min: 34,
-        max: 66,
-      }),
-      decay_max: boundedPercentile({
-        values: useReleaseCalibration
-          ? getValues(releaseSamples, (sample) => sample.decay_score)
-          : [],
-        fallback: [FALLBACK_THRESHOLDS.release.decay_max],
-        percentile: 70,
-        min: 52,
-        max: 82,
-      }),
-    },
-
-    exhaustion: {
-      exhaustion_min: boundedPercentile({
-        values: useExhaustionCalibration
-          ? getValues(exhaustionSamples, (sample) => sample.exhaustion_score)
-          : [],
-        fallback: [FALLBACK_THRESHOLDS.exhaustion.exhaustion_min],
-        percentile: 58,
-        min: 48,
-        max: 78,
-      }),
-      instability_min: boundedPercentile({
-        values: useExhaustionCalibration
-          ? getValues(exhaustionSamples, (sample) => sample.instability_score)
-          : [],
-        fallback: [FALLBACK_THRESHOLDS.exhaustion.instability_min],
-        percentile: 52,
-        min: 35,
-        max: 72,
-      }),
-      saturation_min: boundedPercentile({
-        values: useExhaustionCalibration
-          ? getValues(exhaustionSamples, (sample) => sample.saturation_score)
-          : [],
-        fallback: [FALLBACK_THRESHOLDS.exhaustion.saturation_min],
-        percentile: 52,
-        min: 36,
-        max: 72,
-      }),
-      acceleration_min: boundedPercentile({
-        values: useExhaustionCalibration
-          ? getValues(exhaustionSamples, (sample) => sample.acceleration_score)
-          : [],
-        fallback: [FALLBACK_THRESHOLDS.exhaustion.acceleration_min],
-        percentile: 50,
-        min: 32,
-        max: 70,
-      }),
-      decay_min: boundedPercentile({
-        values: useExhaustionCalibration
-          ? getValues(exhaustionSamples, (sample) => sample.decay_score)
-          : [],
-        fallback: [FALLBACK_THRESHOLDS.exhaustion.decay_min],
-        percentile: 50,
-        min: 35,
-        max: 72,
-      }),
-    },
-
-    neutral: {
-      pressure_max: boundedPercentile({
-        values: useNeutralCalibration
-          ? getValues(neutralSamples, (sample) => sample.pressure_score)
-          : [],
-        fallback: [FALLBACK_THRESHOLDS.neutral.pressure_max],
-        percentile: 65,
-        min: 25,
-        max: 52,
-      }),
-      instability_max: boundedPercentile({
-        values: useNeutralCalibration
-          ? getValues(neutralSamples, (sample) => sample.instability_score)
-          : [],
-        fallback: [FALLBACK_THRESHOLDS.neutral.instability_max],
-        percentile: 65,
-        min: 25,
-        max: 56,
-      }),
-      saturation_max: boundedPercentile({
-        values: useNeutralCalibration
-          ? getValues(neutralSamples, (sample) => sample.saturation_score)
-          : [],
-        fallback: [FALLBACK_THRESHOLDS.neutral.saturation_max],
-        percentile: 65,
-        min: 25,
-        max: 56,
-      }),
-      exhaustion_max: boundedPercentile({
-        values: useNeutralCalibration
-          ? getValues(neutralSamples, (sample) => sample.exhaustion_score)
-          : [],
-        fallback: [FALLBACK_THRESHOLDS.neutral.exhaustion_max],
-        percentile: 65,
-        min: 25,
-        max: 56,
-      }),
-    },
-  };
-
-
-  console.log("XYVALA_IMPULSE_DISTRIBUTION_AUDIT_REACHED", {
-  samples: samples.length,
-  pressureCount: globalPressure.length,
-  accelerationCount: globalAcceleration.length,
-  alignmentCount: globalAlignment.length,
-  instabilityCount: globalInstability.length,
-  saturationCount: globalSaturation.length,
-  exhaustionCount: globalExhaustion.length,
-});
-
-console.log("XYVALA_IMPULSE_DISTRIBUTION_AUDIT", {
-  pressure: distributionAudit(globalPressure),
-  acceleration: distributionAudit(globalAcceleration),
-  alignment: distributionAudit(globalAlignment),
-  instability: distributionAudit(globalInstability),
-  saturation: distributionAudit(globalSaturation),
-  exhaustion: distributionAudit(globalExhaustion),
-  growth: distributionAudit(globalGrowth),
-  core: distributionAudit(globalCore),
-  decay: distributionAudit(globalDecay),
-});
-
-  return {
-    source: "adaptive",
-    sample_size: samples.length,
-    state_sample_size: stateCounts,
-    thresholds,
-    warnings,
+    rejected_sample_count:
+      rejectedSampleCount,
   };
 }
 
 /* ============================================================================
- * 7. POLICY APPLICATION HELPER
+ * 6. CANONICAL BOOTSTRAP CLASSIFICATION
+ * ----------------------------------------------------------------------------
+ * A provided transition state remains authoritative for the calibration sample.
+ *
+ * When absent, the canonical resolver may classify the sample only to build
+ * calibration distributions. This inferred state is not propagated as new
+ * market truth.
  * ========================================================================== */
 
-export function resolveImpulseStateWithAdaptivePolicy(input: {
-  pressure_score: number;
-  acceleration_score?: number;
-  alignment_score?: number;
-  instability_score: number;
-  saturation_score: number;
-  exhaustion_score: number;
+function classifySample(
+  sample:
+    SanitizedImpulseAdaptiveSample,
+): ClassifiedImpulseAdaptiveSample {
+  if (
+    sample.transition_state !==
+    null
+  ) {
+    return {
+      sample,
 
-  growth_score: number | null;
-  core_score: number | null;
-  decay_score: number | null;
+      state:
+        sample.transition_state,
 
-  policy: ImpulseAdaptivePolicy;
-}): ImpulseAdaptiveState {
-  const pressure = normalizeScore(input.pressure_score) ?? 0;
-  const acceleration = normalizeScore(input.acceleration_score) ?? 50;
-  const alignment = normalizeScore(input.alignment_score) ?? 50;
-  const instability = normalizeScore(input.instability_score) ?? 0;
-  const saturation = normalizeScore(input.saturation_score) ?? 0;
-  const exhaustion = normalizeScore(input.exhaustion_score) ?? 0;
+      state_source:
+        "provided",
+    };
+  }
 
-  const growth = normalizeScore(input.growth_score) ?? 50;
-  const core = normalizeScore(input.core_score) ?? 50;
-  const decay = normalizeScore(input.decay_score) ?? 50;
+  const inferredState =
+    resolveImpulseTransitionState({
+      scores:
+        sample.scores,
 
-  const thresholds = input.policy.thresholds;
+      triple_layer:
+        sample.triple_layer,
 
-  const exhaustionMatch =
-    exhaustion >= thresholds.exhaustion.exhaustion_min &&
-    instability >= thresholds.exhaustion.instability_min &&
-    saturation >= thresholds.exhaustion.saturation_min &&
-    acceleration >= thresholds.exhaustion.acceleration_min &&
-    decay >= thresholds.exhaustion.decay_min;
+      policy:
+        DEFAULT_IMPULSE_POLICY,
+    });
 
-  const releaseMatch =
-    pressure >= thresholds.release.pressure_min &&
-    saturation >= thresholds.release.saturation_min &&
-    acceleration >= thresholds.release.acceleration_min &&
-    alignment >= thresholds.release.alignment_min &&
-    instability >= thresholds.release.instability_min &&
-    growth >= thresholds.release.growth_min &&
-    decay <= thresholds.release.decay_max;
+  return {
+    sample,
 
-  const pressureBuildingCore =
-    pressure >= thresholds.pressure_building.pressure_min &&
-    saturation >= thresholds.pressure_building.saturation_min &&
-    alignment >= thresholds.pressure_building.alignment_min;
+    state:
+      inferredState,
 
-  const pressureBuildingContext =
-    acceleration >= thresholds.pressure_building.acceleration_min ||
-    pressure >= thresholds.pressure_building.pressure_min + 2 ||
-    growth >= thresholds.pressure_building.growth_min;
+    state_source:
+      "inferred",
+  };
+}
 
-  const pressureBuildingMatch =
-    pressureBuildingCore && pressureBuildingContext;
+function classifySamples(
+  samples:
+    readonly SanitizedImpulseAdaptiveSample[],
+): ClassifiedImpulseAdaptiveSample[] {
+  return samples.map(
+    classifySample,
+  );
+}
 
-  const compressionMatch =
-    pressure >= thresholds.compression.pressure_min &&
-    instability <= thresholds.compression.instability_max &&
-    exhaustion <= thresholds.compression.exhaustion_max &&
-    saturation <= thresholds.pressure_building.saturation_min &&
-    core >= thresholds.compression.core_min;
+/* ============================================================================
+ * 7. DISTRIBUTION READERS
+ * ========================================================================== */
 
-  const neutralMatch =
-    pressure <= thresholds.neutral.pressure_max &&
-    instability <= thresholds.neutral.instability_max &&
-    saturation <= thresholds.neutral.saturation_max &&
-    exhaustion <= thresholds.neutral.exhaustion_max;
+function getStateSamples(
+  samples:
+    readonly ClassifiedImpulseAdaptiveSample[],
+  state:
+    CalibratableImpulseTransitionState,
+): ClassifiedImpulseAdaptiveSample[] {
+  return samples.filter(
+    (sample) =>
+      sample.state === state,
+  );
+}
 
-  console.log("XYVALA_IMPULSE_POLICY_EVALUATION", {
-    pressure,
-    acceleration,
-    alignment,
-    instability,
-    saturation,
-    exhaustion,
-    growth,
-    core,
-    decay,
+function getSampleValues(
+  samples:
+    readonly ClassifiedImpulseAdaptiveSample[],
+  selector: (
+    sample:
+      SanitizedImpulseAdaptiveSample,
+  ) => number | null,
+): number[] {
+  const values:
+    number[] = [];
 
-    exhaustionMatch,
-    releaseMatch,
-    pressureBuildingCore,
-    pressureBuildingContext,
-    pressureBuildingMatch,
-    compressionMatch,
-    neutralMatch,
+  for (const classifiedSample of samples) {
+    const value =
+      selector(
+        classifiedSample.sample,
+      );
+
+    if (
+      value === null ||
+      !isScoreValue(value)
+    ) {
+      continue;
+    }
+
+    values.push(
+      roundToTwoDecimals(
+        value,
+      ),
+    );
+  }
+
+  return values;
+}
+
+function countStateSamples(
+  samples:
+    readonly ClassifiedImpulseAdaptiveSample[],
+): ImpulseStateSampleSize {
+  return {
+    COMPRESSION:
+      getStateSamples(
+        samples,
+        "COMPRESSION",
+      ).length,
+
+    PRESSURE_BUILDING:
+      getStateSamples(
+        samples,
+        "PRESSURE_BUILDING",
+      ).length,
+
+    RELEASE:
+      getStateSamples(
+        samples,
+        "RELEASE",
+      ).length,
+
+    EXHAUSTION:
+      getStateSamples(
+        samples,
+        "EXHAUSTION",
+      ).length,
+
+    NEUTRAL:
+      getStateSamples(
+        samples,
+        "NEUTRAL",
+      ).length,
+  };
+}
+
+function hasEnoughStateSamples(
+  samples:
+    readonly ClassifiedImpulseAdaptiveSample[],
+): boolean {
+  return (
+    samples.length >=
+    MINIMUM_STATE_SAMPLE_COUNT
+  );
+}
+
+/* ============================================================================
+ * 8. WARNING GOVERNANCE
+ * ========================================================================== */
+
+function appendStateSampleWarnings(
+  stateSampleSize:
+    ImpulseStateSampleSize,
+  warnings:
+    string[],
+): void {
+  for (
+    const state of
+      CALIBRATABLE_IMPULSE_STATES
+  ) {
+    const count =
+      stateSampleSize[state];
+
+    if (
+      count <
+      MINIMUM_STATE_SAMPLE_COUNT
+    ) {
+      warnings.push(
+        `impulse_adaptive_thresholds_insufficient_${state.toLowerCase()}_sample`,
+      );
+    }
+  }
+}
+
+function appendDominanceWarnings(
+  stateSampleSize:
+    ImpulseStateSampleSize,
+  totalSampleSize:
+    number,
+  warnings:
+    string[],
+): void {
+  if (
+    totalSampleSize <= 0
+  ) {
+    return;
+  }
+
+  for (
+    const state of
+      CALIBRATABLE_IMPULSE_STATES
+  ) {
+    const ratio =
+      stateSampleSize[state] /
+      totalSampleSize;
+
+    if (
+      ratio >
+      STATE_DOMINANCE_WARNING_RATIO
+    ) {
+      warnings.push(
+        `impulse_adaptive_thresholds_${state.toLowerCase()}_dominance`,
+      );
+    }
+  }
+}
+
+/* ============================================================================
+ * 9. POLICY FACTORIES
+ * ----------------------------------------------------------------------------
+ * Policies are immutable calibration outputs.
+ *
+ * They do not contain:
+ * - final propagated Impulse truth
+ * - decisions
+ * - public labels
+ * - runtime timestamps
+ * ========================================================================== */
+
+function buildPolicy(
+  input: Readonly<{
+    source:
+      CalibrationSource;
+
+    sample_size:
+      number;
+
+    state_sample_size:
+      ImpulseStateSampleSize;
+
+    thresholds:
+      ImpulseResolvedThresholds;
+
+    warnings:
+      readonly string[];
+  }>,
+): ImpulseResolvedPolicy {
+  return {
+    policy_id:
+      `xyvala-impulse-${input.source}`,
+
+    policy_version:
+      IMPULSE_ADAPTIVE_POLICY_VERSION,
+
+    source:
+      input.source,
+
+    sample_size:
+      input.sample_size,
+
+    state_sample_size:
+      {
+        ...input.state_sample_size,
+      },
+
+    thresholds:
+      input.thresholds,
+
+    warnings:
+      uniqueWarnings(
+        input.warnings,
+      ),
+  };
+}
+
+function buildFallbackPolicy(
+  input: Readonly<{
+    sample_size:
+      number;
+
+    state_sample_size:
+      ImpulseStateSampleSize;
+
+    warnings:
+      readonly string[];
+  }>,
+): ImpulseResolvedPolicy {
+  return buildPolicy({
+    source:
+      "fallback",
+
+    sample_size:
+      input.sample_size,
+
+    state_sample_size:
+      input.state_sample_size,
+
+    thresholds:
+      DEFAULT_IMPULSE_POLICY
+        .thresholds,
+
+    warnings:
+      input.warnings,
   });
+}
 
-  if (exhaustionMatch) {
-    return "EXHAUSTION";
+/* ============================================================================
+ * 10. ADAPTIVE THRESHOLD CONSTRUCTION
+ * ----------------------------------------------------------------------------
+ * Thresholds are derived from state-specific observed distributions.
+ *
+ * When a state does not have enough samples, the corresponding canonical
+ * static threshold remains in force.
+ *
+ * This is a threshold fallback, not an analytical-value fallback.
+ * ========================================================================== */
+
+function buildAdaptiveThresholds(
+  samples:
+    readonly ClassifiedImpulseAdaptiveSample[],
+): ImpulseResolvedThresholds {
+  const fallback =
+    DEFAULT_IMPULSE_POLICY
+      .thresholds;
+
+  const compressionSamples =
+    getStateSamples(
+      samples,
+      "COMPRESSION",
+    );
+
+  const pressureBuildingSamples =
+    getStateSamples(
+      samples,
+      "PRESSURE_BUILDING",
+    );
+
+  const releaseSamples =
+    getStateSamples(
+      samples,
+      "RELEASE",
+    );
+
+  const exhaustionSamples =
+    getStateSamples(
+      samples,
+      "EXHAUSTION",
+    );
+
+  const neutralSamples =
+    getStateSamples(
+      samples,
+      "NEUTRAL",
+    );
+
+  const useCompression =
+    hasEnoughStateSamples(
+      compressionSamples,
+    );
+
+  const usePressureBuilding =
+    hasEnoughStateSamples(
+      pressureBuildingSamples,
+    );
+
+  const useRelease =
+    hasEnoughStateSamples(
+      releaseSamples,
+    );
+
+  const useExhaustion =
+    hasEnoughStateSamples(
+      exhaustionSamples,
+    );
+
+  const useNeutral =
+    hasEnoughStateSamples(
+      neutralSamples,
+    );
+
+  return {
+    compression: {
+      pressure_min:
+        resolveBoundedPercentile(
+          useCompression
+            ? getSampleValues(
+                compressionSamples,
+                (sample) =>
+                  sample.scores
+                    .pressure_score,
+              )
+            : [],
+          {
+            fallback:
+              fallback.compression
+                .pressure_min,
+
+            percentile:
+              45,
+
+            minimum:
+              30,
+
+            maximum:
+              58,
+          },
+        ),
+
+      instability_max:
+        resolveBoundedPercentile(
+          useCompression
+            ? getSampleValues(
+                compressionSamples,
+                (sample) =>
+                  sample.scores
+                    .instability_score,
+              )
+            : [],
+          {
+            fallback:
+              fallback.compression
+                .instability_max,
+
+            percentile:
+              62,
+
+            minimum:
+              42,
+
+            maximum:
+              68,
+          },
+        ),
+
+      exhaustion_max:
+        resolveBoundedPercentile(
+          useCompression
+            ? getSampleValues(
+                compressionSamples,
+                (sample) =>
+                  sample.scores
+                    .exhaustion_score,
+              )
+            : [],
+          {
+            fallback:
+              fallback.compression
+                .exhaustion_max,
+
+            percentile:
+              62,
+
+            minimum:
+              38,
+
+            maximum:
+              66,
+          },
+        ),
+
+      alignment_min:
+        resolveBoundedPercentile(
+          useCompression
+            ? getSampleValues(
+                compressionSamples,
+                (sample) =>
+                  sample.scores
+                    .alignment_score,
+              )
+            : [],
+          {
+            fallback:
+              fallback.compression
+                .alignment_min,
+
+            percentile:
+              42,
+
+            minimum:
+              30,
+
+            maximum:
+              62,
+          },
+        ),
+
+      core_pattern_min:
+        resolveBoundedPercentile(
+          useCompression
+            ? getSampleValues(
+                compressionSamples,
+                (sample) =>
+                  sample.triple_layer
+                    .core_pattern_score,
+              )
+            : [],
+          {
+            fallback:
+              fallback.compression
+                .core_pattern_min,
+
+            percentile:
+              45,
+
+            minimum:
+              35,
+
+            maximum:
+              60,
+          },
+        ),
+    },
+
+    pressure_building: {
+      pressure_min:
+        resolveBoundedPercentile(
+          usePressureBuilding
+            ? getSampleValues(
+                pressureBuildingSamples,
+                (sample) =>
+                  sample.scores
+                    .pressure_score,
+              )
+            : [],
+          {
+            fallback:
+              fallback.pressure_building
+                .pressure_min,
+
+            percentile:
+              55,
+
+            minimum:
+              38,
+
+            maximum:
+              68,
+          },
+        ),
+
+      saturation_min:
+        resolveBoundedPercentile(
+          usePressureBuilding
+            ? getSampleValues(
+                pressureBuildingSamples,
+                (sample) =>
+                  sample.scores
+                    .saturation_score,
+              )
+            : [],
+          {
+            fallback:
+              fallback.pressure_building
+                .saturation_min,
+
+            percentile:
+              45,
+
+            minimum:
+              32,
+
+            maximum:
+              65,
+          },
+        ),
+
+      instability_min:
+        resolveBoundedPercentile(
+          usePressureBuilding
+            ? getSampleValues(
+                pressureBuildingSamples,
+                (sample) =>
+                  sample.scores
+                    .instability_score,
+              )
+            : [],
+          {
+            fallback:
+              fallback.pressure_building
+                .instability_min,
+
+            percentile:
+              38,
+
+            minimum:
+              24,
+
+            maximum:
+              62,
+          },
+        ),
+
+      acceleration_min:
+        resolveBoundedPercentile(
+          usePressureBuilding
+            ? getSampleValues(
+                pressureBuildingSamples,
+                (sample) =>
+                  sample.scores
+                    .acceleration_score,
+              )
+            : [],
+          {
+            fallback:
+              fallback.pressure_building
+                .acceleration_min,
+
+            percentile:
+              42,
+
+            minimum:
+              28,
+
+            maximum:
+              66,
+          },
+        ),
+
+      alignment_min:
+        resolveBoundedPercentile(
+          usePressureBuilding
+            ? getSampleValues(
+                pressureBuildingSamples,
+                (sample) =>
+                  sample.scores
+                    .alignment_score,
+              )
+            : [],
+          {
+            fallback:
+              fallback.pressure_building
+                .alignment_min,
+
+            percentile:
+              45,
+
+            minimum:
+              30,
+
+            maximum:
+              66,
+          },
+        ),
+
+      growth_min:
+        resolveBoundedPercentile(
+          usePressureBuilding
+            ? getSampleValues(
+                pressureBuildingSamples,
+                (sample) =>
+                  sample.triple_layer
+                    .growth_score,
+              )
+            : [],
+          {
+            fallback:
+              fallback.pressure_building
+                .growth_min,
+
+            percentile:
+              42,
+
+            minimum:
+              30,
+
+            maximum:
+              62,
+          },
+        ),
+    },
+
+    release: {
+      pressure_min:
+        resolveBoundedPercentile(
+          useRelease
+            ? getSampleValues(
+                releaseSamples,
+                (sample) =>
+                  sample.scores
+                    .pressure_score,
+              )
+            : [],
+          {
+            fallback:
+              fallback.release
+                .pressure_min,
+
+            percentile:
+              58,
+
+            minimum:
+              42,
+
+            maximum:
+              72,
+          },
+        ),
+
+      instability_min:
+        resolveBoundedPercentile(
+          useRelease
+            ? getSampleValues(
+                releaseSamples,
+                (sample) =>
+                  sample.scores
+                    .instability_score,
+              )
+            : [],
+          {
+            fallback:
+              fallback.release
+                .instability_min,
+
+            percentile:
+              50,
+
+            minimum:
+              34,
+
+            maximum:
+              70,
+          },
+        ),
+
+      saturation_min:
+        resolveBoundedPercentile(
+          useRelease
+            ? getSampleValues(
+                releaseSamples,
+                (sample) =>
+                  sample.scores
+                    .saturation_score,
+              )
+            : [],
+          {
+            fallback:
+              fallback.release
+                .saturation_min,
+
+            percentile:
+              48,
+
+            minimum:
+              34,
+
+            maximum:
+              68,
+          },
+        ),
+
+      acceleration_min:
+        resolveBoundedPercentile(
+          useRelease
+            ? getSampleValues(
+                releaseSamples,
+                (sample) =>
+                  sample.scores
+                    .acceleration_score,
+              )
+            : [],
+          {
+            fallback:
+              fallback.release
+                .acceleration_min,
+
+            percentile:
+              55,
+
+            minimum:
+              36,
+
+            maximum:
+              72,
+          },
+        ),
+
+      alignment_min:
+        resolveBoundedPercentile(
+          useRelease
+            ? getSampleValues(
+                releaseSamples,
+                (sample) =>
+                  sample.scores
+                    .alignment_score,
+              )
+            : [],
+          {
+            fallback:
+              fallback.release
+                .alignment_min,
+
+            percentile:
+              48,
+
+            minimum:
+              32,
+
+            maximum:
+              70,
+          },
+        ),
+
+      growth_min:
+        resolveBoundedPercentile(
+          useRelease
+            ? getSampleValues(
+                releaseSamples,
+                (sample) =>
+                  sample.triple_layer
+                    .growth_score,
+              )
+            : [],
+          {
+            fallback:
+              fallback.release
+                .growth_min,
+
+            percentile:
+              48,
+
+            minimum:
+              34,
+
+            maximum:
+              66,
+          },
+        ),
+
+      decay_max:
+        resolveBoundedPercentile(
+          useRelease
+            ? getSampleValues(
+                releaseSamples,
+                (sample) =>
+                  sample.triple_layer
+                    .decay_score,
+              )
+            : [],
+          {
+            fallback:
+              fallback.release
+                .decay_max,
+
+            percentile:
+              70,
+
+            minimum:
+              52,
+
+            maximum:
+              82,
+          },
+        ),
+    },
+
+    exhaustion: {
+      exhaustion_min:
+        resolveBoundedPercentile(
+          useExhaustion
+            ? getSampleValues(
+                exhaustionSamples,
+                (sample) =>
+                  sample.scores
+                    .exhaustion_score,
+              )
+            : [],
+          {
+            fallback:
+              fallback.exhaustion
+                .exhaustion_min,
+
+            percentile:
+              58,
+
+            minimum:
+              48,
+
+            maximum:
+              78,
+          },
+        ),
+
+      instability_min:
+        resolveBoundedPercentile(
+          useExhaustion
+            ? getSampleValues(
+                exhaustionSamples,
+                (sample) =>
+                  sample.scores
+                    .instability_score,
+              )
+            : [],
+          {
+            fallback:
+              fallback.exhaustion
+                .instability_min,
+
+            percentile:
+              52,
+
+            minimum:
+              35,
+
+            maximum:
+              72,
+          },
+        ),
+
+      saturation_min:
+        resolveBoundedPercentile(
+          useExhaustion
+            ? getSampleValues(
+                exhaustionSamples,
+                (sample) =>
+                  sample.scores
+                    .saturation_score,
+              )
+            : [],
+          {
+            fallback:
+              fallback.exhaustion
+                .saturation_min,
+
+            percentile:
+              52,
+
+            minimum:
+              36,
+
+            maximum:
+              72,
+          },
+        ),
+
+      acceleration_min:
+        resolveBoundedPercentile(
+          useExhaustion
+            ? getSampleValues(
+                exhaustionSamples,
+                (sample) =>
+                  sample.scores
+                    .acceleration_score,
+              )
+            : [],
+          {
+            fallback:
+              fallback.exhaustion
+                .acceleration_min,
+
+            percentile:
+              50,
+
+            minimum:
+              32,
+
+            maximum:
+              70,
+          },
+        ),
+
+      decay_min:
+        resolveBoundedPercentile(
+          useExhaustion
+            ? getSampleValues(
+                exhaustionSamples,
+                (sample) =>
+                  sample.triple_layer
+                    .decay_score,
+              )
+            : [],
+          {
+            fallback:
+              fallback.exhaustion
+                .decay_min,
+
+            percentile:
+              50,
+
+            minimum:
+              35,
+
+            maximum:
+              72,
+          },
+        ),
+    },
+
+    neutral: {
+      pressure_max:
+        resolveBoundedPercentile(
+          useNeutral
+            ? getSampleValues(
+                neutralSamples,
+                (sample) =>
+                  sample.scores
+                    .pressure_score,
+              )
+            : [],
+          {
+            fallback:
+              fallback.neutral
+                .pressure_max,
+
+            percentile:
+              65,
+
+            minimum:
+              25,
+
+            maximum:
+              44,
+          },
+        ),
+
+      instability_max:
+        resolveBoundedPercentile(
+          useNeutral
+            ? getSampleValues(
+                neutralSamples,
+                (sample) =>
+                  sample.scores
+                    .instability_score,
+              )
+            : [],
+          {
+            fallback:
+              fallback.neutral
+                .instability_max,
+
+            percentile:
+              65,
+
+            minimum:
+              25,
+
+            maximum:
+              56,
+          },
+        ),
+
+      saturation_max:
+        resolveBoundedPercentile(
+          useNeutral
+            ? getSampleValues(
+                neutralSamples,
+                (sample) =>
+                  sample.scores
+                    .saturation_score,
+              )
+            : [],
+          {
+            fallback:
+              fallback.neutral
+                .saturation_max,
+
+            percentile:
+              65,
+
+            minimum:
+              25,
+
+            maximum:
+              56,
+          },
+        ),
+
+      exhaustion_max:
+        resolveBoundedPercentile(
+          useNeutral
+            ? getSampleValues(
+                neutralSamples,
+                (sample) =>
+                  sample.scores
+                    .exhaustion_score,
+              )
+            : [],
+          {
+            fallback:
+              fallback.neutral
+                .exhaustion_max,
+
+            percentile:
+              65,
+
+            minimum:
+              25,
+
+            maximum:
+              56,
+          },
+        ),
+    },
+  };
+}
+
+/* ============================================================================
+ * 11. PUBLIC CALIBRATION EXECUTION
+ * ----------------------------------------------------------------------------
+ * PROCESS
+ * 1. validate required source scores
+ * 2. preserve optional Triple Layer nullability
+ * 3. classify unlabeled bootstrap samples through the canonical resolver
+ * 4. measure state sample distribution
+ * 5. select fallback, bootstrap or adaptive policy
+ * 6. return one deterministic immutable policy
+ * ========================================================================== */
+
+export function buildImpulseAdaptivePolicy(
+  inputSamples:
+    readonly ImpulseAdaptiveSample[],
+): ImpulseResolvedPolicy {
+  const sanitation =
+    sanitizeSamples(
+      inputSamples,
+    );
+
+  const warnings:
+    string[] = [];
+
+  if (
+    sanitation
+      .rejected_sample_count > 0
+  ) {
+    warnings.push(
+      "impulse_adaptive_thresholds_rejected_invalid_samples",
+    );
   }
 
-  if (releaseMatch) {
-    return "RELEASE";
+  const classifiedSamples =
+    classifySamples(
+      sanitation.samples,
+    );
+
+  const stateSampleSize =
+    countStateSamples(
+      classifiedSamples,
+    );
+
+  const inferredSampleCount =
+    classifiedSamples.filter(
+      (sample) =>
+        sample.state_source ===
+        "inferred",
+    ).length;
+
+  if (
+    inferredSampleCount > 0
+  ) {
+    warnings.push(
+      "impulse_adaptive_thresholds_inferred_bootstrap_labels",
+    );
   }
 
-  if (pressureBuildingMatch) {
-    return "PRESSURE_BUILDING";
+  if (
+    classifiedSamples.length <
+    MINIMUM_BOOTSTRAP_SAMPLE_COUNT
+  ) {
+    warnings.push(
+      "impulse_adaptive_thresholds_insufficient_bootstrap_sample",
+    );
+
+    return buildFallbackPolicy({
+      sample_size:
+        classifiedSamples.length,
+
+      state_sample_size:
+        stateSampleSize,
+
+      warnings,
+    });
   }
 
-  if (compressionMatch) {
-    return "COMPRESSION";
+  appendStateSampleWarnings(
+    stateSampleSize,
+    warnings,
+  );
+
+  appendDominanceWarnings(
+    stateSampleSize,
+    classifiedSamples.length,
+    warnings,
+  );
+
+  const thresholds =
+    buildAdaptiveThresholds(
+      classifiedSamples,
+    );
+
+  if (
+    classifiedSamples.length <
+    MINIMUM_GLOBAL_SAMPLE_COUNT
+  ) {
+    warnings.push(
+      "impulse_adaptive_thresholds_bootstrap_sample_only",
+    );
+
+    return buildPolicy({
+      source:
+        "bootstrap",
+
+      sample_size:
+        classifiedSamples.length,
+
+      state_sample_size:
+        stateSampleSize,
+
+      thresholds,
+
+      warnings,
+    });
   }
 
-  if (neutralMatch) {
-    return "NEUTRAL";
-  }
+  return buildPolicy({
+    source:
+      "adaptive",
 
-  return "NEUTRAL";
+    sample_size:
+      classifiedSamples.length,
+
+    state_sample_size:
+      stateSampleSize,
+
+    thresholds,
+
+    warnings,
+  });
 }

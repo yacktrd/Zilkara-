@@ -5,31 +5,139 @@
  * - Xyvala private MCI opportunity core
  *
  * ROLE
- * - evaluate pattern occurrences after RFS
- * - measure private convergence, correction and continuation probabilities
- * - produce private MCI decision output only
+ * - consume canonical RFS structural truth after RFS computation
+ * - evaluate comparable historical pattern occurrences
+ * - aggregate correction, continuation and convergence evidence
+ * - compute the private MCI opportunity score
+ * - resolve a private defensive decision
+ *
+ * CLASSIFICATION
+ * - PRIVATE ANALYTICAL ENGINE
+ * - MCI
+ * - COMPUTE
+ * - PURE
+ * - NON-MUTATING
+ *
+ * PARENTS
+ * - RFS
+ * - Triple Layer input adapter
+ * - Impulse Layer input adapter
+ * - Analytical Aggregation System input adapter
+ * - MCI contracts
+ *
+ * CONSUMERS
+ * - MCI orchestrator
+ * - private snapshot projection
+ * - private calibration input adapter
+ * - private analytical stores
  *
  * DIRECTIVES
- * - private analytical core only
+ * - private MCI computation only
  * - no public ScanAsset dependency
  * - no RFS recomputation
- * - no calibration logic
+ * - no pattern reclassification from prices
+ * - no rupture recomputation
+ * - no continuity recomputation
+ * - no stability recomputation
+ * - no regime reconstruction
+ * - no Triple Layer computation
+ * - no Impulse Layer computation
+ * - no Crash System computation
+ * - no calibration computation
  * - no API logic
  * - no UI logic
  * - no public exposure
- * - deterministic output only
- * - same input => same output
+ * - no score clamping as silent repair
+ * - no unavailable-to-zero substitution
+ * - no unavailable-to-neutral substitution
+ * - no synthetic historical occurrence
  * - no unsafe array access
- * - no legacy rupture_detected dependency
+ * - deterministic output only
+ * - same validated input and versions => same output
+ *
+ * INPUTS
+ * - canonical RfsScoreResult
+ * - observable current price series
+ * - optional real historical pattern occurrences
+ *
+ * OUTPUTS
+ * - private MCI opportunity result
+ *
+ * OWNERSHIP
+ * - MCI owns:
+ *   - correction_probability
+ *   - continuation_probability
+ *   - opportunity_score
+ *   - decision
+ *   - decision reason
+ *
+ * NON-OWNERSHIP
+ * - RFS owns:
+ *   - pattern truth
+ *   - structural convergence
+ *   - stability
+ *   - regime
+ *   - rupture
+ *   - continuity probability
+ *
+ * - Calibration owns:
+ *   - calibrated decision thresholds
+ *   - calibrated distribution policies
+ *
+ * INVARIANTS
+ * - RFS values are consumed through their canonical nested identities
+ * - RFS pattern state is never recomputed from prices
+ * - null remains distinct from zero
+ * - missing analytical truth produces a defensive WATCH result
+ * - ALLOW requires complete and valid upstream analytical truth
+ * - BLOCK qualifies observed adverse evidence, not technical insufficiency
+ * - historical absence never becomes a synthetic zero-probability observation
+ * - no downstream layer may infer missing RFS truth from MCI output
+ *
+ * BOUNDARIES
+ * - RFS -> MCI
+ * - historical occurrence store -> MCI
+ * - MCI -> private snapshot
+ *
+ * FIRST DIVERGENCE
+ * - invalid or unavailable canonical RFS truth
+ *   => RFS -> MCI boundary
+ *
+ * - invalid historical occurrences
+ *   => historical occurrence store -> MCI boundary
+ *
+ * - valid MCI result altered downstream
+ *   => first downstream propagation boundary
+ *
+ * SENSITIVE ZONES
+ * - RFS nested contract reading
+ * - nullability
+ * - pattern identity mapping
+ * - historical comparability
+ * - probability aggregation
+ * - defensive decision resolution
  * ========================================================================== */
 
-import type { RfsResult } from "@/lib/xyvala/rfs-core";
+import type {
+  RfsComputationStatus,
+  RfsPatternState,
+  RfsScoreResult,
+} from "@/lib/xyvala/rfs/contracts/rfs-score-contract";
 
 /* ============================================================================
- * 1. TYPES
+ * 1. PUBLIC CONTRACTS
  * ========================================================================== */
 
-export type MciDecision = "ALLOW" | "WATCH" | "BLOCK";
+export type MciDecision =
+  | "ALLOW"
+  | "WATCH"
+  | "BLOCK";
+
+export type MciComputationStatus =
+  | "computed"
+  | "partial"
+  | "unavailable"
+  | "invalid";
 
 export type PatternKind =
   | "UP_STREAK"
@@ -39,433 +147,1451 @@ export type PatternKind =
   | "BREAKDOWN"
   | "MEAN_REVERTING"
   | "CHAOTIC"
-  | "MIXED";
+  | "MIXED"
+  | "UNAVAILABLE";
 
-export type PatternOccurrence = {
+export type PatternOccurrence = Readonly<{
   kind: PatternKind;
-  similarity_score: number;
-  led_to_correction: boolean;
-  led_to_continuation: boolean;
-};
 
-export type MciInput = {
-  rfs: RfsResult;
-  prices: number[];
-  timestamps?: number[];
-  historical_patterns?: PatternOccurrence[];
-};
+  similarity_score:
+    number;
 
-export type MciResult = {
-  pattern_kind: PatternKind;
+  led_to_correction:
+    boolean;
 
-  pattern_occurrence_count: number;
-  comparable_occurrence_count: number;
+  led_to_continuation:
+    boolean;
+}>;
 
-  pattern_similarity_score: number;
-  convergence_score: number;
+export type MciInput = Readonly<{
+  rfs:
+    RfsScoreResult;
 
-  correction_probability: number;
-  continuation_probability: number;
+  prices:
+    readonly number[];
 
-  opportunity_score: number;
-  decision: MciDecision;
+  timestamps?:
+    readonly number[];
 
-  reason: string;
-};
+  historical_patterns?:
+    readonly PatternOccurrence[];
+}>;
+
+export type MciResult = Readonly<{
+  status:
+    MciComputationStatus;
+
+  pattern_kind:
+    PatternKind;
+
+  pattern_occurrence_count:
+    number;
+
+  comparable_occurrence_count:
+    number;
+
+  pattern_similarity_score:
+    number | null;
+
+  convergence_score:
+    number | null;
+
+  correction_probability:
+    number | null;
+
+  continuation_probability:
+    number | null;
+
+  opportunity_score:
+    number | null;
+
+  decision:
+    MciDecision;
+
+  reason:
+    string;
+}>;
 
 /* ============================================================================
- * 2. SAFE HELPERS
+ * 2. GOVERNED CONSTANTS
+ * ----------------------------------------------------------------------------
+ * These thresholds belong to the current deterministic MCI implementation.
+ *
+ * They are not calibration values and must not be altered by runtime data.
+ * A future calibrated policy must be injected by the MCI orchestrator through
+ * a dedicated versioned contract rather than read implicitly here.
  * ========================================================================== */
 
-function isFiniteNumber(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value);
+const MINIMUM_CURRENT_PRICE_COUNT =
+  3;
+
+const RUPTURE_DETECTED_THRESHOLD =
+  60;
+
+const STABILITY_STRONG_THRESHOLD =
+  60;
+
+const STABILITY_MODERATE_THRESHOLD =
+  45;
+
+const ALLOW_CORRECTION_THRESHOLD =
+  60;
+
+const ALLOW_CONVERGENCE_THRESHOLD =
+  55;
+
+const ALLOW_STABILITY_THRESHOLD =
+  55;
+
+const WATCH_CORRECTION_THRESHOLD =
+  40;
+
+const WATCH_OPPORTUNITY_THRESHOLD =
+  45;
+
+/* ============================================================================
+ * 3. PURE NUMERIC READERS
+ * ----------------------------------------------------------------------------
+ * These helpers validate values.
+ *
+ * They never:
+ * - clamp invalid producer values
+ * - repair invalid values
+ * - replace null with zero
+ * - synthesize analytical truth
+ * ========================================================================== */
+
+function isFiniteNumber(
+  value: unknown,
+): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isFinite(value)
+  );
 }
 
-function sanitizePrices(values: number[]): number[] {
-  return values.filter((value) => isFiniteNumber(value) && value > 0);
+function isScoreValue(
+  value: unknown,
+): value is number {
+  return (
+    isFiniteNumber(value) &&
+    value >= 0 &&
+    value <= 100
+  );
 }
 
-function firstNumber(values: readonly number[]): number | null {
-  const value = values.at(0);
-  return isFiniteNumber(value) ? value : null;
+function readNullableScore(
+  value: unknown,
+  variableName: string,
+): number | null {
+  if (value === null) {
+    return null;
+  }
+
+  if (!isScoreValue(value)) {
+    throw new RangeError(
+      `MCI_UPSTREAM_SCORE_INVALID: ${variableName} must be null or a finite score between 0 and 100`,
+    );
+  }
+
+  return value;
 }
 
-function lastNumber(values: readonly number[]): number | null {
-  const value = values.at(-1);
-  return isFiniteNumber(value) ? value : null;
+function roundToTwoDecimals(
+  value: number,
+): number {
+  if (!isFiniteNumber(value)) {
+    throw new RangeError(
+      "MCI_NUMERIC_RESULT_INVALID: result must be finite",
+    );
+  }
+
+  return (
+    Math.round(value * 100) /
+    100
+  );
 }
 
-function clamp(value: number, min = 0, max = 100): number {
-  if (!Number.isFinite(value)) return min;
-  return Math.max(min, Math.min(max, value));
-}
+function normalizeComputedScore(
+  value: number,
+): number {
+  if (!isFiniteNumber(value)) {
+    throw new RangeError(
+      "MCI_SCORE_INVALID: computed score must be finite",
+    );
+  }
 
-function round2(value: number): number {
-  if (!Number.isFinite(value)) return 0;
-  return Math.round(value * 100) / 100;
-}
-
-function average(values: readonly number[]): number {
-  if (values.length === 0) return 0;
-  return values.reduce((sum, value) => sum + value, 0) / values.length;
-}
-
-function standardDeviation(values: readonly number[]): number {
-  if (values.length <= 1) return 0;
-
-  const mean = average(values);
-  const variance =
-    values.reduce((sum, value) => sum + (value - mean) ** 2, 0) /
-    values.length;
-
-  return Math.sqrt(variance);
-}
-
-function pctChange(from: number | null, to: number | null): number {
   if (
-    from === null ||
-    to === null ||
-    !Number.isFinite(from) ||
-    !Number.isFinite(to) ||
-    from === 0
+    value < 0 ||
+    value > 100
   ) {
-    return 0;
+    throw new RangeError(
+      "MCI_SCORE_OUT_OF_RANGE: computed score must remain between 0 and 100",
+    );
   }
 
-  return ((to - from) / from) * 100;
+  return roundToTwoDecimals(
+    value,
+  );
 }
 
-function isRuptureDetected(rfs: RfsResult): boolean {
-  return rfs.rupture_probability >= 60 || rfs.rupture_score >= 60;
+function average(
+  values: readonly number[],
+): number | null {
+  if (values.length === 0) {
+    return null;
+  }
+
+  const total =
+    values.reduce(
+      (sum, value) => {
+        if (!isFiniteNumber(value)) {
+          throw new RangeError(
+            "MCI_AVERAGE_INPUT_INVALID: all values must be finite",
+          );
+        }
+
+        return sum + value;
+      },
+      0,
+    );
+
+  return total / values.length;
+}
+
+function firstNumber(
+  values: readonly number[],
+): number | null {
+  const value =
+    values[0];
+
+  return isFiniteNumber(value)
+    ? value
+    : null;
+}
+
+function lastNumber(
+  values: readonly number[],
+): number | null {
+  const value =
+    values.at(-1);
+
+  return isFiniteNumber(value)
+    ? value
+    : null;
+}
+
+function computePercentageChange(
+  from: number,
+  to: number,
+): number {
+  if (
+    !isFiniteNumber(from) ||
+    !isFiniteNumber(to) ||
+    from <= 0
+  ) {
+    throw new RangeError(
+      "MCI_PERCENTAGE_CHANGE_INPUT_INVALID: prices must be finite and the initial price must be positive",
+    );
+  }
+
+  return (
+    (to - from) /
+    from
+  ) * 100;
 }
 
 /* ============================================================================
- * 3. PATTERN HELPERS
+ * 4. OBSERVABLE PRICE VALIDATION
+ * ----------------------------------------------------------------------------
+ * Prices are used only as immediate observable MCI evidence.
+ *
+ * They are not used to:
+ * - classify the canonical RFS pattern
+ * - recompute stability
+ * - recompute rupture
+ * - recompute continuity
+ * - reconstruct missing timestamps
  * ========================================================================== */
 
-function countDirectionalStats(prices: readonly number[]) {
-  let upMoves = 0;
-  let downMoves = 0;
-
-  let currentUpStreak = 0;
-  let currentDownStreak = 0;
-
-  let maxUpStreak = 0;
-  let maxDownStreak = 0;
-
-  for (let index = 1; index < prices.length; index += 1) {
-    const previous = prices[index - 1];
-    const current = prices[index];
-
-    if (!isFiniteNumber(previous) || !isFiniteNumber(current)) {
-      currentUpStreak = 0;
-      currentDownStreak = 0;
-      continue;
-    }
-
-    if (current > previous) {
-      upMoves += 1;
-      currentUpStreak += 1;
-      currentDownStreak = 0;
-    } else if (current < previous) {
-      downMoves += 1;
-      currentDownStreak += 1;
-      currentUpStreak = 0;
-    } else {
-      currentUpStreak = 0;
-      currentDownStreak = 0;
-    }
-
-    maxUpStreak = Math.max(maxUpStreak, currentUpStreak);
-    maxDownStreak = Math.max(maxDownStreak, currentDownStreak);
+function validatePrices(
+  values: readonly number[],
+): readonly number[] | null {
+  if (
+    !Array.isArray(values) ||
+    values.length <
+      MINIMUM_CURRENT_PRICE_COUNT
+  ) {
+    return null;
   }
+
+  for (
+    let index = 0;
+    index < values.length;
+    index += 1
+  ) {
+    const value =
+      values[index];
+
+    if (
+      !isFiniteNumber(value) ||
+      value <= 0
+    ) {
+      return null;
+    }
+  }
+
+  return [...values];
+}
+
+function computeCurrentDistanceFromMean(
+  prices: readonly number[],
+): number | null {
+  const meanPrice =
+    average(prices);
+
+  const latestPrice =
+    lastNumber(prices);
+
+  if (
+    meanPrice === null ||
+    latestPrice === null ||
+    meanPrice <= 0
+  ) {
+    return null;
+  }
+
+  return Math.abs(
+    computePercentageChange(
+      meanPrice,
+      latestPrice,
+    ),
+  );
+}
+
+/* ============================================================================
+ * 5. RFS CANONICAL READERS
+ * ----------------------------------------------------------------------------
+ * These readers preserve the RFS contract identities.
+ *
+ * No flattened legacy identity is accepted here.
+ * ========================================================================== */
+
+type CanonicalRfsEvidence = Readonly<{
+  pattern_kind:
+    PatternKind;
+
+  pattern_score:
+    number | null;
+
+  structural_convergence_score:
+    number | null;
+
+  stability_score:
+    number | null;
+
+  regime:
+    RfsScoreResult["regime"]["regime"];
+
+  rupture_probability:
+    number | null;
+
+  rupture_score:
+    number | null;
+
+  continuity_probability:
+    number | null;
+
+  complete:
+    boolean;
+}>;
+
+function mapRfsPatternState(
+  state: RfsPatternState,
+): PatternKind {
+  switch (state) {
+    case "ASCENDING":
+      return "UP_STREAK";
+
+    case "DESCENDING":
+      return "DOWN_STREAK";
+
+    case "COMPRESSING":
+      return "COMPRESSION";
+
+    case "EXPANDING":
+      return "BREAKOUT";
+
+    case "RANGE":
+      return "MEAN_REVERTING";
+
+    case "FRAGMENTED":
+    case "IRREGULAR":
+      return "CHAOTIC";
+
+    case "UNAVAILABLE":
+    default:
+      return "UNAVAILABLE";
+  }
+}
+
+function isComputedOrPartial(
+  status: RfsComputationStatus,
+): boolean {
+  return (
+    status === "computed" ||
+    status === "partial"
+  );
+}
+
+function readCanonicalRfsEvidence(
+  rfs: RfsScoreResult,
+): CanonicalRfsEvidence {
+  const patternScore =
+    readNullableScore(
+      rfs.pattern
+        .pattern_score,
+      "rfs.pattern.pattern_score",
+    );
+
+  const structuralConvergenceScore =
+    readNullableScore(
+      rfs.structural_axes
+        .convergence_score,
+      "rfs.structural_axes.convergence_score",
+    );
+
+  const stabilityScore =
+    readNullableScore(
+      rfs.stability
+        .stability_score,
+      "rfs.stability.stability_score",
+    );
+
+  const ruptureProbability =
+    readNullableScore(
+      rfs.rupture
+        .rupture_probability,
+      "rfs.rupture.rupture_probability",
+    );
+
+  const ruptureScore =
+    readNullableScore(
+      rfs.rupture
+        .rupture_score,
+      "rfs.rupture.rupture_score",
+    );
+
+  const continuityProbability =
+    readNullableScore(
+      rfs.rupture
+        .continuity_probability,
+      "rfs.rupture.continuity_probability",
+    );
+
+  const patternKind =
+    mapRfsPatternState(
+      rfs.pattern
+        .pattern_state,
+    );
+
+  const complete =
+    rfs.propagation_status ===
+      "full" &&
+    isComputedOrPartial(
+      rfs.pattern.status,
+    ) &&
+    isComputedOrPartial(
+      rfs.stability.status,
+    ) &&
+    isComputedOrPartial(
+      rfs.regime.status,
+    ) &&
+    isComputedOrPartial(
+      rfs.rupture.status,
+    ) &&
+    patternKind !==
+      "UNAVAILABLE" &&
+    patternScore !== null &&
+    structuralConvergenceScore !==
+      null &&
+    stabilityScore !== null &&
+    rfs.regime.regime !== null &&
+    ruptureProbability !== null &&
+    ruptureScore !== null &&
+    continuityProbability !== null;
 
   return {
-    up_moves: upMoves,
-    down_moves: downMoves,
-    up_streak_max: maxUpStreak,
-    down_streak_max: maxDownStreak,
+    pattern_kind:
+      patternKind,
+
+    pattern_score:
+      patternScore,
+
+    structural_convergence_score:
+      structuralConvergenceScore,
+
+    stability_score:
+      stabilityScore,
+
+    regime:
+      rfs.regime.regime,
+
+    rupture_probability:
+      ruptureProbability,
+
+    rupture_score:
+      ruptureScore,
+
+    continuity_probability:
+      continuityProbability,
+
+    complete,
   };
 }
 
-function classifyPattern(prices: readonly number[]): PatternKind {
-  if (prices.length < 3) {
-    return "MIXED";
+function isRuptureDetected(
+  evidence: CanonicalRfsEvidence,
+): boolean | null {
+  if (
+    evidence.rupture_probability ===
+      null ||
+    evidence.rupture_score ===
+      null
+  ) {
+    return null;
   }
 
-  const stats = countDirectionalStats(prices);
-  const volatility = standardDeviation(prices);
-  const mean = average(prices);
-  const start = firstNumber(prices);
-  const end = lastNumber(prices);
-  const change = pctChange(start, end);
-
-  if (stats.up_streak_max >= 3 && change > 0) {
-    return "UP_STREAK";
-  }
-
-  if (stats.down_streak_max >= 3 && change < 0) {
-    return "DOWN_STREAK";
-  }
-
-  if (mean > 0 && volatility < mean * 0.01) {
-    return "COMPRESSION";
-  }
-
-  if (change > 4 && stats.up_moves > stats.down_moves * 1.5) {
-    return "BREAKOUT";
-  }
-
-  if (change < -4 && stats.down_moves > stats.up_moves * 1.5) {
-    return "BREAKDOWN";
-  }
-
-  if (Math.abs(pctChange(mean, end)) < 1.5) {
-    return "MEAN_REVERTING";
-  }
-
-  if (mean > 0 && volatility > mean * 0.04) {
-    return "CHAOTIC";
-  }
-
-  return "MIXED";
-}
-
-function computeCurrentPatternSimilarity(prices: readonly number[]): number {
-  if (prices.length < 3) {
-    return 0;
-  }
-
-  const stats = countDirectionalStats(prices);
-  const volatility = standardDeviation(prices);
-  const mean = average(prices);
-
-  const moveCount = stats.up_moves + stats.down_moves;
-
-  const directionalBalance =
-    moveCount > 0 ? Math.abs(stats.up_moves - stats.down_moves) / moveCount : 0;
-
-  const normalizedVolatility =
-    mean > 0 ? clamp((volatility / mean) * 100, 0, 100) : 0;
-
-  const streakStrength = clamp(
-    Math.max(stats.up_streak_max, stats.down_streak_max) * 12,
-    0,
-    100,
-  );
-
-  return round2(
-    clamp(
-      streakStrength * 0.45 +
-        (100 - normalizedVolatility) * 0.25 +
-        directionalBalance * 100 * 0.3,
-      0,
-      100,
-    ),
+  return (
+    evidence.rupture_probability >=
+      RUPTURE_DETECTED_THRESHOLD ||
+    evidence.rupture_score >=
+      RUPTURE_DETECTED_THRESHOLD
   );
 }
 
 /* ============================================================================
- * 4. HISTORICAL COMPARISON HELPERS
+ * 6. HISTORICAL OCCURRENCE VALIDATION
+ * ----------------------------------------------------------------------------
+ * Invalid historical occurrences are rejected.
+ *
+ * They are never:
+ * - silently removed
+ * - clamped
+ * - converted to synthetic neutral occurrences
  * ========================================================================== */
 
-function comparableOccurrences(
+function validateHistoricalOccurrences(
+  occurrences:
+    readonly PatternOccurrence[],
+): readonly PatternOccurrence[] {
+  for (
+    let index = 0;
+    index < occurrences.length;
+    index += 1
+  ) {
+    const occurrence =
+      occurrences[index];
+
+    if (
+      occurrence === undefined ||
+      !isScoreValue(
+        occurrence
+          .similarity_score,
+      ) ||
+      typeof occurrence
+        .led_to_correction !==
+        "boolean" ||
+      typeof occurrence
+        .led_to_continuation !==
+        "boolean"
+    ) {
+      throw new RangeError(
+        `MCI_HISTORICAL_OCCURRENCE_INVALID: historical_patterns[${index}] violates the occurrence contract`,
+      );
+    }
+  }
+
+  return [...occurrences];
+}
+
+function selectComparableOccurrences(
   patternKind: PatternKind,
-  occurrences: PatternOccurrence[],
-): PatternOccurrence[] {
-  return occurrences.filter((item) => item.kind === patternKind);
+  occurrences:
+    readonly PatternOccurrence[],
+): readonly PatternOccurrence[] {
+  if (
+    patternKind ===
+    "UNAVAILABLE"
+  ) {
+    return [];
+  }
+
+  return occurrences.filter(
+    (occurrence) =>
+      occurrence.kind ===
+      patternKind,
+  );
 }
 
-function correctionRate(occurrences: PatternOccurrence[]): number {
-  if (occurrences.length === 0) return 0;
+function computeCorrectionRate(
+  occurrences:
+    readonly PatternOccurrence[],
+): number | null {
+  if (occurrences.length === 0) {
+    return null;
+  }
 
-  const correctionCount = occurrences.filter(
-    (item) => item.led_to_correction,
-  ).length;
+  const correctionCount =
+    occurrences.filter(
+      (occurrence) =>
+        occurrence
+          .led_to_correction,
+    ).length;
 
-  return round2((correctionCount / occurrences.length) * 100);
+  return normalizeComputedScore(
+    (
+      correctionCount /
+      occurrences.length
+    ) * 100,
+  );
 }
 
-function continuationRate(occurrences: PatternOccurrence[]): number {
-  if (occurrences.length === 0) return 0;
+function computeContinuationRate(
+  occurrences:
+    readonly PatternOccurrence[],
+): number | null {
+  if (occurrences.length === 0) {
+    return null;
+  }
 
-  const continuationCount = occurrences.filter(
-    (item) => item.led_to_continuation,
-  ).length;
+  const continuationCount =
+    occurrences.filter(
+      (occurrence) =>
+        occurrence
+          .led_to_continuation,
+    ).length;
 
-  return round2((continuationCount / occurrences.length) * 100);
+  return normalizeComputedScore(
+    (
+      continuationCount /
+      occurrences.length
+    ) * 100,
+  );
 }
 
-function averageHistoricalSimilarity(occurrences: PatternOccurrence[]): number {
-  if (occurrences.length === 0) return 0;
+function computeHistoricalSimilarity(
+  occurrences:
+    readonly PatternOccurrence[],
+): number | null {
+  if (occurrences.length === 0) {
+    return null;
+  }
 
-  return round2(
-    average(occurrences.map((item) => clamp(item.similarity_score, 0, 100))),
+  const similarityAverage =
+    average(
+      occurrences.map(
+        (occurrence) =>
+          occurrence
+            .similarity_score,
+      ),
+    );
+
+  return similarityAverage === null
+    ? null
+    : normalizeComputedScore(
+        similarityAverage,
+      );
+}
+
+/* ============================================================================
+ * 7. WEIGHTED AGGREGATION
+ * ----------------------------------------------------------------------------
+ * Missing optional evidence is excluded and remaining weights are normalized.
+ *
+ * Missing mandatory evidence blocks computation.
+ *
+ * This is not an unavailable-to-neutral substitution.
+ * ========================================================================== */
+
+type WeightedEvidence = Readonly<{
+  value: number | null;
+  weight: number;
+  required: boolean;
+}>;
+
+function computeWeightedScore(
+  evidence:
+    readonly WeightedEvidence[],
+): number | null {
+  const requiredUnavailable =
+    evidence.some(
+      (item) =>
+        item.required &&
+        item.value === null,
+    );
+
+  if (requiredUnavailable) {
+    return null;
+  }
+
+  const availableEvidence =
+    evidence.filter(
+      (
+        item,
+      ): item is Readonly<{
+        value: number;
+        weight: number;
+        required: boolean;
+      }> =>
+        item.value !== null,
+    );
+
+  if (
+    availableEvidence.length === 0
+  ) {
+    return null;
+  }
+
+  const totalWeight =
+    availableEvidence.reduce(
+      (total, item) =>
+        total + item.weight,
+      0,
+    );
+
+  if (
+    !isFiniteNumber(totalWeight) ||
+    totalWeight <= 0
+  ) {
+    throw new RangeError(
+      "MCI_WEIGHT_CONFIGURATION_INVALID: total available weight must be positive",
+    );
+  }
+
+  const weightedTotal =
+    availableEvidence.reduce(
+      (total, item) =>
+        total +
+        item.value *
+          item.weight,
+      0,
+    );
+
+  return normalizeComputedScore(
+    weightedTotal /
+      totalWeight,
   );
 }
 
 /* ============================================================================
- * 5. CONVERGENCE HELPERS
+ * 8. CONVERGENCE
+ * ----------------------------------------------------------------------------
+ * MCI convergence aggregates upstream and observable evidence.
+ *
+ * It does not replace RFS structural convergence.
  * ========================================================================== */
 
-function computeConvergenceScore(input: {
-  rfs: RfsResult;
-  pattern_kind: PatternKind;
-  prices: readonly number[];
-}): number {
-  const latest = lastNumber(input.prices);
-  const mean = average(input.prices);
-  const currentDistance = mean > 0 ? Math.abs(pctChange(mean, latest)) : 0;
+function computeMciConvergenceScore(
+  input: Readonly<{
+    evidence:
+      CanonicalRfsEvidence;
 
-  const ruptureDetected = isRuptureDetected(input.rfs);
+    current_distance_pct:
+      number | null;
+  }>,
+): number | null {
+  const ruptureDetected =
+    isRuptureDetected(
+      input.evidence,
+    );
 
-  let score = 0;
-
-  if (ruptureDetected) {
-    score += 30;
+  if (
+    ruptureDetected === null ||
+    input.evidence
+      .structural_convergence_score ===
+      null ||
+    input.evidence
+      .stability_score === null ||
+    input.evidence.regime ===
+      null ||
+    input.current_distance_pct ===
+      null
+  ) {
+    return null;
   }
 
-  if (input.rfs.stability >= 60) {
-    score += 20;
-  } else if (input.rfs.stability >= 45) {
-    score += 10;
-  }
+  const ruptureEvidenceScore =
+    ruptureDetected
+      ? 100
+      : 0;
 
-  if (input.rfs.regime === "STABLE") {
-    score += 20;
-  } else if (input.rfs.regime === "TRANSITION") {
-    score += 12;
-  }
+  const regimeEvidenceScore =
+    input.evidence.regime ===
+      "STABLE"
+      ? 100
+      : input.evidence.regime ===
+          "TRANSITION"
+        ? 60
+        : 20;
 
-  if (input.pattern_kind !== "CHAOTIC") {
-    score += 10;
-  }
+  const distanceEvidenceScore =
+    input.current_distance_pct <= 4
+      ? 100
+      : input.current_distance_pct <=
+          8
+        ? 50
+        : 0;
 
-  if (currentDistance <= 4) {
-    score += 20;
-  } else if (currentDistance <= 8) {
-    score += 10;
-  }
+  const patternIntegrityScore =
+    input.evidence.pattern_kind ===
+      "CHAOTIC"
+      ? 20
+      : input.evidence
+            .pattern_kind ===
+          "UNAVAILABLE"
+        ? 0
+        : 100;
 
-  return round2(clamp(score, 0, 100));
+  return computeWeightedScore([
+    {
+      value:
+        input.evidence
+          .structural_convergence_score,
+
+      weight:
+        0.3,
+
+      required:
+        true,
+    },
+    {
+      value:
+        ruptureEvidenceScore,
+
+      weight:
+        0.2,
+
+      required:
+        true,
+    },
+    {
+      value:
+        input.evidence
+          .stability_score,
+
+      weight:
+        0.18,
+
+      required:
+        true,
+    },
+    {
+      value:
+        regimeEvidenceScore,
+
+      weight:
+        0.14,
+
+      required:
+        true,
+    },
+    {
+      value:
+        patternIntegrityScore,
+
+      weight:
+        0.08,
+
+      required:
+        true,
+    },
+    {
+      value:
+        distanceEvidenceScore,
+
+      weight:
+        0.1,
+
+      required:
+        true,
+    },
+  ]);
 }
 
 /* ============================================================================
- * 6. MCI CORE
+ * 9. PROBABILITY AND OPPORTUNITY AGGREGATION
  * ========================================================================== */
 
-export function runMCI(input: MciInput): MciResult {
-  const prices = sanitizePrices(input.prices);
-  const rfs = input.rfs;
-  const historical = input.historical_patterns ?? [];
+function computeCorrectionProbability(
+  input: Readonly<{
+    historical_correction_rate:
+      number | null;
 
-  if (prices.length < 3) {
-    return {
-      pattern_kind: "MIXED",
+    convergence_score:
+      number | null;
 
-      pattern_occurrence_count: historical.length,
-      comparable_occurrence_count: 0,
+    rupture_probability:
+      number | null;
 
-      pattern_similarity_score: 0,
-      convergence_score: 0,
+    historical_similarity:
+      number | null;
+  }>,
+): number | null {
+  return computeWeightedScore([
+    {
+      value:
+        input
+          .historical_correction_rate,
 
-      correction_probability: 0,
-      continuation_probability: 0,
+      weight:
+        0.45,
 
-      opportunity_score: 0,
-      decision: "BLOCK",
+      required:
+        false,
+    },
+    {
+      value:
+        input
+          .convergence_score,
 
-      reason: "insufficient_prices",
-    };
+      weight:
+        0.3,
+
+      required:
+        true,
+    },
+    {
+      value:
+        input
+          .rupture_probability,
+
+      weight:
+        0.15,
+
+      required:
+        true,
+    },
+    {
+      value:
+        input
+          .historical_similarity,
+
+      weight:
+        0.1,
+
+      required:
+        false,
+    },
+  ]);
+}
+
+function computeContinuationProbability(
+  input: Readonly<{
+    historical_continuation_rate:
+      number | null;
+
+    rfs_continuity_probability:
+      number | null;
+
+    current_pattern_score:
+      number | null;
+  }>,
+): number | null {
+  return computeWeightedScore([
+    {
+      value:
+        input
+          .historical_continuation_rate,
+
+      weight:
+        0.45,
+
+      required:
+        false,
+    },
+    {
+      value:
+        input
+          .rfs_continuity_probability,
+
+      weight:
+        0.35,
+
+      required:
+        true,
+    },
+    {
+      value:
+        input
+          .current_pattern_score,
+
+      weight:
+        0.2,
+
+      required:
+        true,
+    },
+  ]);
+}
+
+function computeOpportunityScore(
+  input: Readonly<{
+    correction_probability:
+      number | null;
+
+    convergence_score:
+      number | null;
+
+    stability_score:
+      number | null;
+  }>,
+): number | null {
+  return computeWeightedScore([
+    {
+      value:
+        input
+          .correction_probability,
+
+      weight:
+        0.55,
+
+      required:
+        true,
+    },
+    {
+      value:
+        input
+          .convergence_score,
+
+      weight:
+        0.25,
+
+      required:
+        true,
+    },
+    {
+      value:
+        input
+          .stability_score,
+
+      weight:
+        0.2,
+
+      required:
+        true,
+    },
+  ]);
+}
+
+/* ============================================================================
+ * 10. DECISION RESOLUTION
+ * ----------------------------------------------------------------------------
+ * WATCH is the defensive response to incomplete analytical truth.
+ *
+ * BLOCK is reserved for complete observed evidence that fails the opportunity
+ * conditions or demonstrates an adverse structural configuration.
+ * ========================================================================== */
+
+function resolveDecision(
+  input: Readonly<{
+    evidence:
+      CanonicalRfsEvidence;
+
+    correction_probability:
+      number | null;
+
+    convergence_score:
+      number | null;
+
+    opportunity_score:
+      number | null;
+  }>,
+): MciDecision {
+  const ruptureDetected =
+    isRuptureDetected(
+      input.evidence,
+    );
+
+  if (
+    !input.evidence.complete ||
+    ruptureDetected === null ||
+    input.correction_probability ===
+      null ||
+    input.convergence_score ===
+      null ||
+    input.opportunity_score ===
+      null ||
+    input.evidence
+      .stability_score === null
+  ) {
+    return "WATCH";
   }
-
-  const patternKind = classifyPattern(prices);
-  const patternSimilarityScore = computeCurrentPatternSimilarity(prices);
-
-  const comparable = comparableOccurrences(patternKind, historical);
-
-  const patternOccurrenceCount = historical.length;
-  const comparableOccurrenceCount = comparable.length;
-
-  const historicalCorrectionRate = correctionRate(comparable);
-  const historicalContinuationRate = continuationRate(comparable);
-  const historicalSimilarity = averageHistoricalSimilarity(comparable);
-
-  const convergenceScore = computeConvergenceScore({
-    rfs,
-    pattern_kind: patternKind,
-    prices,
-  });
-
-  const correctionProbability = round2(
-    clamp(
-      historicalCorrectionRate * 0.45 +
-        convergenceScore * 0.3 +
-        rfs.rupture_probability * 0.15 +
-        historicalSimilarity * 0.1,
-      0,
-      100,
-    ),
-  );
-
-  const continuationProbability = round2(
-    clamp(
-      historicalContinuationRate * 0.45 +
-        rfs.continuity_probability * 0.35 +
-        patternSimilarityScore * 0.2,
-      0,
-      100,
-    ),
-  );
-
-  const opportunityScore = round2(
-    clamp(
-      correctionProbability * 0.55 +
-        convergenceScore * 0.25 +
-        rfs.stability * 0.2,
-      0,
-      100,
-    ),
-  );
-
-  const ruptureDetected = isRuptureDetected(rfs);
-
-  let decision: MciDecision = "BLOCK";
 
   if (
     ruptureDetected &&
-    correctionProbability >= 60 &&
-    convergenceScore >= 55 &&
-    rfs.stability >= 55
+    input.correction_probability >=
+      ALLOW_CORRECTION_THRESHOLD &&
+    input.convergence_score >=
+      ALLOW_CONVERGENCE_THRESHOLD &&
+    input.evidence
+      .stability_score >=
+      ALLOW_STABILITY_THRESHOLD
   ) {
-    decision = "ALLOW";
-  } else if (
-    (ruptureDetected && correctionProbability >= 40) ||
-    opportunityScore >= 45
-  ) {
-    decision = "WATCH";
+    return "ALLOW";
   }
 
+  if (
+    (
+      ruptureDetected &&
+      input.correction_probability >=
+        WATCH_CORRECTION_THRESHOLD
+    ) ||
+    input.opportunity_score >=
+      WATCH_OPPORTUNITY_THRESHOLD
+  ) {
+    return "WATCH";
+  }
+
+  return "BLOCK";
+}
+
+/* ============================================================================
+ * 11. RESULT FACTORIES
+ * ========================================================================== */
+
+function buildUnavailableResult(
+  input: Readonly<{
+    pattern_kind:
+      PatternKind;
+
+    pattern_occurrence_count:
+      number;
+
+    comparable_occurrence_count:
+      number;
+
+    pattern_similarity_score:
+      number | null;
+
+    reason:
+      string;
+  }>,
+): MciResult {
   return {
-    pattern_kind: patternKind,
+    status:
+      "unavailable",
 
-    pattern_occurrence_count: patternOccurrenceCount,
-    comparable_occurrence_count: comparableOccurrenceCount,
+    pattern_kind:
+      input.pattern_kind,
 
-    pattern_similarity_score: patternSimilarityScore,
-    convergence_score: convergenceScore,
+    pattern_occurrence_count:
+      input
+        .pattern_occurrence_count,
 
-    correction_probability: correctionProbability,
-    continuation_probability: continuationProbability,
+    comparable_occurrence_count:
+      input
+        .comparable_occurrence_count,
 
-    opportunity_score: opportunityScore,
+    pattern_similarity_score:
+      input
+        .pattern_similarity_score,
+
+    convergence_score:
+      null,
+
+    correction_probability:
+      null,
+
+    continuation_probability:
+      null,
+
+    opportunity_score:
+      null,
+
+    decision:
+      "WATCH",
+
+    reason:
+      input.reason,
+  };
+}
+
+function resolveResultStatus(
+  input: Readonly<{
+    evidence_complete:
+      boolean;
+
+    comparable_occurrence_count:
+      number;
+
+    convergence_score:
+      number | null;
+
+    correction_probability:
+      number | null;
+
+    continuation_probability:
+      number | null;
+
+    opportunity_score:
+      number | null;
+  }>,
+): MciComputationStatus {
+  if (
+    input.convergence_score ===
+      null ||
+    input.correction_probability ===
+      null ||
+    input.continuation_probability ===
+      null ||
+    input.opportunity_score ===
+      null
+  ) {
+    return "unavailable";
+  }
+
+  if (
+    !input.evidence_complete ||
+    input.comparable_occurrence_count ===
+      0
+  ) {
+    return "partial";
+  }
+
+  return "computed";
+}
+
+/* ============================================================================
+ * 12. PUBLIC EXECUTION
+ * ========================================================================== */
+
+export function runMCI(
+  input: MciInput,
+): MciResult {
+  const prices =
+    validatePrices(
+      input.prices,
+    );
+
+  const historicalOccurrences =
+    validateHistoricalOccurrences(
+      input.historical_patterns ??
+        [],
+    );
+
+  const rfsEvidence =
+    readCanonicalRfsEvidence(
+      input.rfs,
+    );
+
+  const comparableOccurrences =
+    selectComparableOccurrences(
+      rfsEvidence.pattern_kind,
+      historicalOccurrences,
+    );
+
+  const patternOccurrenceCount =
+    historicalOccurrences.length;
+
+  const comparableOccurrenceCount =
+    comparableOccurrences.length;
+
+  const historicalSimilarity =
+    computeHistoricalSimilarity(
+      comparableOccurrences,
+    );
+
+  if (prices === null) {
+    return buildUnavailableResult({
+      pattern_kind:
+        rfsEvidence.pattern_kind,
+
+      pattern_occurrence_count:
+        patternOccurrenceCount,
+
+      comparable_occurrence_count:
+        comparableOccurrenceCount,
+
+      pattern_similarity_score:
+        historicalSimilarity,
+
+      reason:
+        "mci_current_prices_unavailable",
+    });
+  }
+
+  if (
+    rfsEvidence.pattern_kind ===
+      "UNAVAILABLE"
+  ) {
+    return buildUnavailableResult({
+      pattern_kind:
+        "UNAVAILABLE",
+
+      pattern_occurrence_count:
+        patternOccurrenceCount,
+
+      comparable_occurrence_count:
+        0,
+
+      pattern_similarity_score:
+        null,
+
+      reason:
+        "mci_rfs_pattern_unavailable",
+    });
+  }
+
+  const currentDistancePct =
+    computeCurrentDistanceFromMean(
+      prices,
+    );
+
+  const convergenceScore =
+    computeMciConvergenceScore({
+      evidence:
+        rfsEvidence,
+
+      current_distance_pct:
+        currentDistancePct,
+    });
+
+  const historicalCorrectionRate =
+    computeCorrectionRate(
+      comparableOccurrences,
+    );
+
+  const historicalContinuationRate =
+    computeContinuationRate(
+      comparableOccurrences,
+    );
+
+  const correctionProbability =
+    computeCorrectionProbability({
+      historical_correction_rate:
+        historicalCorrectionRate,
+
+      convergence_score:
+        convergenceScore,
+
+      rupture_probability:
+        rfsEvidence
+          .rupture_probability,
+
+      historical_similarity:
+        historicalSimilarity,
+    });
+
+  const continuationProbability =
+    computeContinuationProbability({
+      historical_continuation_rate:
+        historicalContinuationRate,
+
+      rfs_continuity_probability:
+        rfsEvidence
+          .continuity_probability,
+
+      current_pattern_score:
+        rfsEvidence
+          .pattern_score,
+    });
+
+  const opportunityScore =
+    computeOpportunityScore({
+      correction_probability:
+        correctionProbability,
+
+      convergence_score:
+        convergenceScore,
+
+      stability_score:
+        rfsEvidence
+          .stability_score,
+    });
+
+  const decision =
+    resolveDecision({
+      evidence:
+        rfsEvidence,
+
+      correction_probability:
+        correctionProbability,
+
+      convergence_score:
+        convergenceScore,
+
+      opportunity_score:
+        opportunityScore,
+    });
+
+  const status =
+    resolveResultStatus({
+      evidence_complete:
+        rfsEvidence.complete,
+
+      comparable_occurrence_count:
+        comparableOccurrenceCount,
+
+      convergence_score:
+        convergenceScore,
+
+      correction_probability:
+        correctionProbability,
+
+      continuation_probability:
+        continuationProbability,
+
+      opportunity_score:
+        opportunityScore,
+    });
+
+  return {
+    status,
+
+    pattern_kind:
+      rfsEvidence.pattern_kind,
+
+    pattern_occurrence_count:
+      patternOccurrenceCount,
+
+    comparable_occurrence_count:
+      comparableOccurrenceCount,
+
+    /*
+     * This legacy identity now represents the similarity of comparable
+     * historical occurrences.
+     *
+     * The canonical current pattern evidence remains:
+     * rfs.pattern.pattern_score.
+     */
+    pattern_similarity_score:
+      historicalSimilarity,
+
+    convergence_score:
+      convergenceScore,
+
+    correction_probability:
+      correctionProbability,
+
+    continuation_probability:
+      continuationProbability,
+
+    opportunity_score:
+      opportunityScore,
+
     decision,
 
     reason:
-      `pattern=${patternKind}` +
-      ` occ=${comparableOccurrenceCount}` +
-      ` conv=${convergenceScore}` +
-      ` corr=${correctionProbability}` +
-      ` cont=${continuationProbability}`,
+      [
+        `status=${status}`,
+        `pattern=${rfsEvidence.pattern_kind}`,
+        `occurrences=${comparableOccurrenceCount}`,
+        `convergence=${convergenceScore ?? "unavailable"}`,
+        `correction=${correctionProbability ?? "unavailable"}`,
+        `continuation=${continuationProbability ?? "unavailable"}`,
+        `opportunity=${opportunityScore ?? "unavailable"}`,
+        `decision=${decision}`,
+      ].join(" "),
   };
 }

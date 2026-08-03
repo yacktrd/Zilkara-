@@ -46,73 +46,139 @@
  * - local calibration side effects
  * ========================================================================== */
 
-import { runMciOrchestrator } from "./lib/xyvala/engine/mci-orchestrator";
+import {
+  runMciOrchestrator,
+} from "./lib/xyvala/engine/mci-orchestrator";
 
-const result = runMciOrchestrator({
-  asset_id: "test-btc",
-  symbol: "BTC",
-  analytical_version: "v8",
-  horizon: "7D",
-  refresh_calibration: true,
+const result =
+  runMciOrchestrator({
+    asset_id:
+      "test-btc",
 
-  rfs: {
-    metrics: {
-      pattern_count: 12,
-      sample_size: 120,
-      direction_changes: 3,
-      rupture_events: 1,
-      stable_run_length: 8,
-      dominant_direction_ratio: 72,
-      liquidity_support: 64,
-      confirmation_alignment: "ALIGNED",
-    },
-    axes: {
-      occurrence: 62,
-      convergence: 58,
-      duration: 61,
-      frequency: 57,
-      correlation: 52,
-    },
-    scores: {
-  occurrence: 62,
-  convergence: 58,
-  duration: 61,
-  frequency: 57,
-  correlation: 52,
-  stability: 80,
-  structure: 76,
-  rupture: 24,
-  crash_score: 0,
-  mid_term: 63,
-},
-states: {
-  regime: "STABLE",
-  rfs_status: "VALID",
-  mid_term_state: "FAVORABLE",
-  crash_state: "NONE",
-},
-    probabilities: {
-      rupture_probability: 24,
-      continuity_probability: 73,
-    },
-        quality: {
-      confidence: 69,
-    },
-    impulse: {
-      impulse_compression_score: 62,
-      impulse_pressure_score: 58,
-      impulse_acceleration_score: 38,
-      impulse_alignment_score: 58,
-      impulse_instability_score: 24,
-      impulse_saturation_score: 32,
-      impulse_exhaustion_score: 28,
-      impulse_directional_bias: "UP",
-      impulse_transition_state: "COMPRESSION",
-      impulse_status: "computed",
-      impulse_context: "NEUTRAL",
-    },
-    warnings: [],
-  },
-});
+    symbol:
+      "BTC",
 
-console.log("RESULT =", JSON.stringify(result, null, 2));
+    analytical_version:
+      "v8",
+
+    horizon:
+      "7D",
+
+    refresh_calibration:
+      true,
+
+    rfs: {
+      metrics: {
+        pattern_count:
+          12,
+
+        sample_size:
+          120,
+
+        direction_changes:
+          3,
+
+        rupture_events:
+          1,
+
+        stable_run_length:
+          8,
+
+        dominant_direction_ratio:
+          72,
+
+        liquidity_support:
+          64,
+
+        confirmation_alignment:
+          "ALIGNED",
+      },
+
+      axes: {
+        occurrence:
+          62,
+
+        convergence:
+          58,
+
+        duration:
+          61,
+
+        frequency:
+          57,
+
+        correlation:
+          52,
+      },
+
+      scores: {
+        occurrence:
+          62,
+
+        convergence:
+          58,
+
+        duration:
+          61,
+
+        frequency:
+          57,
+
+        correlation:
+          52,
+
+        stability:
+          80,
+
+        structure:
+          76,
+
+        rupture:
+          24,
+
+        crash_score:
+          0,
+
+        mid_term:
+          63,
+      },
+
+      states: {
+        regime:
+          "STABLE",
+
+        rfs_status:
+          "VALID",
+
+        mid_term_state:
+          "FAVORABLE",
+
+        crash_state:
+          "NONE",
+      },
+
+      probabilities: {
+        rupture_probability:
+          24,
+
+        continuity_probability:
+          73,
+      },
+
+      quality: {
+        confidence:
+          69,
+      },
+
+      warnings: [],
+    },
+  });
+
+console.log(
+  "RESULT =",
+  JSON.stringify(
+    result,
+    null,
+    2,
+  ),
+);

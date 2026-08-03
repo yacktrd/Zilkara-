@@ -1,0 +1,2420 @@
+/* ============================================================================
+ * FILE: lib/xyvala/RFS-score.ts
+ * ----------------------------------------------------------------------------
+ * TITLE
+ * - Xyvala deterministic RFS structural score engine
+ *
+ * ROLE
+ * - orchestrate the canonical deterministic RFS structural computation
+ * - transform validated price and timestamp observations into RFS readings
+ * - segment observable history into monthly and quarterly windows
+ * - compare the current structural signature with historical signatures
+ * - compute structural axes, stability, rupture, continuity and temporal context
+ * - expose RFS truth only
+ *
+ * CLASSIFICATION
+ * - PRIVATE ANALYTICAL ENGINE
+ * - COMPUTE
+ * - PURE
+ * - NON-MUTATING
+ *
+ * PARENTS
+ * - Acquisition Layer
+ * - Pattern Layer
+ * - RFS contracts
+ *
+ * CONSUMERS
+ * - Triple Layer
+ * - Impulse Layer
+ * - Rupture Evolution System
+ * - Crash System
+ * - Neutralization System
+ * - Analytical Aggregation System
+ *
+ * DIRECTIVES
+ * - RFS logic only
+ * - no Triple Layer computation
+ * - no Impulse Layer computation
+ * - no MCI decision logic
+ * - no calibration logic
+ * - no snapshot construction
+ * - no transformer logic
+ * - no ranking logic
+ * - no API logic
+ * - no UI logic
+ * - no cache logic
+ * - no persistence
+ * - no runtime mutation
+ * - no fallback timestamp reconstruction
+ * - no silent input repair
+ * - no synthetic analytical truth
+ * - pattern metrics must come from pattern-core.ts
+ * - same validated input and version => same output
+ *
+ * INPUTS
+ * - real positive price series
+ * - real strictly increasing timestamp series
+ *
+ * OUTPUTS
+ * - canonical deterministic RFS score result
+ *
+ * INVARIANTS
+ * - RFS is the unique owner of structural truth
+ * - stability describes long-term structural continuity
+ * - mid_term_score describes the current quarterly structure
+ * - regime describes the current structural regime
+ * - 7D contextualizes recent structural dynamics
+ * - 24H contextualizes immediate timing only
+ * - 7D and 24H never replace global structure
+ * - rupture remains multi-axis
+ * - crash qualification remains separate from impulse computation
+ * - unavailable data is never reconstructed
+ * - RFS never produces a business decision
+ * - RFS never produces Impulse Layer truth
+ *
+ * CRITICAL DEPENDENCIES
+ * - lib/xyvala/rfs/contracts/rfs-score-contract.ts
+ * - lib/xyvala/rfs/contracts/rfs-temporal-contract.ts
+ * - lib/xyvala/rfs/contracts/rfs-structural-contract.ts
+ * - lib/xyvala/rfs/rfs-types.ts
+ * - lib/xyvala/pattern-core.ts
+ *
+ * BOUNDARIES
+ * - Acquisition -> RFS
+ * - RFS -> Triple Layer
+ *
+ * FIRST DIVERGENCE
+ * - invalid source observations
+ *   => Acquisition -> RFS boundary
+ *
+ * - valid observations but invalid structural output
+ *   => RFS engine
+ *
+ * - valid RFS output altered downstream
+ *   => first downstream propagation boundary
+ *
+ * SENSITIVE ZONES
+ * - input validation
+ * - timestamp monotonicity
+ * - monthly segmentation
+ * - historical reference selection
+ * - structural-axis weighting
+ * - rupture-axis weighting
+ * - temporal context computation
+ * - unavailable historical baseline handling
+ * ========================================================================== */
+
+import type { RfsRegimeState } from "@/lib/xyvala/rfs/rfs-types";
+
+import type {
+  RfsScoreInput,
+  RfsScoreResult,
+} from "@/lib/xyvala/rfs/contracts/rfs-score-contract";
+
+import {
+  classifyPattern,
+  computePatternAmplitudePct,
+  computePatternBreakRate,
+  computePatternInstabilityScore,
+  computePatternKindSimilarity,
+  computePatternQuality,
+  computePatternSlopePct,
+  type PatternKind,
+} from "@/lib/xyvala/pattern-core";
+
+export type {
+  RfsScoreInput,
+  RfsScoreResult,
+} from "@/lib/xyvala/rfs/contracts/rfs-score-contract";
+
+/* ============================================================================
+ * 1. INTERNAL CONTRACTS
+ * ========================================================================== */
+
+type RfsHistoricalMode =
+  | "INSUFFICIENT_HISTORY"
+  | "MONTH_TO_MONTH"
+  | "YEAR_PHASE_COMPARISON";
+
+type RfsTimingState =
+  | "GOOD"
+  | "NEUTRAL"
+  | "BAD"
+  | "UNAVAILABLE";
+
+type RfsCrashState =
+  | "NONE"
+  | "RISING"
+  | "CRASH";
+
+type RfsCrashStatus =
+  | "computed"
+  | "baseline_missing"
+  | "insufficient_data"
+  | "unavailable";
+
+type RfsTemporalStatus =
+  | "computed"
+  | "partial"
+  | "insufficient_data"
+  | "unavailable";
+
+type ValidatedRfsInput = Readonly<{
+  prices: number[];
+  timestamps: number[];
+}>;
+
+type SegmentWindow = Readonly<{
+  start_index: number;
+  end_index: number;
+
+  prices: number[];
+  timestamps: number[];
+
+  quarter_index: 0 | 1 | 2 | 3;
+  year: number;
+  month: number;
+}>;
+
+type SegmentSignature = Readonly<{
+  kind: PatternKind;
+
+  slope_pct: number;
+  amplitude_pct: number;
+  instability_score: number;
+  break_rate: number;
+  quality_score: number;
+  duration_score: number;
+
+  sample_size: number;
+}>;
+
+type StructuralComparison = Readonly<{
+  similarity_score: number;
+  rupture_gap_score: number;
+  continuity_score: number;
+  duration_similarity_score: number;
+  reference_kind: PatternKind;
+}>;
+
+type QuarterBundle = Readonly<{
+  quarter_index: 0 | 1 | 2 | 3;
+  year: number;
+  windows: SegmentWindow[];
+}>;
+
+type StructuralAxisScores = Readonly<{
+  occurrence_score: number;
+  frequency_score: number;
+  convergence_score: number;
+  correlation_score: number;
+  duration_score: number;
+}>;
+
+type RuptureAxisScores = Readonly<{
+  rupture_occurrence_score: number;
+  rupture_frequency_score: number;
+  rupture_convergence_score: number;
+  rupture_correlation_score: number;
+  rupture_duration_score: number;
+}>;
+
+type TemporalWindow = Readonly<{
+  prices: number[];
+  timestamps: number[];
+  status: RfsTemporalStatus;
+}>;
+
+type TemporalBlock = Readonly<{
+  price_score: number | null;
+  change_pct: number | null;
+  slope_pct: number | null;
+
+  stability_score: number | null;
+  rupture_score: number | null;
+  rupture_probability: number | null;
+
+  status: RfsTemporalStatus;
+}>;
+
+type CrashResult = Readonly<{
+  score: number | null;
+  status: RfsCrashStatus;
+  state: RfsCrashState;
+}>;
+
+/* ============================================================================
+ * 2. GOVERNED CONSTANTS
+ * ========================================================================== */
+
+const MINIMUM_PRICE_COUNT = 8;
+const MINIMUM_SEGMENT_POINT_COUNT = 4;
+const MINIMUM_TEMPORAL_POINT_COUNT = 2;
+
+const MILLISECONDS_PER_HOUR = 3_600_000;
+const MILLISECONDS_PER_DAY = 86_400_000;
+
+const APPROXIMATE_DAYS_PER_MONTH = 30;
+const MONTHS_REQUIRED_FOR_YEAR_PHASE_COMPARISON = 12;
+
+const MAXIMUM_OCCURRENCE_REFERENCE_COUNT = 24;
+const MAXIMUM_DURATION_NORMALIZATION_DAYS = 120;
+
+const NEUTRAL_SCORE = 50;
+
+const STRONG_SIMILARITY_THRESHOLD = 70;
+const RUPTURE_COMPARISON_THRESHOLD = 50;
+
+const CRASH_RISING_THRESHOLD = 45;
+const CRASH_CONFIRMED_THRESHOLD = 75;
+
+/* ============================================================================
+ * 3. SAFE NUMERIC PRIMITIVES
+ * ========================================================================== */
+
+function isFiniteNumber(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isFinite(value)
+  );
+}
+
+function clamp(
+  value: number,
+  minimum = 0,
+  maximum = 100,
+): number {
+  if (!isFiniteNumber(value)) {
+    return minimum;
+  }
+
+  return Math.min(
+    maximum,
+    Math.max(minimum, value),
+  );
+}
+
+function roundToTwoDecimals(value: number): number {
+  if (!isFiniteNumber(value)) {
+    return 0;
+  }
+
+  return Math.round(value * 100) / 100;
+}
+
+function normalizeScore(value: number): number {
+  return roundToTwoDecimals(
+    clamp(value),
+  );
+}
+
+function mean(values: readonly number[]): number {
+  if (values.length === 0) {
+    return 0;
+  }
+
+  return (
+    values.reduce(
+      (total, value) =>
+        total + value,
+      0,
+    ) / values.length
+  );
+}
+
+function standardDeviation(
+  values: readonly number[],
+): number {
+  if (values.length < 2) {
+    return 0;
+  }
+
+  const average =
+    mean(values);
+
+  const variance =
+    mean(
+      values.map(
+        (value) =>
+          (value - average) ** 2,
+      ),
+    );
+
+  return Math.sqrt(variance);
+}
+
+function safeDivide(
+  numerator: number,
+  denominator: number,
+): number {
+  if (
+    !isFiniteNumber(numerator) ||
+    !isFiniteNumber(denominator) ||
+    denominator === 0
+  ) {
+    return 0;
+  }
+
+  return numerator / denominator;
+}
+
+function computePercentageChange(
+  initialValue: number,
+  finalValue: number,
+): number {
+  if (
+    !isFiniteNumber(initialValue) ||
+    !isFiniteNumber(finalValue) ||
+    initialValue === 0
+  ) {
+    return 0;
+  }
+
+  return (
+    (finalValue - initialValue) /
+    Math.abs(initialValue)
+  ) * 100;
+}
+
+function firstFiniteNumber(
+  values: readonly number[],
+): number | null {
+  const value =
+    values[0];
+
+  return isFiniteNumber(value)
+    ? value
+    : null;
+}
+
+function lastFiniteNumber(
+  values: readonly number[],
+): number | null {
+  const value =
+    values.at(-1);
+
+  return isFiniteNumber(value)
+    ? value
+    : null;
+}
+
+function computeScoreSimilarity(
+  leftScore: number,
+  rightScore: number,
+): number {
+  return normalizeScore(
+    100 -
+      Math.abs(
+        leftScore -
+          rightScore,
+      ),
+  );
+}
+
+/* ============================================================================
+ * 4. INPUT BOUNDARY VALIDATION
+ * ----------------------------------------------------------------------------
+ * No price or timestamp is removed, sorted, shifted or reconstructed.
+ *
+ * Invalid source observations are rejected at the Acquisition -> RFS boundary.
+ * ========================================================================== */
+
+function validateRfsInput(
+  input: RfsScoreInput,
+): ValidatedRfsInput {
+  if (
+    input === null ||
+    typeof input !== "object"
+  ) {
+    throw new TypeError(
+      "RFS_INPUT_INVALID: input must be an object",
+    );
+  }
+
+  if (!Array.isArray(input.prices)) {
+    throw new TypeError(
+      "RFS_PRICES_INVALID: prices must be an array",
+    );
+  }
+
+  if (
+    input.prices.length <
+    MINIMUM_PRICE_COUNT
+  ) {
+    throw new RangeError(
+      `RFS_PRICES_INSUFFICIENT: at least ${MINIMUM_PRICE_COUNT} prices are required`,
+    );
+  }
+
+  if (!Array.isArray(input.timestamps)) {
+    throw new TypeError(
+      "RFS_TIMESTAMPS_REQUIRED: real timestamps are required",
+    );
+  }
+
+  if (
+    input.timestamps.length !==
+    input.prices.length
+  ) {
+    throw new RangeError(
+      "RFS_SERIES_LENGTH_MISMATCH: prices and timestamps must have identical lengths",
+    );
+  }
+
+  const prices =
+    input.prices.map(
+      (price, index) => {
+        if (
+          !isFiniteNumber(price) ||
+          price <= 0
+        ) {
+          throw new RangeError(
+            `RFS_PRICE_INVALID: prices[${index}] must be a finite positive number`,
+          );
+        }
+
+        return price;
+      },
+    );
+
+  const timestamps =
+    input.timestamps.map(
+      (timestamp, index) => {
+        if (!isFiniteNumber(timestamp)) {
+          throw new RangeError(
+            `RFS_TIMESTAMP_INVALID: timestamps[${index}] must be finite`,
+          );
+        }
+
+        return timestamp;
+      },
+    );
+
+  for (
+    let index = 1;
+    index < timestamps.length;
+    index += 1
+  ) {
+    const previousTimestamp =
+      timestamps[index - 1];
+
+    const currentTimestamp =
+      timestamps[index];
+
+    if (
+      previousTimestamp === undefined ||
+      currentTimestamp === undefined ||
+      currentTimestamp <= previousTimestamp
+    ) {
+      throw new RangeError(
+        `RFS_TIMESTAMP_ORDER_INVALID: timestamps must be strictly increasing at index ${index}`,
+      );
+    }
+  }
+
+  return {
+    prices,
+    timestamps,
+  };
+}
+
+/* ============================================================================
+ * 5. TIME HELPERS
+ * ========================================================================== */
+
+function computeTimestampSpanDays(
+  timestamps: readonly number[],
+): number {
+  const firstTimestamp =
+    firstFiniteNumber(timestamps);
+
+  const lastTimestamp =
+    lastFiniteNumber(timestamps);
+
+  if (
+    firstTimestamp === null ||
+    lastTimestamp === null
+  ) {
+    return 0;
+  }
+
+  return Math.max(
+    0,
+    (
+      lastTimestamp -
+      firstTimestamp
+    ) /
+      MILLISECONDS_PER_DAY,
+  );
+}
+
+function computeTimestampSpanMonths(
+  timestamps: readonly number[],
+): number {
+  return (
+    computeTimestampSpanDays(
+      timestamps,
+    ) /
+    APPROXIMATE_DAYS_PER_MONTH
+  );
+}
+
+function resolveHistoricalMode(
+  timestamps: readonly number[],
+): RfsHistoricalMode {
+  const monthSpan =
+    computeTimestampSpanMonths(
+      timestamps,
+    );
+
+  if (monthSpan < 2) {
+    return "INSUFFICIENT_HISTORY";
+  }
+
+  if (
+    monthSpan <
+    MONTHS_REQUIRED_FOR_YEAR_PHASE_COMPARISON
+  ) {
+    return "MONTH_TO_MONTH";
+  }
+
+  return "YEAR_PHASE_COMPARISON";
+}
+
+function resolveQuarterIndex(
+  timestamp: number,
+): 0 | 1 | 2 | 3 {
+  const month =
+    new Date(timestamp)
+      .getUTCMonth();
+
+  const quarter =
+    Math.floor(month / 3);
+
+  if (quarter === 1) {
+    return 1;
+  }
+
+  if (quarter === 2) {
+    return 2;
+  }
+
+  if (quarter === 3) {
+    return 3;
+  }
+
+  return 0;
+}
+
+function computeNormalizedDurationScore(
+  timestamps: readonly number[],
+): number {
+  const spanDays =
+    computeTimestampSpanDays(
+      timestamps,
+    );
+
+  if (spanDays <= 0) {
+    return 0;
+  }
+
+  return normalizeScore(
+    (
+      Math.min(
+        spanDays,
+        MAXIMUM_DURATION_NORMALIZATION_DAYS,
+      ) /
+      MAXIMUM_DURATION_NORMALIZATION_DAYS
+    ) *
+      100,
+  );
+}
+
+/* ============================================================================
+ * 6. MONTHLY AND QUARTERLY SEGMENTATION
+ * ========================================================================== */
+
+function buildMonthlyWindows(
+  prices: readonly number[],
+  timestamps: readonly number[],
+): SegmentWindow[] {
+  const windows: SegmentWindow[] = [];
+
+  let startIndex = 0;
+
+  for (
+    let index = 1;
+    index <= timestamps.length;
+    index += 1
+  ) {
+    const previousTimestamp =
+      timestamps[index - 1];
+
+    if (previousTimestamp === undefined) {
+      continue;
+    }
+
+    const previousDate =
+      new Date(previousTimestamp);
+
+    const currentTimestamp =
+      index < timestamps.length
+        ? timestamps[index]
+        : null;
+
+    const currentDate =
+      currentTimestamp !== null &&
+      currentTimestamp !== undefined
+        ? new Date(currentTimestamp)
+        : null;
+
+    const monthChanged =
+      currentDate === null ||
+      currentDate.getUTCFullYear() !==
+        previousDate.getUTCFullYear() ||
+      currentDate.getUTCMonth() !==
+        previousDate.getUTCMonth();
+
+    if (!monthChanged) {
+      continue;
+    }
+
+    const endIndex =
+      index - 1;
+
+    const windowPrices =
+      prices.slice(
+        startIndex,
+        endIndex + 1,
+      );
+
+    const windowTimestamps =
+      timestamps.slice(
+        startIndex,
+        endIndex + 1,
+      );
+
+    if (
+      windowPrices.length >=
+      MINIMUM_SEGMENT_POINT_COUNT
+    ) {
+      windows.push({
+        start_index:
+          startIndex,
+
+        end_index:
+          endIndex,
+
+        prices:
+          [...windowPrices],
+
+        timestamps:
+          [...windowTimestamps],
+
+        quarter_index:
+          resolveQuarterIndex(
+            previousTimestamp,
+          ),
+
+        year:
+          previousDate
+            .getUTCFullYear(),
+
+        month:
+          previousDate
+            .getUTCMonth(),
+      });
+    }
+
+    startIndex =
+      index;
+  }
+
+  return windows;
+}
+
+function buildQuarterBundles(
+  windows: readonly SegmentWindow[],
+): QuarterBundle[] {
+  const bundles =
+    new Map<string, {
+      quarter_index: 0 | 1 | 2 | 3;
+      year: number;
+      windows: SegmentWindow[];
+    }>();
+
+  for (const window of windows) {
+    const key =
+      `${window.year}:${window.quarter_index}`;
+
+    const existingBundle =
+      bundles.get(key);
+
+    if (existingBundle) {
+      existingBundle.windows.push(
+        window,
+      );
+
+      continue;
+    }
+
+    bundles.set(key, {
+      quarter_index:
+        window.quarter_index,
+
+      year:
+        window.year,
+
+      windows:
+        [window],
+    });
+  }
+
+  return Array.from(
+    bundles.values(),
+  ).sort(
+    (left, right) => {
+      if (left.year !== right.year) {
+        return left.year - right.year;
+      }
+
+      return (
+        left.quarter_index -
+        right.quarter_index
+      );
+    },
+  );
+}
+
+function flattenQuarterBundle(
+  bundle: QuarterBundle,
+): SegmentWindow | null {
+  const firstWindow =
+    bundle.windows[0];
+
+  const lastWindow =
+    bundle.windows.at(-1);
+
+  if (
+    firstWindow === undefined ||
+    lastWindow === undefined
+  ) {
+    return null;
+  }
+
+  return {
+    start_index:
+      firstWindow.start_index,
+
+    end_index:
+      lastWindow.end_index,
+
+    prices:
+      bundle.windows.flatMap(
+        (window) =>
+          window.prices,
+      ),
+
+    timestamps:
+      bundle.windows.flatMap(
+        (window) =>
+          window.timestamps,
+      ),
+
+    quarter_index:
+      bundle.quarter_index,
+
+    year:
+      bundle.year,
+
+    month:
+      lastWindow.month,
+  };
+}
+
+function buildFullWindow(
+  prices: readonly number[],
+  timestamps: readonly number[],
+): SegmentWindow {
+  const firstTimestamp =
+    timestamps[0];
+
+  if (firstTimestamp === undefined) {
+    throw new Error(
+      "RFS_FULL_WINDOW_UNAVAILABLE: missing first timestamp",
+    );
+  }
+
+  const firstDate =
+    new Date(firstTimestamp);
+
+  return {
+    start_index:
+      0,
+
+    end_index:
+      Math.max(
+        0,
+        prices.length - 1,
+      ),
+
+    prices:
+      [...prices],
+
+    timestamps:
+      [...timestamps],
+
+    quarter_index:
+      resolveQuarterIndex(
+        firstTimestamp,
+      ),
+
+    year:
+      firstDate.getUTCFullYear(),
+
+    month:
+      firstDate.getUTCMonth(),
+  };
+}
+
+/* ============================================================================
+ * 7. STRUCTURAL SIGNATURE
+ * ========================================================================== */
+
+function computeSegmentSignature(
+  window: SegmentWindow,
+): SegmentSignature {
+  return {
+    kind:
+      classifyPattern(
+        window.prices,
+      ),
+
+    slope_pct:
+      roundToTwoDecimals(
+        computePatternSlopePct(
+          window.prices,
+        ),
+      ),
+
+    amplitude_pct:
+      roundToTwoDecimals(
+        computePatternAmplitudePct(
+          window.prices,
+        ),
+      ),
+
+    instability_score:
+      normalizeScore(
+        computePatternInstabilityScore(
+          window.prices,
+        ),
+      ),
+
+    break_rate:
+      roundToTwoDecimals(
+        computePatternBreakRate(
+          window.prices,
+        ),
+      ),
+
+    quality_score:
+      normalizeScore(
+        computePatternQuality(
+          window.prices,
+        ),
+      ),
+
+    duration_score:
+      computeNormalizedDurationScore(
+        window.timestamps,
+      ),
+
+    sample_size:
+      window.prices.length,
+  };
+}
+
+/* ============================================================================
+ * 8. STRUCTURAL COMPARISON
+ * ========================================================================== */
+
+function computeMetricSimilarity(
+  currentValue: number,
+  referenceValue: number,
+  tolerance: number,
+): number {
+  const absoluteDifference =
+    Math.abs(
+      currentValue -
+        referenceValue,
+    );
+
+  return normalizeScore(
+    100 -
+      safeDivide(
+        absoluteDifference,
+        tolerance,
+      ) *
+        100,
+  );
+}
+
+function computePatternSimilarity(
+  current: SegmentSignature,
+  reference: SegmentSignature,
+): number {
+  const kindSimilarity =
+    computePatternKindSimilarity(
+      current.kind,
+      reference.kind,
+    );
+
+  const slopeSimilarity =
+    computeMetricSimilarity(
+      current.slope_pct,
+      reference.slope_pct,
+      20,
+    );
+
+  const amplitudeSimilarity =
+    computeMetricSimilarity(
+      current.amplitude_pct,
+      reference.amplitude_pct,
+      30,
+    );
+
+  const instabilitySimilarity =
+    computeMetricSimilarity(
+      current.instability_score,
+      reference.instability_score,
+      50,
+    );
+
+  const breakRateSimilarity =
+    computeMetricSimilarity(
+      current.break_rate,
+      reference.break_rate,
+      0.6,
+    );
+
+  const durationSimilarity =
+    computeMetricSimilarity(
+      current.duration_score,
+      reference.duration_score,
+      40,
+    );
+
+  return normalizeScore(
+    kindSimilarity * 0.14 +
+      slopeSimilarity * 0.22 +
+      amplitudeSimilarity * 0.16 +
+      instabilitySimilarity * 0.22 +
+      breakRateSimilarity * 0.14 +
+      durationSimilarity * 0.12,
+  );
+}
+
+function computeRuptureGap(
+  current: SegmentSignature,
+  reference: SegmentSignature,
+  similarityScore: number,
+): number {
+  const currentFragility =
+    current.instability_score *
+      0.38 +
+    current.break_rate *
+      100 *
+      0.38 +
+    (
+      100 -
+      current.duration_score
+    ) *
+      0.24;
+
+  const referenceFragility =
+    reference.instability_score *
+      0.38 +
+    reference.break_rate *
+      100 *
+      0.38 +
+    (
+      100 -
+      reference.duration_score
+    ) *
+      0.24;
+
+  const positiveFragilityDifference =
+    Math.max(
+      0,
+      currentFragility -
+        referenceFragility,
+    );
+
+  return normalizeScore(
+    positiveFragilityDifference *
+      0.62 +
+      (
+        100 -
+        similarityScore
+      ) *
+        0.38,
+  );
+}
+
+function computeContinuityScore(
+  current: SegmentSignature,
+  reference: SegmentSignature,
+  similarityScore: number,
+): number {
+  const currentDirection =
+    current.slope_pct > 0
+      ? 1
+      : current.slope_pct < 0
+        ? -1
+        : 0;
+
+  const referenceDirection =
+    reference.slope_pct > 0
+      ? 1
+      : reference.slope_pct < 0
+        ? -1
+        : 0;
+
+  const directionAlignmentScore =
+    currentDirection !== 0 &&
+    referenceDirection !== 0 &&
+    currentDirection ===
+      referenceDirection
+      ? 100
+      : 35;
+
+  const breakRatePenalty =
+    clamp(
+      Math.abs(
+        current.break_rate -
+          reference.break_rate,
+      ) *
+        100,
+    );
+
+  const durationSimilarity =
+    computeMetricSimilarity(
+      current.duration_score,
+      reference.duration_score,
+      40,
+    );
+
+  return normalizeScore(
+    similarityScore * 0.54 +
+      directionAlignmentScore * 0.2 +
+      durationSimilarity * 0.16 +
+      (
+        100 -
+        breakRatePenalty
+      ) *
+        0.1,
+  );
+}
+
+function compareCurrentSignatureToHistory(
+  currentSignature: SegmentSignature,
+  referenceSignatures: readonly SegmentSignature[],
+): StructuralComparison[] {
+  return referenceSignatures.map(
+    (referenceSignature) => {
+      const similarityScore =
+        computePatternSimilarity(
+          currentSignature,
+          referenceSignature,
+        );
+
+      return {
+        similarity_score:
+          similarityScore,
+
+        rupture_gap_score:
+          computeRuptureGap(
+            currentSignature,
+            referenceSignature,
+            similarityScore,
+          ),
+
+        continuity_score:
+          computeContinuityScore(
+            currentSignature,
+            referenceSignature,
+            similarityScore,
+          ),
+
+        duration_similarity_score:
+          computeMetricSimilarity(
+            currentSignature.duration_score,
+            referenceSignature.duration_score,
+            40,
+          ),
+
+        reference_kind:
+          referenceSignature.kind,
+      };
+    },
+  );
+}
+
+/* ============================================================================
+ * 9. STRUCTURAL AXES
+ * ========================================================================== */
+
+function computeStructuralAxes(
+  comparisons: readonly StructuralComparison[],
+): StructuralAxisScores {
+  if (comparisons.length === 0) {
+    return {
+      occurrence_score: 0,
+      frequency_score: 0,
+      convergence_score: 0,
+      correlation_score: 0,
+      duration_score: 0,
+    };
+  }
+
+  const strongOccurrenceCount =
+    comparisons.filter(
+      (comparison) =>
+        comparison.similarity_score >=
+        STRONG_SIMILARITY_THRESHOLD,
+    ).length;
+
+  return {
+    occurrence_score:
+      normalizeScore(
+        (
+          Math.min(
+            comparisons.length,
+            MAXIMUM_OCCURRENCE_REFERENCE_COUNT,
+          ) /
+          MAXIMUM_OCCURRENCE_REFERENCE_COUNT
+        ) *
+          100,
+      ),
+
+    frequency_score:
+      normalizeScore(
+        safeDivide(
+          strongOccurrenceCount,
+          comparisons.length,
+        ) *
+          100,
+      ),
+
+    convergence_score:
+      normalizeScore(
+        mean(
+          comparisons.map(
+            (comparison) =>
+              comparison.continuity_score,
+          ),
+        ),
+      ),
+
+    correlation_score:
+      comparisons.length < 2
+        ? NEUTRAL_SCORE
+        : normalizeScore(
+            100 -
+              clamp(
+                standardDeviation(
+                  comparisons.map(
+                    (comparison) =>
+                      comparison.similarity_score,
+                  ),
+                ),
+              ),
+          ),
+
+    duration_score:
+      normalizeScore(
+        mean(
+          comparisons.map(
+            (comparison) =>
+              comparison
+                .duration_similarity_score,
+          ),
+        ),
+      ),
+  };
+}
+
+function computeStructuralScore(
+  axes: StructuralAxisScores,
+): number {
+  return normalizeScore(
+    axes.occurrence_score * 0.22 +
+      axes.frequency_score * 0.18 +
+      axes.convergence_score * 0.26 +
+      axes.correlation_score * 0.16 +
+      axes.duration_score * 0.18,
+  );
+}
+
+/* ============================================================================
+ * 10. RUPTURE AXES
+ * ========================================================================== */
+
+function computeRuptureAxes(
+  comparisons: readonly StructuralComparison[],
+  currentSignature: SegmentSignature,
+): RuptureAxisScores {
+  if (comparisons.length === 0) {
+    return {
+      rupture_occurrence_score:
+        NEUTRAL_SCORE,
+
+      rupture_frequency_score:
+        NEUTRAL_SCORE,
+
+      rupture_convergence_score:
+        NEUTRAL_SCORE,
+
+      rupture_correlation_score:
+        NEUTRAL_SCORE,
+
+      rupture_duration_score:
+        NEUTRAL_SCORE,
+    };
+  }
+
+  const ruptureLikeComparisons =
+    comparisons.filter(
+      (comparison) =>
+        comparison.rupture_gap_score >=
+        RUPTURE_COMPARISON_THRESHOLD,
+    );
+
+  return {
+    rupture_occurrence_score:
+      normalizeScore(
+        (
+          Math.min(
+            ruptureLikeComparisons.length,
+            MAXIMUM_OCCURRENCE_REFERENCE_COUNT,
+          ) /
+          MAXIMUM_OCCURRENCE_REFERENCE_COUNT
+        ) *
+          100,
+      ),
+
+    rupture_frequency_score:
+      normalizeScore(
+        safeDivide(
+          ruptureLikeComparisons.length,
+          comparisons.length,
+        ) *
+          100,
+      ),
+
+    rupture_convergence_score:
+      normalizeScore(
+        mean(
+          comparisons.map(
+            (comparison) =>
+              comparison
+                .rupture_gap_score,
+          ),
+        ),
+      ),
+
+    rupture_correlation_score:
+      normalizeScore(
+        100 -
+          clamp(
+            standardDeviation(
+              comparisons.map(
+                (comparison) =>
+                  comparison
+                    .rupture_gap_score,
+              ),
+            ),
+          ),
+      ),
+
+    rupture_duration_score:
+      normalizeScore(
+        (
+          100 -
+          currentSignature
+            .duration_score
+        ) *
+          0.55 +
+          currentSignature
+            .break_rate *
+            100 *
+            0.45,
+      ),
+  };
+}
+
+function computeRuptureProbability(
+  axes: RuptureAxisScores,
+): number {
+  return normalizeScore(
+    axes.rupture_occurrence_score *
+      0.18 +
+      axes.rupture_frequency_score *
+        0.22 +
+      axes.rupture_convergence_score *
+        0.26 +
+      axes.rupture_correlation_score *
+        0.14 +
+      axes.rupture_duration_score *
+        0.2,
+  );
+}
+
+function computeRupturePenaltyScore(
+  ruptureProbability: number,
+  ruptureFrequencyScore: number,
+): number {
+  return normalizeScore(
+    ruptureProbability * 0.7 +
+      ruptureFrequencyScore * 0.3,
+  );
+}
+
+function computeContinuityProbability(input: {
+  structural_axes: StructuralAxisScores;
+  rupture_penalty_score: number;
+}): number {
+  return normalizeScore(
+    input.structural_axes
+      .occurrence_score *
+      0.18 +
+      input.structural_axes
+        .frequency_score *
+        0.16 +
+      input.structural_axes
+        .convergence_score *
+        0.24 +
+      input.structural_axes
+        .correlation_score *
+        0.16 +
+      input.structural_axes
+        .duration_score *
+        0.16 +
+      (
+        100 -
+        input.rupture_penalty_score
+      ) *
+        0.1,
+  );
+}
+
+/* ============================================================================
+ * 11. TEMPORAL WINDOWS
+ * ========================================================================== */
+
+function sliceTemporalWindow(input: {
+  prices: readonly number[];
+  timestamps: readonly number[];
+  duration_ms: number;
+  anchor: "INITIAL" | "ROLLING";
+}): TemporalWindow {
+  if (
+    input.prices.length !==
+      input.timestamps.length ||
+    input.prices.length <
+      MINIMUM_TEMPORAL_POINT_COUNT
+  ) {
+    return {
+      prices: [],
+      timestamps: [],
+      status: "unavailable",
+    };
+  }
+
+  const anchorTimestamp =
+    input.anchor === "INITIAL"
+      ? firstFiniteNumber(
+          input.timestamps,
+        )
+      : lastFiniteNumber(
+          input.timestamps,
+        );
+
+  if (anchorTimestamp === null) {
+    return {
+      prices: [],
+      timestamps: [],
+      status: "unavailable",
+    };
+  }
+
+  const minimumTimestamp =
+    input.anchor === "INITIAL"
+      ? anchorTimestamp
+      : anchorTimestamp -
+        input.duration_ms;
+
+  const maximumTimestamp =
+    input.anchor === "INITIAL"
+      ? anchorTimestamp +
+        input.duration_ms
+      : anchorTimestamp;
+
+  const prices: number[] = [];
+  const timestamps: number[] = [];
+
+  for (
+    let index = 0;
+    index < input.prices.length;
+    index += 1
+  ) {
+    const price =
+      input.prices[index];
+
+    const timestamp =
+      input.timestamps[index];
+
+    if (
+      price === undefined ||
+      timestamp === undefined
+    ) {
+      continue;
+    }
+
+    if (
+      timestamp >= minimumTimestamp &&
+      timestamp <= maximumTimestamp
+    ) {
+      prices.push(price);
+      timestamps.push(timestamp);
+    }
+  }
+
+  if (
+    prices.length <
+    MINIMUM_TEMPORAL_POINT_COUNT
+  ) {
+    return {
+      prices,
+      timestamps,
+      status: "insufficient_data",
+    };
+  }
+
+  return {
+    prices,
+    timestamps,
+
+    status:
+      prices.length >=
+      MINIMUM_SEGMENT_POINT_COUNT
+        ? "computed"
+        : "partial",
+  };
+}
+
+function buildUnavailableTemporalBlock(
+  status: RfsTemporalStatus,
+): TemporalBlock {
+  return {
+    price_score: null,
+    change_pct: null,
+    slope_pct: null,
+
+    stability_score: null,
+    rupture_score: null,
+    rupture_probability: null,
+
+    status,
+  };
+}
+
+function computeTemporalBlock(
+  window: TemporalWindow,
+): TemporalBlock {
+  if (
+    window.status === "unavailable" ||
+    window.status ===
+      "insufficient_data" ||
+    window.prices.length <
+      MINIMUM_TEMPORAL_POINT_COUNT
+  ) {
+    return buildUnavailableTemporalBlock(
+      window.status,
+    );
+  }
+
+  const firstPrice =
+    firstFiniteNumber(
+      window.prices,
+    );
+
+  const lastPrice =
+    lastFiniteNumber(
+      window.prices,
+    );
+
+  if (
+    firstPrice === null ||
+    lastPrice === null
+  ) {
+    return buildUnavailableTemporalBlock(
+      "unavailable",
+    );
+  }
+
+  const temporalSignature =
+    computeSegmentSignature({
+      start_index: 0,
+
+      end_index:
+        Math.max(
+          0,
+          window.prices.length - 1,
+        ),
+
+      prices:
+        window.prices,
+
+      timestamps:
+        window.timestamps,
+
+      quarter_index:
+        0,
+
+      year:
+        0,
+
+      month:
+        0,
+    });
+
+  const changePct =
+    computePercentageChange(
+      firstPrice,
+      lastPrice,
+    );
+
+  const stabilityScore =
+    normalizeScore(
+      temporalSignature
+        .quality_score *
+        0.42 +
+        temporalSignature
+          .duration_score *
+          0.22 +
+        (
+          100 -
+          temporalSignature
+            .instability_score
+        ) *
+          0.2 +
+        (
+          100 -
+          temporalSignature
+            .break_rate *
+            100
+        ) *
+          0.16,
+    );
+
+  const ruptureProbability =
+    normalizeScore(
+      temporalSignature
+        .instability_score *
+        0.36 +
+        temporalSignature
+          .break_rate *
+          100 *
+          0.36 +
+        (
+          100 -
+          temporalSignature
+            .duration_score
+        ) *
+          0.28,
+    );
+
+  return {
+    price_score:
+      normalizeScore(
+        50 +
+          clamp(
+            changePct,
+            -50,
+            50,
+          ),
+      ),
+
+    change_pct:
+      roundToTwoDecimals(
+        changePct,
+      ),
+
+    slope_pct:
+      temporalSignature
+        .slope_pct,
+
+    stability_score:
+      stabilityScore,
+
+    rupture_score:
+      ruptureProbability,
+
+    rupture_probability:
+      ruptureProbability,
+
+    status:
+      window.status,
+  };
+}
+
+/* ============================================================================
+ * 12. CRASH QUALIFICATION
+ * ----------------------------------------------------------------------------
+ * This remains an RFS structural excess measurement.
+ *
+ * It does not calculate an Impulse Layer state.
+ * ========================================================================== */
+
+function computeCrashResult(input: {
+  rupture_score: number;
+  historical_rupture_scores: readonly number[];
+}): CrashResult {
+  if (
+    input.historical_rupture_scores
+      .length === 0
+  ) {
+    return {
+      score: null,
+      status: "baseline_missing",
+      state: "NONE",
+    };
+  }
+
+  const baseline =
+    mean(
+      input.historical_rupture_scores,
+    );
+
+  const baselineDeviation =
+    standardDeviation(
+      input.historical_rupture_scores,
+    );
+
+  const positiveExcess =
+    Math.max(
+      0,
+      input.rupture_score -
+        baseline,
+    );
+
+  const normalizedExcess =
+    normalizeScore(
+      safeDivide(
+        positiveExcess,
+        Math.max(
+          baselineDeviation,
+          1,
+        ),
+      ) *
+        20,
+    );
+
+  return {
+    score:
+      normalizedExcess,
+
+    status:
+      "computed",
+
+    state:
+      normalizedExcess >=
+      CRASH_CONFIRMED_THRESHOLD
+        ? "CRASH"
+        : normalizedExcess >=
+            CRASH_RISING_THRESHOLD
+          ? "RISING"
+          : "NONE",
+  };
+}
+
+/* ============================================================================
+ * 13. REGIME, TIMING AND COHERENCE
+ * ========================================================================== */
+
+function resolveRegime(input: {
+  stability_score: number;
+  rupture_probability: number;
+  crash_score: number | null;
+  current_month_score: number;
+  current_quarter_score: number;
+  rolling_7d: TemporalBlock;
+}): RfsRegimeState {
+  if (
+    (
+      input.crash_score !== null &&
+      input.crash_score >=
+        CRASH_CONFIRMED_THRESHOLD
+    ) ||
+    input.rupture_probability >=
+      78 ||
+    (
+      input.rolling_7d
+        .rupture_probability !==
+        null &&
+      input.rolling_7d
+        .rupture_probability >=
+        80
+    )
+  ) {
+    return "VOLATILE";
+  }
+
+  if (
+    input.stability_score >= 70 &&
+    input.rupture_probability <=
+      35 &&
+    input.current_month_score >=
+      60 &&
+    input.current_quarter_score >=
+      60 &&
+    input.rolling_7d
+      .stability_score !== null &&
+    input.rolling_7d
+      .stability_score >= 50
+  ) {
+    return "STABLE";
+  }
+
+  return "TRANSITION";
+}
+
+function resolveTimingState(input: {
+  rolling_24h: TemporalBlock;
+  crash_state: RfsCrashState;
+}): RfsTimingState {
+  if (
+    input.rolling_24h.status ===
+      "unavailable" ||
+    input.rolling_24h.status ===
+      "insufficient_data" ||
+    input.rolling_24h
+      .rupture_probability === null ||
+    input.rolling_24h
+      .stability_score === null
+  ) {
+    return "UNAVAILABLE";
+  }
+
+  if (
+    input.crash_state === "CRASH"
+  ) {
+    return "BAD";
+  }
+
+  if (
+    input.rolling_24h
+      .rupture_probability >= 70 ||
+    input.rolling_24h
+      .stability_score <= 35
+  ) {
+    return "BAD";
+  }
+
+  if (
+    input.rolling_24h
+      .stability_score >= 60 &&
+    input.rolling_24h
+      .rupture_probability <= 40
+  ) {
+    return "GOOD";
+  }
+
+  return "NEUTRAL";
+}
+
+function computeCoherenceScore(input: {
+  stability_score: number;
+  current_quarter_score: number;
+  current_month_score: number;
+  rolling_7d: TemporalBlock;
+  rolling_24h: TemporalBlock;
+  rupture_penalty_score: number;
+}): number {
+  const longToMidSimilarity =
+    computeScoreSimilarity(
+      input.stability_score,
+      input.current_quarter_score,
+    );
+
+  const midToShortSimilarity =
+    computeScoreSimilarity(
+      input.current_quarter_score,
+      input.current_month_score,
+    );
+
+  const sevenDaySimilarity =
+    input.rolling_7d
+      .stability_score === null
+      ? NEUTRAL_SCORE
+      : computeScoreSimilarity(
+          input.current_month_score,
+          input.rolling_7d
+            .stability_score,
+        );
+
+  const twentyFourHourSimilarity =
+    input.rolling_7d
+      .stability_score === null ||
+    input.rolling_24h
+      .stability_score === null
+      ? NEUTRAL_SCORE
+      : computeScoreSimilarity(
+          input.rolling_7d
+            .stability_score,
+          input.rolling_24h
+            .stability_score,
+        );
+
+  return normalizeScore(
+    longToMidSimilarity * 0.28 +
+      midToShortSimilarity * 0.24 +
+      sevenDaySimilarity * 0.24 +
+      twentyFourHourSimilarity * 0.08 +
+      (
+        100 -
+        input.rupture_penalty_score
+      ) *
+        0.16,
+  );
+}
+
+/* ============================================================================
+ * 14. HISTORICAL REFERENCE SELECTION
+ * ========================================================================== */
+
+function selectReferenceWindows(input: {
+  historical_mode: RfsHistoricalMode;
+  monthly_windows: readonly SegmentWindow[];
+  current_window: SegmentWindow;
+}): SegmentWindow[] {
+  if (
+    input.monthly_windows.length <= 1
+  ) {
+    return [];
+  }
+
+  if (
+    input.historical_mode ===
+    "YEAR_PHASE_COMPARISON"
+  ) {
+    return input.monthly_windows.filter(
+      (window) =>
+        window.quarter_index ===
+          input.current_window
+            .quarter_index &&
+        window.year <
+          input.current_window.year,
+    );
+  }
+
+  if (
+    input.historical_mode ===
+    "MONTH_TO_MONTH"
+  ) {
+    return input.monthly_windows.slice(
+      0,
+      -1,
+    );
+  }
+
+  return [];
+}
+
+/* ============================================================================
+ * 15. PUBLIC EXECUTION
+ * ========================================================================== */
+
+export function runRFSScore(
+  input: RfsScoreInput,
+): RfsScoreResult {
+  const validatedInput =
+    validateRfsInput(input);
+
+  const prices =
+    validatedInput.prices;
+
+  const timestamps =
+    validatedInput.timestamps;
+
+  const historicalMode =
+    resolveHistoricalMode(
+      timestamps,
+    );
+
+  const monthlyWindows =
+    buildMonthlyWindows(
+      prices,
+      timestamps,
+    );
+
+  const quarterBundles =
+    buildQuarterBundles(
+      monthlyWindows,
+    );
+
+  const fullWindow =
+    buildFullWindow(
+      prices,
+      timestamps,
+    );
+
+  const currentWindow =
+    monthlyWindows.at(-1) ??
+    fullWindow;
+
+  const currentSignature =
+    computeSegmentSignature(
+      currentWindow,
+    );
+
+  const currentQuarterBundle =
+    quarterBundles.at(-1) ??
+    null;
+
+  const currentQuarterWindow =
+    currentQuarterBundle === null
+      ? null
+      : flattenQuarterBundle(
+          currentQuarterBundle,
+        );
+
+  const currentQuarterScore =
+    currentQuarterWindow === null
+      ? currentSignature
+          .quality_score
+      : computeSegmentSignature(
+          currentQuarterWindow,
+        ).quality_score;
+
+  const referenceWindows =
+    selectReferenceWindows({
+      historical_mode:
+        historicalMode,
+
+      monthly_windows:
+        monthlyWindows,
+
+      current_window:
+        currentWindow,
+    });
+
+  const referenceSignatures =
+    referenceWindows.map(
+      computeSegmentSignature,
+    );
+
+  const comparisons =
+    compareCurrentSignatureToHistory(
+      currentSignature,
+      referenceSignatures,
+    );
+
+  const structuralAxes =
+    computeStructuralAxes(
+      comparisons,
+    );
+
+  const ruptureAxes =
+    computeRuptureAxes(
+      comparisons,
+      currentSignature,
+    );
+
+  const ruptureProbability =
+    computeRuptureProbability(
+      ruptureAxes,
+    );
+
+  const ruptureScore =
+    ruptureProbability;
+
+  const rupturePenaltyScore =
+    computeRupturePenaltyScore(
+      ruptureProbability,
+      ruptureAxes
+        .rupture_frequency_score,
+    );
+
+  const continuityProbability =
+    computeContinuityProbability({
+      structural_axes:
+        structuralAxes,
+
+      rupture_penalty_score:
+        rupturePenaltyScore,
+    });
+
+  const historicalQualityScores =
+    monthlyWindows
+      .slice(0, -1)
+      .map(
+        (window) =>
+          computeSegmentSignature(
+            window,
+          ).quality_score,
+      );
+
+  const yearlyBaselineScore =
+    historicalQualityScores.length ===
+    0
+      ? currentSignature
+          .quality_score
+      : normalizeScore(
+          mean(
+            historicalQualityScores,
+          ),
+        );
+
+  const stabilityScore =
+    normalizeScore(
+      computeStructuralScore(
+        structuralAxes,
+      ) *
+        0.72 +
+        (
+          100 -
+          rupturePenaltyScore
+        ) *
+          0.18 +
+        yearlyBaselineScore *
+          0.1,
+    );
+
+  const midTermScore =
+    normalizeScore(
+      currentQuarterScore *
+        0.46 +
+        structuralAxes
+          .convergence_score *
+          0.22 +
+        yearlyBaselineScore *
+          0.2 +
+        (
+          100 -
+          rupturePenaltyScore
+        ) *
+          0.12,
+    );
+
+  const initial7d =
+    computeTemporalBlock(
+      sliceTemporalWindow({
+        prices,
+        timestamps,
+
+        duration_ms:
+          7 *
+          MILLISECONDS_PER_DAY,
+
+        anchor:
+          "INITIAL",
+      }),
+    );
+
+  const rolling7d =
+    computeTemporalBlock(
+      sliceTemporalWindow({
+        prices,
+        timestamps,
+
+        duration_ms:
+          7 *
+          MILLISECONDS_PER_DAY,
+
+        anchor:
+          "ROLLING",
+      }),
+    );
+
+  const initial24h =
+    computeTemporalBlock(
+      sliceTemporalWindow({
+        prices,
+        timestamps,
+
+        duration_ms:
+          24 *
+          MILLISECONDS_PER_HOUR,
+
+        anchor:
+          "INITIAL",
+      }),
+    );
+
+  const rolling24h =
+    computeTemporalBlock(
+      sliceTemporalWindow({
+        prices,
+        timestamps,
+
+        duration_ms:
+          24 *
+          MILLISECONDS_PER_HOUR,
+
+        anchor:
+          "ROLLING",
+      }),
+    );
+
+  const crashResult =
+    computeCrashResult({
+      rupture_score:
+        ruptureScore,
+
+      historical_rupture_scores:
+        comparisons.map(
+          (comparison) =>
+            comparison
+              .rupture_gap_score,
+        ),
+    });
+
+  const coherenceScore =
+    computeCoherenceScore({
+      stability_score:
+        stabilityScore,
+
+      current_quarter_score:
+        currentQuarterScore,
+
+      current_month_score:
+        currentSignature
+          .quality_score,
+
+      rolling_7d:
+        rolling7d,
+
+      rolling_24h:
+        rolling24h,
+
+      rupture_penalty_score:
+        rupturePenaltyScore,
+    });
+
+  const regime =
+    resolveRegime({
+      stability_score:
+        stabilityScore,
+
+      rupture_probability:
+        ruptureProbability,
+
+      crash_score:
+        crashResult.score,
+
+      current_month_score:
+        currentSignature
+          .quality_score,
+
+      current_quarter_score:
+        currentQuarterScore,
+
+      rolling_7d:
+        rolling7d,
+    });
+
+  const timingState =
+    resolveTimingState({
+      rolling_24h:
+        rolling24h,
+
+      crash_state:
+        crashResult.state,
+    });
+
+  const structureScore =
+    normalizeScore(
+      currentSignature
+        .quality_score *
+        0.34 +
+        currentQuarterScore *
+          0.34 +
+        yearlyBaselineScore *
+          0.18 +
+        structuralAxes
+          .duration_score *
+          0.14,
+    );
+
+  const marketScore =
+    normalizeScore(
+      stabilityScore * 0.36 +
+        midTermScore * 0.24 +
+        coherenceScore * 0.16 +
+        continuityProbability *
+          0.14 +
+        (
+          100 -
+          rupturePenaltyScore
+        ) *
+          0.1,
+    );
+
+  const confidenceScore =
+    normalizeScore(
+      structuralAxes
+        .occurrence_score *
+        0.2 +
+        structuralAxes
+          .frequency_score *
+          0.14 +
+        structuralAxes
+          .convergence_score *
+          0.22 +
+        structuralAxes
+          .correlation_score *
+          0.16 +
+        structuralAxes
+          .duration_score *
+          0.14 +
+        Math.min(
+          comparisons.length * 4,
+          100,
+        ) *
+          0.14,
+    );
+
+  return {
+    stability:
+      stabilityScore,
+
+    mid_term_score:
+      midTermScore,
+
+    regime,
+
+    structure_score:
+      structureScore,
+
+    market_score:
+      marketScore,
+
+    confidence_score:
+      confidenceScore,
+
+    coherence_score:
+      coherenceScore,
+
+    occurrence_score:
+      structuralAxes
+        .occurrence_score,
+
+    frequency_score:
+      structuralAxes
+        .frequency_score,
+
+    convergence_score:
+      structuralAxes
+        .convergence_score,
+
+    correlation_score:
+      structuralAxes
+        .correlation_score,
+
+    duration_score:
+      structuralAxes
+        .duration_score,
+
+    pattern_score:
+      currentSignature
+        .quality_score,
+
+    pattern_frequency_score:
+      structuralAxes
+        .frequency_score,
+
+    rupture_occurrence_score:
+      ruptureAxes
+        .rupture_occurrence_score,
+
+    rupture_frequency_score:
+      ruptureAxes
+        .rupture_frequency_score,
+
+    rupture_convergence_score:
+      ruptureAxes
+        .rupture_convergence_score,
+
+    rupture_correlation_score:
+      ruptureAxes
+        .rupture_correlation_score,
+
+    rupture_duration_score:
+      ruptureAxes
+        .rupture_duration_score,
+
+    rupture_probability:
+      ruptureProbability,
+
+    rupture_score:
+      ruptureScore,
+
+    rupture_penalty_score:
+      rupturePenaltyScore,
+
+    crash_score:
+      crashResult.score,
+
+    crash_state:
+      crashResult.state,
+
+    crash_status:
+      crashResult.status,
+
+    continuity_probability:
+      continuityProbability,
+
+    current_month_score:
+      currentSignature
+        .quality_score,
+
+    current_quarter_score:
+      currentQuarterScore,
+
+    yearly_baseline_score:
+      yearlyBaselineScore,
+
+    initial_7d:
+      initial7d,
+
+    rolling_7d:
+      rolling7d,
+
+    initial_24h:
+      initial24h,
+
+    rolling_24h:
+      rolling24h,
+
+    change_24h:
+      rolling24h.change_pct,
+
+    slope_7d:
+      rolling7d.slope_pct,
+
+    timing_state:
+      timingState,
+
+    historical_mode:
+      historicalMode,
+
+    comparison_count:
+      comparisons.length,
+  };
+}
+
+export const runRFS =
+  runRFSScore;

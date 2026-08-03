@@ -2,15 +2,41 @@
  * FILE: lib/xyvala/stores/traceability-store-orchestrator.ts
  * ----------------------------------------------------------------------------
  * TITLE
- * - Xyvala private traceability store orchestrator
+ * - Xyvala canonical private traceability store orchestrator
  *
  * ROLE
- * - orchestrate private traceability writes from already computed scan assets
- * - record detection, structural analytics and lifecycle traces
- * - build runtime propagation observations from existing private assets
- * - keep traceability stores private, auditable and isolated from public layers
+ * - validate canonical private traceability write inputs
+ * - orchestrate private traceability writes from already-computed scan assets
+ * - record detection, structural analytics and transition lifecycle traces
+ * - build factual runtime propagation observations from private assets
+ * - report the first invalid persistence boundary without rewriting truth
  *
- * PARENT FILES
+ * CLASSIFICATION
+ * - PRIVATE
+ * - MUTATE ORCHESTRATOR
+ * - VALIDATE / OBSERVE / MUTATE
+ * - DETERMINISTIC FOR IDENTICAL INPUTS AND STORE STATE
+ * - NO ANALYTICAL COMPUTE
+ * - NO PUBLIC PROJECTION
+ *
+ * POSITION IN OFFICIAL CHAIN
+ * - Acquisition
+ * - RFS
+ * - Triple Layer
+ * - Impulse Layer
+ * - Analytical Aggregation System
+ * - MCI
+ * - Calibration
+ * - Snapshot
+ * - Private Contract Adaptation
+ * - Private Traceability Observation
+ * - Private Traceability Persistence
+ * - Private/Public Transformer
+ * - Rankings
+ * - API
+ * - Interface
+ *
+ * PARENTS
  * - lib/xyvala/contracts/scan-private-contract.ts
  * - lib/xyvala/stores/detection-store.ts
  * - lib/xyvala/stores/structural-analytics-store.ts
@@ -18,54 +44,107 @@
  * - lib/xyvala/governance/governance-runtime.ts
  * - lib/xyvala/governance/runtime-traceability.ts
  *
+ * CONSUMERS
+ * - lib/xyvala/services/raw-assets-service.ts
+ * - private traceability diagnostics
+ * - private governance diagnostics
+ *
  * DIRECTIVES
- * - private MUTATE orchestration only
+ * - private traceability persistence only
  * - no RFS recomputation
+ * - no Triple Layer recomputation
+ * - no Impulse Layer recomputation
+ * - no Analytical Aggregation recomputation
  * - no MCI recomputation
  * - no calibration computation
  * - no lifecycle inference outside transition-lifecycle-service
- * - no performance computation
- * - no public API response building
+ * - no public API response construction
  * - no UI logic
  * - no public snapshot exposure
- * - traceability stores remain strictly private
- * - record only already produced values
- * - runtime traces observe existing propagated values only
+ * - no private-to-public transformation
+ * - no local clock access
+ * - no timestamp generation
+ * - no synthetic analytical version
+ * - no synthetic snapshot version
+ * - no synthetic provenance
+ * - no unavailable-to-zero conversion
+ * - no unavailable-to-neutral conversion
+ * - no private decision suppression
+ * - no temporary diagnostic logging
  * - null means explicitly unavailable
  * - undefined must never be stored
  *
  * INPUTS
- * - PrivateScanAsset[]
- * - optional runtime traces from upstream/downstream controlled boundaries
+ * - canonical PrivateScanAsset[]
+ * - canonical snapshot version
+ * - optional canonical analytical version fallback
+ * - optional canonical detected_at fallback
+ * - optional controlled runtime traces
  *
  * OUTPUTS
  * - TraceabilityWriteResult
  *
- * INVARIANTS
- * - detection store receives observable detection data
- * - structural analytics store receives private analytical data
- * - lifecycle store receives transition lifecycle data
- * - governance runtime receives non-empty trace observations when assets exist
- * - orchestrator does not create analytical truth
- * - failed writes are reported, not hidden
+ * OWNERSHIP
+ * - detection store owns observable detection persistence
+ * - structural analytics store owns private analytical persistence
+ * - transition lifecycle service owns lifecycle mutation
+ * - governance runtime owns propagation observation qualification
+ * - this orchestrator owns execution order and persistence reporting only
  *
- * CRITICAL DEPENDENCIES
- * - PrivateScanAsset
- * - detection-store.ts
- * - structural-analytics-store.ts
- * - transition-lifecycle-service.ts
- * - governance-runtime.ts
- * - runtime-traceability.ts
+ * INVARIANTS
+ * - every write uses upstream canonical timestamps only
+ * - every write uses upstream canonical versions only
+ * - already-computed private values are propagated without replacement
+ * - decision_score is never discarded when available
+ * - trace observations never prove an unobserved downstream boundary
+ * - persistence failure never changes analytical truth
+ * - warnings are deterministic, deduplicated and ordered
+ * - identical valid inputs produce identical write ordering
+ * - status and ok remain semantically aligned
+ *
+ * FIRST DIVERGENCE
+ * - invalid input collection
+ *   => traceability_assets_invalid
+ *
+ * - empty input collection
+ *   => traceability_assets_empty
+ *
+ * - invalid snapshot version
+ *   => traceability_snapshot_version_invalid
+ *
+ * - invalid asset identity
+ *   => traceability_asset_identity_invalid
+ *
+ * - missing analytical version
+ *   => traceability_analytical_version_invalid
+ *
+ * - missing canonical timestamp
+ *   => traceability_detected_at_invalid
+ *
+ * - detection write failure
+ *   => detection store result
+ *
+ * - structural analytics write failure
+ *   => structural analytics store result
+ *
+ * - lifecycle write failure
+ *   => transition lifecycle service result
+ *
+ * - governance observation failure
+ *   => governance runtime result
  *
  * SENSITIVE ZONES
+ * - canonical metadata
  * - private analytical fields
- * - decision leakage
- * - public/private boundary
- * - runtime governance diagnostics
- * - future persistence migration
+ * - decision propagation
+ * - runtime lineage
+ * - mutation ordering
+ * - write-status aggregation
  * ========================================================================== */
 
-import type { PrivateScanAsset } from "@/lib/xyvala/contracts/scan-private-contract";
+import type {
+  PrivateScanAsset,
+} from "@/lib/xyvala/contracts/scan-private-contract";
 
 import {
   buildGovernanceRuntimeState,
@@ -76,14 +155,18 @@ import type {
 } from "@/lib/xyvala/governance/runtime-traceability";
 
 import {
-  recordDetection,
+  CANONICAL_SCAN_REBUILD_SCOPE,
+} from "@/lib/xyvala/governance/runtime-observation-scopes";
+
+import {
   getDetectionStoreSnapshot,
+  recordDetection,
   type DetectionStoreWriteResult,
 } from "@/lib/xyvala/stores/detection-store";
 
 import {
-  recordStructuralAnalytics,
   getStructuralAnalyticsStoreSnapshot,
+  recordStructuralAnalytics,
   type StructuralAnalyticsWriteResult,
 } from "@/lib/xyvala/stores/structural-analytics-store";
 
@@ -105,7 +188,14 @@ import {
 } from "@/lib/xyvala/stores/calibration-store";
 
 /* ============================================================================
- * 1. TYPES
+ * 1. VERSION
+ * ========================================================================== */
+
+export const TRACEABILITY_STORE_ORCHESTRATOR_VERSION =
+  "2.0.0" as const;
+
+/* ============================================================================
+ * 2. PUBLIC TYPES
  * ========================================================================== */
 
 export type TraceabilityWriteStatus =
@@ -118,537 +208,1556 @@ export type TraceabilityWriteItem = {
   asset_id: string;
   symbol: string;
 
-  detection: DetectionStoreWriteResult;
-  structural_analytics: StructuralAnalyticsWriteResult;
-  transition_lifecycle: TransitionLifecycleServiceResult;
+  detection:
+    DetectionStoreWriteResult;
+
+  structural_analytics:
+    StructuralAnalyticsWriteResult;
+
+  transition_lifecycle:
+    TransitionLifecycleServiceResult;
 };
 
 export type TraceabilityWriteResult = {
   ok: boolean;
-  status: TraceabilityWriteStatus;
+
+  status:
+    TraceabilityWriteStatus;
+
   count: number;
   recorded_count: number;
   partial_count: number;
   invalid_count: number;
-  items: TraceabilityWriteItem[];
-  warnings: string[];
+
+  items:
+    TraceabilityWriteItem[];
+
+  warnings:
+    string[];
 };
 
 export type TraceabilityRecordScanInput = {
-  assets: readonly PrivateScanAsset[];
-  snapshot_version: string;
-  analytical_version?: string;
-  detected_at?: string;
+  assets:
+    readonly PrivateScanAsset[];
+
+  snapshot_version:
+    string;
 
   /**
-   * Optional controlled traces from upstream/downstream boundaries.
+   * Controlled fallback only.
    *
-   * This field allows services/routes to provide additional propagation
-   * observations without forcing this private MUTATE orchestrator to invent
-   * public API or interface traces.
+   * The asset governance analytical version remains the preferred source.
+   * No synthetic version is generated when both are unavailable.
    */
-  runtime_traces?: readonly RuntimeTraceInput[];
+  analytical_version?:
+    string;
+
+  /**
+   * Controlled fallback only.
+   *
+   * The asset governance generated_at remains the preferred source.
+   * No local timestamp is generated when both are unavailable.
+   */
+  detected_at?:
+    string;
+
+  /**
+   * Optional controlled observations emitted by actual upstream or downstream
+   * boundaries.
+   *
+   * The orchestrator does not invent API, interface, snapshot or calibration
+   * propagation observations.
+   */
+  runtime_traces?:
+    readonly RuntimeTraceInput[];
 };
 
 /* ============================================================================
- * 2. SNAPSHOT API
+ * 3. INTERNAL TYPES
+ * ========================================================================== */
+
+type PreparedTraceabilityAsset = {
+  asset:
+    PrivateScanAsset;
+
+  analytical_version:
+    string;
+
+  detected_at:
+    string;
+};
+
+type PreparationFailureReason =
+  | "asset_identity_invalid"
+  | "analytical_version_invalid"
+  | "detected_at_invalid";
+
+type PreparationFailure = {
+  index: number;
+  asset_id: string | null;
+  symbol: string | null;
+  reason: PreparationFailureReason;
+};
+
+type PreparationResult = {
+  prepared:
+    PreparedTraceabilityAsset[];
+
+  failures:
+    PreparationFailure[];
+};
+
+/* ============================================================================
+ * 4. SNAPSHOT READ API
+ * ----------------------------------------------------------------------------
+ * This function reads existing private store state.
+ *
+ * It does not:
+ * - compute analytics
+ * - mutate stores
+ * - project publicly
  * ========================================================================== */
 
 export function getTraceabilityStoreSnapshot() {
   return {
-    detection_store: getDetectionStoreSnapshot(),
-    structural_analytics_store: getStructuralAnalyticsStoreSnapshot(),
-    transition_lifecycle_store: getTransitionLifecycleStoreSnapshot(),
-    performance_store: getPerformanceStoreSnapshot(),
-    calibration_store: getCalibrationStoreSnapshot(),
+    detection_store:
+      getDetectionStoreSnapshot(),
+
+    structural_analytics_store:
+      getStructuralAnalyticsStoreSnapshot(),
+
+    transition_lifecycle_store:
+      getTransitionLifecycleStoreSnapshot(),
+
+    performance_store:
+      getPerformanceStoreSnapshot(),
+
+    calibration_store:
+      getCalibrationStoreSnapshot(),
   };
 }
 
 /* ============================================================================
- * 3. SAFE HELPERS
+ * 5. SAFE PRIMITIVE HELPERS
  * ========================================================================== */
 
-function nowIso(): string {
-  return new Date().toISOString();
-}
-
-function isDevelopment(): boolean {
-  return process.env.NODE_ENV !== "production";
-}
-
-function safeString(value: unknown, fallback = ""): string {
-  return typeof value === "string" && value.trim().length > 0
-    ? value.trim()
-    : fallback;
-}
-
-function normalizeIsoDate(value: unknown, fallback: string): string {
-  if (typeof value !== "string" || value.trim().length === 0) {
-    return fallback;
+function normalizeRequiredString(
+  value: unknown,
+): string | null {
+  if (typeof value !== "string") {
+    return null;
   }
 
-  const parsed = new Date(value);
+  const normalized =
+    value.trim();
 
-  return Number.isNaN(parsed.getTime())
-    ? fallback
-    : parsed.toISOString();
+  return normalized.length > 0
+    ? normalized
+    : null;
+}
+
+function normalizeIsoDate(
+  value: unknown,
+): string | null {
+  const normalized =
+    normalizeRequiredString(
+      value,
+    );
+
+  if (normalized === null) {
+    return null;
+  }
+
+  const timestamp =
+    Date.parse(normalized);
+
+  if (!Number.isFinite(timestamp)) {
+    return null;
+  }
+
+  return new Date(timestamp)
+    .toISOString();
+}
+
+function compareDeterministicStrings(
+  left: string,
+  right: string,
+): number {
+  if (left < right) {
+    return -1;
+  }
+
+  if (left > right) {
+    return 1;
+  }
+
+  return 0;
 }
 
 function uniqueWarnings(
-  ...groups: Array<string[] | undefined | null>
+  ...groups: Array<
+    readonly string[] |
+    undefined |
+    null
+  >
 ): string[] {
+  const normalized =
+    groups
+      .flatMap((group) =>
+        Array.isArray(group)
+          ? group
+          : [],
+      )
+      .filter(
+        (warning): warning is string =>
+          typeof warning === "string",
+      )
+      .map((warning) =>
+        warning.trim(),
+      )
+      .filter(
+        (warning) =>
+          warning.length > 0,
+      );
+
   return [
-    ...new Set(
-      groups
-        .flatMap((group) => (Array.isArray(group) ? group : []))
-        .filter(
-          (item): item is string =>
-            typeof item === "string" && item.trim().length > 0,
-        ),
-    ),
-  ];
+    ...new Set(normalized),
+  ].sort(
+    compareDeterministicStrings,
+  );
 }
 
+/* ============================================================================
+ * 6. CANONICAL METADATA RESOLUTION
+ * ----------------------------------------------------------------------------
+ * Preferred ownership:
+ *
+ * - analytical_version
+ *   <- asset.governance.analytical_version
+ *
+ * - detected_at
+ *   <- asset.governance.generated_at
+ *
+ * Controlled input fallbacks are accepted only when the canonical asset
+ * governance value is unavailable.
+ *
+ * No local or synthetic replacement is authorised.
+ * ========================================================================== */
+
 function resolveAnalyticalVersion(input: {
-  asset: PrivateScanAsset;
-  fallback: string | undefined;
-}): string {
-  return safeString(
-    input.asset.governance?.analytical_version,
-    safeString(input.fallback, "unknown"),
+  asset:
+    PrivateScanAsset;
+
+  fallback:
+    string | undefined;
+}): string | null {
+  return (
+    normalizeRequiredString(
+      input.asset
+        .governance
+        .analytical_version,
+    ) ??
+    normalizeRequiredString(
+      input.fallback,
+    )
   );
 }
 
 function resolveDetectedAt(input: {
-  asset: PrivateScanAsset;
-  fallback: string;
-}): string {
-  return normalizeIsoDate(
-    input.asset.governance?.generated_at,
-    input.fallback,
+  asset:
+    PrivateScanAsset;
+
+  fallback:
+    string | undefined;
+}): string | null {
+  return (
+    normalizeIsoDate(
+      input.asset
+        .governance
+        .generated_at,
+    ) ??
+    normalizeIsoDate(
+      input.fallback,
+    )
+  );
+}
+
+function resolveAssetReference(
+  asset:
+    PrivateScanAsset,
+): string | null {
+  return (
+    normalizeRequiredString(
+      asset.id,
+    ) ??
+    normalizeRequiredString(
+      asset.symbol,
+    )
   );
 }
 
 /* ============================================================================
- * 4. RUNTIME TRACE HELPERS
- * ==========================================================================
+ * 7. INPUT PREPARATION
+ * ----------------------------------------------------------------------------
+ * Preparation validates persistence metadata only.
  *
- * ROLE
- * - build runtime propagation observations from already computed private assets
- * - observe existing private analytical values only
- * - provide governance runtime with factual trace inputs
- *
- * DIRECTIVES
- * - observe only
- * - no analytical computation
- * - no RFS recomputation
- * - no MCI recomputation
- * - no analytical aggregation computation
- * - no calibration computation
- * - no public API trace fabrication
- * - no interface trace fabrication
- * - no reconstruction of missing values
- * - null means explicitly unavailable
- * - undefined must never be traced
- *
- * INVARIANTS
- * - traces prove observed values at their real producer layer
- * - traces never create analytical truth
- * - downstream propagation must be provided by the real downstream layer
- * - aggregated contexts must be produced by the Analytical Aggregation System
- *   before they can be traced here
+ * It does not:
+ * - repair analytical values
+ * - repair identity
+ * - rewrite metadata
+ * - mutate stores
  * ========================================================================== */
 
-function hasValue(value: unknown): boolean {
-  return value !== null && value !== undefined;
-}
+function prepareTraceabilityAssets(input: {
+  assets:
+    readonly PrivateScanAsset[];
 
-function trace(input: {
-  variable_name: string;
-  layer: RuntimeTraceInput["layer"];
-  source: RuntimeTraceInput["source"];
-  reference: string;
-  reason?: string | null;
-}): RuntimeTraceInput {
+  analytical_version:
+    string | undefined;
+
+  detected_at:
+    string | undefined;
+}): PreparationResult {
+  const prepared:
+    PreparedTraceabilityAsset[] = [];
+
+  const failures:
+    PreparationFailure[] = [];
+
+  for (
+    let index = 0;
+    index < input.assets.length;
+    index += 1
+  ) {
+    const asset =
+      input.assets[index];
+
+    if (!asset) {
+      failures.push({
+        index,
+        asset_id:
+          null,
+
+        symbol:
+          null,
+
+        reason:
+          "asset_identity_invalid",
+      });
+
+      continue;
+    }
+
+    const assetId =
+      normalizeRequiredString(
+        asset.id,
+      );
+
+    const symbol =
+      normalizeRequiredString(
+        asset.symbol,
+      );
+
+    if (
+      assetId === null ||
+      symbol === null
+    ) {
+      failures.push({
+        index,
+        asset_id:
+          assetId,
+
+        symbol,
+
+        reason:
+          "asset_identity_invalid",
+      });
+
+      continue;
+    }
+
+    const analyticalVersion =
+      resolveAnalyticalVersion({
+        asset,
+        fallback:
+          input.analytical_version,
+      });
+
+    if (analyticalVersion === null) {
+      failures.push({
+        index,
+        asset_id:
+          assetId,
+
+        symbol,
+
+        reason:
+          "analytical_version_invalid",
+      });
+
+      continue;
+    }
+
+    const detectedAt =
+      resolveDetectedAt({
+        asset,
+        fallback:
+          input.detected_at,
+      });
+
+    if (detectedAt === null) {
+      failures.push({
+        index,
+        asset_id:
+          assetId,
+
+        symbol,
+
+        reason:
+          "detected_at_invalid",
+      });
+
+      continue;
+    }
+
+    prepared.push({
+      asset,
+
+      analytical_version:
+        analyticalVersion,
+
+      detected_at:
+        detectedAt,
+    });
+  }
+
   return {
-    variable_name: input.variable_name,
-    layer: input.layer,
-    status: "observed",
-    source: input.source,
-    reference: input.reference,
-    reason: input.reason ?? null,
+    prepared,
+    failures,
   };
 }
 
-function appendTraceIfValue(
-  traces: RuntimeTraceInput[],
+function buildPreparationWarnings(
+  failures:
+    readonly PreparationFailure[],
+): string[] {
+  if (failures.length === 0) {
+    return [];
+  }
+
+  const counts =
+    new Map<
+      PreparationFailureReason,
+      number
+    >();
+
+  for (const failure of failures) {
+    counts.set(
+      failure.reason,
+      (
+        counts.get(
+          failure.reason,
+        ) ??
+        0
+      ) + 1,
+    );
+  }
+
+  const warnings: string[] = [
+    `traceability_preparation_invalid_count:${failures.length}`,
+  ];
+
+  const sortedCounts =
+    [
+      ...counts.entries(),
+    ].sort(
+      (
+        [left],
+        [right],
+      ) =>
+        compareDeterministicStrings(
+          left,
+          right,
+        ),
+    );
+
+  for (
+    const [
+      reason,
+      count,
+    ] of sortedCounts
+  ) {
+    warnings.push(
+      `traceability_preparation_failure:${reason}:${count}`,
+    );
+  }
+
+  const firstFailure =
+    failures[0];
+
+  if (firstFailure) {
+    warnings.push(
+      `traceability_first_invalid_index:${firstFailure.index}`,
+    );
+
+    if (firstFailure.asset_id) {
+      warnings.push(
+        `traceability_first_invalid_asset:${firstFailure.asset_id}`,
+      );
+    }
+  }
+
+  return warnings;
+}
+
+/* ============================================================================
+ * 8. RUNTIME TRACE HELPERS
+ * ----------------------------------------------------------------------------
+ * Runtime traces observe values already present in PrivateScanAsset.
+ *
+ * They do not:
+ * - recompute values
+ * - infer analytical truth
+ * - fabricate downstream propagation
+ * - fabricate public exposure
+ * ========================================================================== */
+
+function hasTraceableValue(
+  value: unknown,
+): boolean {
+  return (
+    value !== null &&
+    value !== undefined
+  );
+}
+
+function buildRuntimeTraceKey(
+  trace:
+    RuntimeTraceInput,
+): string {
+  return [
+    trace.variable_name,
+    trace.layer,
+    trace.source,
+    trace.reference,
+    trace.status,
+    trace.reason ?? "",
+  ].join("|");
+}
+
+function compareRuntimeTraces(
+  left:
+    RuntimeTraceInput,
+
+  right:
+    RuntimeTraceInput,
+): number {
+  return compareDeterministicStrings(
+    buildRuntimeTraceKey(left),
+    buildRuntimeTraceKey(right),
+  );
+}
+
+function uniqueRuntimeTraces(
+  traces:
+    readonly RuntimeTraceInput[],
+): RuntimeTraceInput[] {
+  const traceByKey =
+    new Map<
+      string,
+      RuntimeTraceInput
+    >();
+
+  for (const trace of traces) {
+    const key =
+      buildRuntimeTraceKey(
+        trace,
+      );
+
+    if (!traceByKey.has(key)) {
+      traceByKey.set(
+        key,
+        trace,
+      );
+    }
+  }
+
+  return [
+    ...traceByKey.values(),
+  ].sort(
+    compareRuntimeTraces,
+  );
+}
+
+function appendRuntimeTraceIfPresent(
+  traces:
+    RuntimeTraceInput[],
+
   input: {
-    value: unknown;
-    variable_name: string;
-    layer: RuntimeTraceInput["layer"];
-    source: RuntimeTraceInput["source"];
-    reference: string;
+    value:
+      unknown;
+
+    variableName:
+      string;
+
+    layer:
+      RuntimeTraceInput["layer"];
+
+    source:
+      RuntimeTraceInput["source"];
+
+    reference:
+      string;
   },
 ): void {
-  if (!hasValue(input.value)) return;
-
-  traces.push(
-    trace({
-      variable_name: input.variable_name,
-      layer: input.layer,
-      source: input.source,
-      reference: input.reference,
-    }),
-  );
-}
-
-function buildRuntimeTracesFromAssets(
-  assets: readonly PrivateScanAsset[],
-): RuntimeTraceInput[] {
-  const traces: RuntimeTraceInput[] = [];
-
-  for (const asset of assets) {
-    const reference = safeString(asset.id, asset.symbol);
-
-    appendTraceIfValue(traces, {
-      value: asset.stability_score,
-      variable_name: "stability_score",
-      layer: "RFS",
-      source: "engine",
-      reference,
-    });
-
-    appendTraceIfValue(traces, {
-      value: asset.regime,
-      variable_name: "regime",
-      layer: "RFS",
-      source: "engine",
-      reference,
-    });
-
-    appendTraceIfValue(traces, {
-      value: asset.rupture_score,
-      variable_name: "rupture_score",
-      layer: "RFS",
-      source: "engine",
-      reference,
-    });
-
-    appendTraceIfValue(traces, {
-      value: asset.rupture_probability,
-      variable_name: "rupture_probability",
-      layer: "RFS",
-      source: "engine",
-      reference,
-    });
-
-    appendTraceIfValue(traces, {
-      value: asset.continuity_probability,
-      variable_name: "continuity_probability",
-      layer: "RFS",
-      source: "engine",
-      reference,
-    });
-
-    appendTraceIfValue(traces, {
-      value: asset.growth_score,
-      variable_name: "growth_layer",
-      layer: "TRIPLE_LAYER",
-      source: "engine",
-      reference,
-    });
-
-    appendTraceIfValue(traces, {
-      value: asset.core_pattern_score,
-      variable_name: "core_pattern_layer",
-      layer: "TRIPLE_LAYER",
-      source: "engine",
-      reference,
-    });
-
-    appendTraceIfValue(traces, {
-      value: asset.decay_score,
-      variable_name: "decay_layer",
-      layer: "TRIPLE_LAYER",
-      source: "engine",
-      reference,
-    });
-
-    appendTraceIfValue(traces, {
-      value: asset.impulse_pressure_score,
-      variable_name: "impulse_pressure_score",
-      layer: "IMPULSE_LAYER",
-      source: "engine",
-      reference,
-    });
-
-    appendTraceIfValue(traces, {
-      value: asset.impulse_instability_score,
-      variable_name: "impulse_instability_score",
-      layer: "IMPULSE_LAYER",
-      source: "engine",
-      reference,
-    });
-
-    appendTraceIfValue(traces, {
-      value: asset.impulse_saturation_score,
-      variable_name: "impulse_saturation_score",
-      layer: "IMPULSE_LAYER",
-      source: "engine",
-      reference,
-    });
-
-    appendTraceIfValue(traces, {
-      value: asset.impulse_exhaustion_score,
-      variable_name: "impulse_exhaustion_score",
-      layer: "IMPULSE_LAYER",
-      source: "engine",
-      reference,
-    });
-
-    appendTraceIfValue(traces, {
-      value: asset.impulse_directional_bias,
-      variable_name: "impulse_directional_bias",
-      layer: "IMPULSE_LAYER",
-      source: "engine",
-      reference,
-    });
-
-    appendTraceIfValue(traces, {
-      value: asset.impulse_transition_state,
-      variable_name: "impulse_transition_state",
-      layer: "IMPULSE_LAYER",
-      source: "engine",
-      reference,
-    });
-
-    appendTraceIfValue(traces, {
-      value: asset.crash_score,
-      variable_name: "crash_score",
-      layer: "CRASH_SYSTEM",
-      source: "engine",
-      reference,
-    });
-
-    appendTraceIfValue(traces, {
-      value: asset.crash_state,
-      variable_name: "crash_state",
-      layer: "CRASH_SYSTEM",
-      source: "engine",
-      reference,
-    });
-
-    appendTraceIfValue(traces, {
-      value: asset.decision,
-      variable_name: "decision",
-      layer: "MCI",
-      source: "engine",
-      reference,
-    });
+  if (
+    !hasTraceableValue(
+      input.value,
+    )
+  ) {
+    return;
   }
 
-  return traces;
+  traces.push({
+    variable_name:
+      input.variableName,
+
+    layer:
+      input.layer,
+
+    status:
+      "observed",
+
+    source:
+      input.source,
+
+    reference:
+      input.reference,
+
+    reason:
+      null,
+  });
 }
 
 /* ============================================================================
- * 5. RECORD HELPERS
+ * 9. RFS TRACE OBSERVATION
  * ========================================================================== */
 
-function recordTraceabilityItem(input: {
-  asset: PrivateScanAsset;
-  snapshot_version: string;
-  analytical_version: string;
-  detected_at: string;
-}): TraceabilityWriteItem {
-  const asset = input.asset;
+function appendRfsRuntimeTraces(
+  traces:
+    RuntimeTraceInput[],
 
-  const detection = recordDetection({
-    asset_id: asset.id,
-    symbol: asset.symbol,
-    name: asset.name,
+  asset:
+    PrivateScanAsset,
 
-    detected_at: input.detected_at,
-    quote: asset.quote,
+  reference:
+    string,
+): void {
+  const layer:
+    RuntimeTraceInput["layer"] =
+      "RFS";
 
-    snapshot_version: input.snapshot_version,
-    analytical_version: input.analytical_version,
+  const source:
+    RuntimeTraceInput["source"] =
+      "engine";
 
-    source: asset.governance?.source ?? "scan",
+  const values:
+    ReadonlyArray<
+      readonly [
+        string,
+        unknown,
+      ]
+    > = [
+      [
+        "stability_score",
+        asset.stability_score,
+      ],
+      [
+        "stability_status",
+        asset.stability_status,
+      ],
+      [
+        "structure_score",
+        asset.structure_score,
+      ],
+      [
+        "market_score",
+        asset.market_score,
+      ],
+      [
+        "coherence_score",
+        asset.coherence_score,
+      ],
+      [
+        "occurrence_score",
+        asset.occurrence_score,
+      ],
+      [
+        "frequency_score",
+        asset.frequency_score,
+      ],
+      [
+        "convergence_score",
+        asset.convergence_score,
+      ],
+      [
+        "duration_score",
+        asset.duration_score,
+      ],
+      [
+        "evolution_score",
+        asset.evolution_score,
+      ],
+      [
+        "regime",
+        asset.regime,
+      ],
+      [
+        "rupture_score",
+        asset.rupture_score,
+      ],
+      [
+        "rupture_probability",
+        asset.rupture_probability,
+      ],
+      [
+        "rupture_penalty_score",
+        asset.rupture_penalty_score,
+      ],
+      [
+        "rupture_occurrence_score",
+        asset.rupture_occurrence_score,
+      ],
+      [
+        "rupture_frequency_score",
+        asset.rupture_frequency_score,
+      ],
+      [
+        "rupture_convergence_score",
+        asset.rupture_convergence_score,
+      ],
+      [
+        "rupture_duration_score",
+        asset.rupture_duration_score,
+      ],
+      [
+        "rupture_evolution_score",
+        asset.rupture_evolution_score,
+      ],
+      [
+        "rupture_evolution_state",
+        asset.rupture_evolution_state,
+      ],
+      [
+        "rupture_acceleration_score",
+        asset.rupture_acceleration_score,
+      ],
+      [
+        "continuity_probability",
+        asset.continuity_probability,
+      ],
+    ];
 
-    rank: asset.rank,
+  for (
+    const [
+      variableName,
+      value,
+    ] of values
+  ) {
+    appendRuntimeTraceIfPresent(
+      traces,
+      {
+        value,
+        variableName,
+        layer,
+        source,
+        reference,
+      },
+    );
+  }
+}
 
-    price: asset.price,
-    market_cap: asset.market_cap,
-    volume_24h: asset.volume_24h,
+/* ============================================================================
+ * 10. TRIPLE LAYER TRACE OBSERVATION
+ * ========================================================================== */
 
-    chg_24h_pct: asset.chg_24h_pct,
-    chg_7d_pct: asset.chg_7d_pct,
+function appendTripleLayerRuntimeTraces(
+  traces:
+    RuntimeTraceInput[],
 
-    public_activity: null,
-    public_structure_transition: null,
-    public_impulse_context: null,
-  });
+  asset:
+    PrivateScanAsset,
 
-  const structuralAnalytics = recordStructuralAnalytics({
-    detection_id: detection.record?.detection_id ?? "",
+  reference:
+    string,
+): void {
+  const layer:
+    RuntimeTraceInput["layer"] =
+      "TRIPLE_LAYER";
 
-    asset_id: asset.id,
-    symbol: asset.symbol,
+  const source:
+    RuntimeTraceInput["source"] =
+      "engine";
 
-    snapshot_version: input.snapshot_version,
-    analytical_version: input.analytical_version,
-    recorded_at: input.detected_at,
+  const values:
+    ReadonlyArray<
+      readonly [
+        string,
+        unknown,
+      ]
+    > = [
+      [
+        "triple_layer_state",
+        asset.state,
+      ],
+      [
+        "growth_score",
+        asset.growth_score,
+      ],
+      [
+        "core_pattern_score",
+        asset.core_pattern_score,
+      ],
+      [
+        "decay_score",
+        asset.decay_score,
+      ],
+      [
+        "growth_status",
+        asset.growth_status,
+      ],
+      [
+        "core_status",
+        asset.core_status,
+      ],
+      [
+        "decay_status",
+        asset.decay_status,
+      ],
+    ];
 
-    stability_score: asset.stability_score,
-    stability_status: asset.stability_status,
+  for (
+    const [
+      variableName,
+      value,
+    ] of values
+  ) {
+    appendRuntimeTraceIfPresent(
+      traces,
+      {
+        value,
+        variableName,
+        layer,
+        source,
+        reference,
+      },
+    );
+  }
+}
 
-    structure_score: asset.structure_score,
-    market_score: asset.market_score,
-    coherence_score: asset.coherence_score,
+/* ============================================================================
+ * 11. IMPULSE TRACE OBSERVATION
+ * ========================================================================== */
 
-    occurrence_score: asset.occurrence_score,
-    frequency_score: asset.frequency_score,
-    convergence_score: asset.convergence_score,
-    duration_score: asset.duration_score,
-    evolution_score: asset.evolution_score,
+function appendImpulseRuntimeTraces(
+  traces:
+    RuntimeTraceInput[],
 
-    regime: asset.regime,
+  asset:
+    PrivateScanAsset,
 
-    rupture_score: asset.rupture_score,
-    rupture_probability: asset.rupture_probability,
-    rupture_penalty_score: asset.rupture_penalty_score,
+  reference:
+    string,
+): void {
+  const layer:
+    RuntimeTraceInput["layer"] =
+      "IMPULSE_LAYER";
 
-    rupture_occurrence_score: asset.rupture_occurrence_score,
-    rupture_frequency_score: asset.rupture_frequency_score,
-    rupture_convergence_score: asset.rupture_convergence_score,
-    rupture_duration_score: asset.rupture_duration_score,
+  const source:
+    RuntimeTraceInput["source"] =
+      "engine";
 
-    rupture_evolution_score: asset.rupture_evolution_score,
-    rupture_evolution_state: asset.rupture_evolution_state,
-    rupture_acceleration_score: asset.rupture_acceleration_score,
+  const values:
+    ReadonlyArray<
+      readonly [
+        string,
+        unknown,
+      ]
+    > = [
+      [
+        "impulse_pressure_score",
+        asset.impulse_pressure_score,
+      ],
+      [
+        "impulse_acceleration_score",
+        asset.impulse_acceleration_score,
+      ],
+      [
+        "impulse_alignment_score",
+        asset.impulse_alignment_score,
+      ],
+      [
+        "impulse_instability_score",
+        asset.impulse_instability_score,
+      ],
+      [
+        "impulse_saturation_score",
+        asset.impulse_saturation_score,
+      ],
+      [
+        "impulse_exhaustion_score",
+        asset.impulse_exhaustion_score,
+      ],
+      [
+        "impulse_directional_bias",
+        asset.impulse_directional_bias,
+      ],
+      [
+        "impulse_transition_state",
+        asset.impulse_transition_state,
+      ],
+      [
+        "impulse_status",
+        asset.impulse_status,
+      ],
+    ];
 
-    crash_score: asset.crash_score,
-    crash_state: asset.crash_state,
+  for (
+    const [
+      variableName,
+      value,
+    ] of values
+  ) {
+    appendRuntimeTraceIfPresent(
+      traces,
+      {
+        value,
+        variableName,
+        layer,
+        source,
+        reference,
+      },
+    );
+  }
+}
 
-    continuity_probability: asset.continuity_probability,
+/* ============================================================================
+ * 12. CRASH TRACE OBSERVATION
+ * ========================================================================== */
 
-    triple_layer_state: asset.state,
-    growth_score: asset.growth_score,
-    core_pattern_score: asset.core_pattern_score,
-    decay_score: asset.decay_score,
-    growth_status: asset.growth_status,
-    core_status: asset.core_status,
-    decay_status: asset.decay_status,
+function appendCrashRuntimeTraces(
+  traces:
+    RuntimeTraceInput[],
 
-    impulse_pressure_score: asset.impulse_pressure_score,
-    impulse_instability_score: asset.impulse_instability_score,
-    impulse_saturation_score: asset.impulse_saturation_score,
-    impulse_exhaustion_score: asset.impulse_exhaustion_score,
-    impulse_directional_bias: asset.impulse_directional_bias,
-    impulse_transition_state: asset.impulse_transition_state,
-    impulse_status: asset.impulse_status,
+  asset:
+    PrivateScanAsset,
 
-    neutralized: asset.neutralized,
-    neutralization_reason: asset.neutralization_reason,
-    neutralization_severity: asset.neutralization_severity,
-    neutralization_validity: asset.neutralization_validity,
+  reference:
+    string,
+): void {
+  const layer:
+    RuntimeTraceInput["layer"] =
+      "CRASH_SYSTEM";
 
-    decision: asset.decision,
-    decision_score: null,
+  const source:
+    RuntimeTraceInput["source"] =
+      "engine";
 
-    opportunity_score: asset.opportunity_score,
-    opportunity_status: asset.opportunity_status,
+  appendRuntimeTraceIfPresent(
+    traces,
+    {
+      value:
+        asset.crash_score,
 
-    confidence_score: asset.confidence_score,
-    confidence_status: asset.confidence_status,
+      variableName:
+        "crash_score",
 
-    decision_status: asset.decision_status,
-  });
+      layer,
+      source,
+      reference,
+    },
+  );
 
-  const lifecycle = recordOrUpdateTransitionLifecycle({
-    asset,
-    detection_id: detection.record?.detection_id ?? "",
-    detected_at: input.detected_at,
-    snapshot_version: input.snapshot_version,
-    analytical_version: input.analytical_version,
-  });
+  appendRuntimeTraceIfPresent(
+    traces,
+    {
+      value:
+        asset.crash_state,
 
-  if (isDevelopment()) {
-    console.log("XYVALA_TRACEABILITY_ITEM_AUDIT", {
-      symbol: asset.symbol,
-      asset_stability: asset.stability_score,
-      stored_stability: structuralAnalytics.record?.stability_score,
-      asset_structure: asset.structure_score,
-      stored_structure: structuralAnalytics.record?.structure_score,
-      lifecycle_status: lifecycle.status,
-      lifecycle_transition_id: lifecycle.transition_id,
-    });
+      variableName:
+        "crash_state",
+
+      layer,
+      source,
+      reference,
+    },
+  );
+}
+
+/* ============================================================================
+ * 13. MCI TRACE OBSERVATION
+ * ========================================================================== */
+
+function appendMciRuntimeTraces(
+  traces:
+    RuntimeTraceInput[],
+
+  asset:
+    PrivateScanAsset,
+
+  reference:
+    string,
+): void {
+  const layer:
+    RuntimeTraceInput["layer"] =
+      "MCI";
+
+  const source:
+    RuntimeTraceInput["source"] =
+      "engine";
+
+  const values:
+    ReadonlyArray<
+      readonly [
+        string,
+        unknown,
+      ]
+    > = [
+      [
+        "decision",
+        asset.decision,
+      ],
+      [
+        "decision_status",
+        asset.decision_status,
+      ],
+      [
+        "decision_score",
+        asset.decision_score,
+      ],
+      [
+        "opportunity_score",
+        asset.opportunity_score,
+      ],
+      [
+        "opportunity_status",
+        asset.opportunity_status,
+      ],
+      [
+        "confidence_score",
+        asset.confidence_score,
+      ],
+      [
+        "confidence_status",
+        asset.confidence_status,
+      ],
+      [
+        "neutralized",
+        asset.neutralized,
+      ],
+      [
+        "neutralization_reason",
+        asset.neutralization_reason,
+      ],
+      [
+        "neutralization_severity",
+        asset.neutralization_severity,
+      ],
+      [
+        "neutralization_validity",
+        asset.neutralization_validity,
+      ],
+    ];
+
+  for (
+    const [
+      variableName,
+      value,
+    ] of values
+  ) {
+    appendRuntimeTraceIfPresent(
+      traces,
+      {
+        value,
+        variableName,
+        layer,
+        source,
+        reference,
+      },
+    );
+  }
+}
+
+/* ============================================================================
+ * 14. CANONICAL RUNTIME TRACE BUILD
+ * ========================================================================== */
+
+function buildRuntimeTracesFromAssets(
+  assets:
+    readonly PrivateScanAsset[],
+): RuntimeTraceInput[] {
+  const traces:
+    RuntimeTraceInput[] = [];
+
+  for (const asset of assets) {
+    const reference =
+      resolveAssetReference(
+        asset,
+      );
+
+    if (reference === null) {
+      continue;
+    }
+
+    appendRfsRuntimeTraces(
+      traces,
+      asset,
+      reference,
+    );
+
+    appendTripleLayerRuntimeTraces(
+      traces,
+      asset,
+      reference,
+    );
+
+    appendImpulseRuntimeTraces(
+      traces,
+      asset,
+      reference,
+    );
+
+    appendCrashRuntimeTraces(
+      traces,
+      asset,
+      reference,
+    );
+
+    appendMciRuntimeTraces(
+      traces,
+      asset,
+      reference,
+    );
   }
 
+  return uniqueRuntimeTraces(
+    traces,
+  );
+}
+
+/* ============================================================================
+ * 15. STORE WRITE ORCHESTRATION
+ * ----------------------------------------------------------------------------
+ * Store contracts remain authoritative.
+ *
+ * This function propagates only fields already accepted by the current store
+ * contracts. Additional Impulse fields must be added atomically with the
+ * structural analytics store contract.
+ * ========================================================================== */
+
+function recordTraceabilityItem(
+  input:
+    PreparedTraceabilityAsset & {
+      snapshot_version:
+        string;
+    },
+): TraceabilityWriteItem {
+  const asset =
+    input.asset;
+
+  const detection =
+    recordDetection({
+      asset_id:
+        asset.id,
+
+      symbol:
+        asset.symbol,
+
+      name:
+        asset.name,
+
+      detected_at:
+        input.detected_at,
+
+      quote:
+        asset.quote,
+
+      snapshot_version:
+        input.snapshot_version,
+
+      analytical_version:
+        input.analytical_version,
+
+      source:
+        asset.governance.source,
+
+      rank:
+        asset.rank,
+
+      price:
+        asset.price,
+
+      market_cap:
+        asset.market_cap,
+
+      volume_24h:
+        asset.volume_24h,
+
+      chg_24h_pct:
+        asset.chg_24h_pct,
+
+      chg_7d_pct:
+        asset.chg_7d_pct,
+
+      /*
+       * Public projections are not owned by this private persistence boundary.
+       */
+      public_activity:
+        null,
+
+      public_structure_transition:
+        null,
+
+      public_impulse_context:
+        null,
+    });
+
+  const structuralAnalytics =
+    recordStructuralAnalytics({
+      detection_id:
+        detection.record
+          ?.detection_id ??
+        "",
+
+      asset_id:
+        asset.id,
+
+      symbol:
+        asset.symbol,
+
+      snapshot_version:
+        input.snapshot_version,
+
+      analytical_version:
+        input.analytical_version,
+
+      recorded_at:
+        input.detected_at,
+
+      stability_score:
+        asset.stability_score,
+
+      stability_status:
+        asset.stability_status,
+
+      structure_score:
+        asset.structure_score,
+
+      market_score:
+        asset.market_score,
+
+      coherence_score:
+        asset.coherence_score,
+
+      occurrence_score:
+        asset.occurrence_score,
+
+      frequency_score:
+        asset.frequency_score,
+
+      convergence_score:
+        asset.convergence_score,
+
+      duration_score:
+        asset.duration_score,
+
+      evolution_score:
+        asset.evolution_score,
+
+      regime:
+        asset.regime,
+
+      rupture_score:
+        asset.rupture_score,
+
+      rupture_probability:
+        asset.rupture_probability,
+
+      rupture_penalty_score:
+        asset.rupture_penalty_score,
+
+      rupture_occurrence_score:
+        asset.rupture_occurrence_score,
+
+      rupture_frequency_score:
+        asset.rupture_frequency_score,
+
+      rupture_convergence_score:
+        asset.rupture_convergence_score,
+
+      rupture_duration_score:
+        asset.rupture_duration_score,
+
+      rupture_evolution_score:
+        asset.rupture_evolution_score,
+
+      rupture_evolution_state:
+        asset.rupture_evolution_state,
+
+      rupture_acceleration_score:
+        asset.rupture_acceleration_score,
+
+      crash_score:
+        asset.crash_score,
+
+      crash_state:
+        asset.crash_state,
+
+      continuity_probability:
+        asset.continuity_probability,
+
+      triple_layer_state:
+        asset.state,
+
+      growth_score:
+        asset.growth_score,
+
+      core_pattern_score:
+        asset.core_pattern_score,
+
+      decay_score:
+        asset.decay_score,
+
+      growth_status:
+        asset.growth_status,
+
+      core_status:
+        asset.core_status,
+
+      decay_status:
+        asset.decay_status,
+
+      impulse_pressure_score:
+        asset.impulse_pressure_score,
+
+      impulse_instability_score:
+        asset.impulse_instability_score,
+
+      impulse_saturation_score:
+        asset.impulse_saturation_score,
+
+      impulse_exhaustion_score:
+        asset.impulse_exhaustion_score,
+
+      impulse_directional_bias:
+        asset.impulse_directional_bias,
+
+      impulse_transition_state:
+        asset.impulse_transition_state,
+
+      impulse_status:
+        asset.impulse_status,
+
+      neutralized:
+        asset.neutralized,
+
+      neutralization_reason:
+        asset.neutralization_reason,
+
+      neutralization_severity:
+        asset.neutralization_severity,
+
+      neutralization_validity:
+        asset.neutralization_validity,
+
+      decision:
+        asset.decision,
+
+      /*
+       * The previous implementation replaced an available canonical value
+       * with null. The persistence boundary must propagate the real value.
+       */
+      decision_score:
+        asset.decision_score,
+
+      opportunity_score:
+        asset.opportunity_score,
+
+      opportunity_status:
+        asset.opportunity_status,
+
+      confidence_score:
+        asset.confidence_score,
+
+      confidence_status:
+        asset.confidence_status,
+
+      decision_status:
+        asset.decision_status,
+    });
+
+  const transitionLifecycle =
+    recordOrUpdateTransitionLifecycle({
+      asset,
+
+      detection_id:
+        detection.record
+          ?.detection_id ??
+        "",
+
+      detected_at:
+        input.detected_at,
+
+      snapshot_version:
+        input.snapshot_version,
+
+      analytical_version:
+        input.analytical_version,
+    });
+
   return {
-    asset_id: asset.id,
-    symbol: asset.symbol,
+    asset_id:
+      asset.id,
+
+    symbol:
+      asset.symbol,
+
     detection,
-    structural_analytics: structuralAnalytics,
-    transition_lifecycle: lifecycle,
+
+    structural_analytics:
+      structuralAnalytics,
+
+    transition_lifecycle:
+      transitionLifecycle,
   };
 }
 
 /* ============================================================================
- * 6. WRITE COUNT HELPERS
+ * 16. WRITE CLASSIFICATION
  * ========================================================================== */
 
-function isLifecycleOk(
-  lifecycle: TransitionLifecycleServiceResult,
+function isLifecycleUsable(
+  lifecycle:
+    TransitionLifecycleServiceResult,
 ): boolean {
-  return lifecycle.ok || lifecycle.status === "skipped";
+  return (
+    lifecycle.ok ||
+    lifecycle.status === "skipped"
+  );
 }
 
-function countInvalidItems(items: readonly TraceabilityWriteItem[]): number {
+function isItemInvalid(
+  item:
+    TraceabilityWriteItem,
+): boolean {
+  return (
+    !item.detection.ok ||
+    !item.structural_analytics.ok ||
+    !isLifecycleUsable(
+      item.transition_lifecycle,
+    )
+  );
+}
+
+function isItemPartial(
+  item:
+    TraceabilityWriteItem,
+): boolean {
+  const states = [
+    item.detection.ok,
+    item.structural_analytics.ok,
+    isLifecycleUsable(
+      item.transition_lifecycle,
+    ),
+  ];
+
+  return (
+    states.some(Boolean) &&
+    !states.every(Boolean)
+  );
+}
+
+function isItemRecorded(
+  item:
+    TraceabilityWriteItem,
+): boolean {
+  return (
+    item.detection.ok &&
+    item.structural_analytics.ok &&
+    isLifecycleUsable(
+      item.transition_lifecycle,
+    ) &&
+    item.detection.status ===
+      "recorded" &&
+    item.structural_analytics.status ===
+      "recorded" &&
+    (
+      item.transition_lifecycle.status ===
+        "recorded" ||
+      item.transition_lifecycle.status ===
+        "updated" ||
+      item.transition_lifecycle.status ===
+        "skipped"
+    )
+  );
+}
+
+function countInvalidItems(
+  items:
+    readonly TraceabilityWriteItem[],
+): number {
   return items.filter(
-    (item) =>
-      !item.detection.ok ||
-      !item.structural_analytics.ok ||
-      !isLifecycleOk(item.transition_lifecycle),
+    isItemInvalid,
   ).length;
 }
 
-function countPartialItems(items: readonly TraceabilityWriteItem[]): number {
-  return items.filter((item) => {
-    const states = [
-      item.detection.ok,
-      item.structural_analytics.ok,
-      isLifecycleOk(item.transition_lifecycle),
-    ];
-
-    return states.some(Boolean) && !states.every(Boolean);
-  }).length;
+function countPartialItems(
+  items:
+    readonly TraceabilityWriteItem[],
+): number {
+  return items.filter(
+    isItemPartial,
+  ).length;
 }
 
-function countRecordedItems(items: readonly TraceabilityWriteItem[]): number {
+function countRecordedItems(
+  items:
+    readonly TraceabilityWriteItem[],
+): number {
   return items.filter(
-    (item) =>
-      item.detection.ok &&
-      item.structural_analytics.ok &&
-      isLifecycleOk(item.transition_lifecycle) &&
-      item.detection.status === "recorded" &&
-      item.structural_analytics.status === "recorded" &&
-      ["recorded", "updated", "skipped"].includes(
-        item.transition_lifecycle.status,
-      ),
+    isItemRecorded,
   ).length;
 }
 
 function resolveWriteStatus(input: {
-  invalid_count: number;
-  partial_count: number;
-  governance_runtime_ok: boolean;
+  input_count:
+    number;
+
+  recorded_count:
+    number;
+
+  partial_count:
+    number;
+
+  invalid_count:
+    number;
+
+  governance_runtime_ok:
+    boolean;
 }): TraceabilityWriteStatus {
-  if (input.invalid_count > 0) return "invalid";
+  if (input.input_count === 0) {
+    return "empty";
+  }
+
+  if (input.invalid_count > 0) {
+    return "invalid";
+  }
 
   if (
     input.partial_count > 0 ||
-    !input.governance_runtime_ok
+    !input.governance_runtime_ok ||
+    input.recorded_count !==
+      input.input_count
   ) {
     return "partial";
   }
@@ -657,115 +1766,277 @@ function resolveWriteStatus(input: {
 }
 
 /* ============================================================================
- * 7. PRIVATE ORCHESTRATION API
+ * 17. PRIVATE ORCHESTRATION API
  * ========================================================================== */
 
 export function recordScanTraceability(
-  input: TraceabilityRecordScanInput,
+  input:
+    TraceabilityRecordScanInput,
 ): TraceabilityWriteResult {
-  if (!Array.isArray(input.assets) || input.assets.length === 0) {
+  if (!Array.isArray(input.assets)) {
     return {
-      ok: true,
-      status: "empty",
-      count: 0,
-      recorded_count: 0,
-      partial_count: 0,
-      invalid_count: 0,
-      items: [],
-      warnings: ["traceability_assets_empty"],
+      ok:
+        false,
+
+      status:
+        "invalid",
+
+      count:
+        0,
+
+      recorded_count:
+        0,
+
+      partial_count:
+        0,
+
+      invalid_count:
+        1,
+
+      items:
+        [],
+
+      warnings: [
+        "traceability_assets_invalid",
+      ],
     };
   }
 
-  const fallbackDetectedAt = normalizeIsoDate(
-    input.detected_at,
-    nowIso(),
-  );
+  if (input.assets.length === 0) {
+    return {
+      ok:
+        true,
 
-  const snapshotVersion = safeString(
-    input.snapshot_version,
-    "unknown",
-  );
+      status:
+        "empty",
 
-  const items = input.assets.map((asset) =>
-    recordTraceabilityItem({
-      asset,
-      snapshot_version: snapshotVersion,
-      analytical_version: resolveAnalyticalVersion({
-        asset,
-        fallback: input.analytical_version,
-      }),
-      detected_at: resolveDetectedAt({
-        asset,
-        fallback: fallbackDetectedAt,
-      }),
-    }),
-  );
+      count:
+        0,
 
-  const invalidCount = countInvalidItems(items);
-  const partialCount = countPartialItems(items);
-  const recordedCount = countRecordedItems(items);
+      recorded_count:
+        0,
 
-  const runtimeTraces = [
-    ...buildRuntimeTracesFromAssets(input.assets),
-    ...(Array.isArray(input.runtime_traces)
-      ? input.runtime_traces
-      : []),
-  ];
+      partial_count:
+        0,
 
-    console.log("XYVALA_RUNTIME_TRACES", {
-  count: runtimeTraces.length,
-  sample: runtimeTraces.slice(0, 10),
-});
+      invalid_count:
+        0,
 
-  const governanceRuntime = buildGovernanceRuntimeState({
-    traces: runtimeTraces,
-  });
+      items:
+        [],
 
-  if (isDevelopment()) {
-    console.log("XYVALA_GOVERNANCE_RUNTIME_AUDIT", {
-      ok: governanceRuntime.ok,
-      status: governanceRuntime.status,
-      error: governanceRuntime.error,
-      warnings: governanceRuntime.warnings,
-      trace_count: governanceRuntime.health.traceability.reason,
-      health_status: governanceRuntime.health.status,
-      health_severity: governanceRuntime.health.severity,
-      health_reason: governanceRuntime.health.reason,
-      compliance: governanceRuntime.health.compliance,
-      lineage: governanceRuntime.health.lineage,
-      boundary: governanceRuntime.health.boundary,
-      propagation: governanceRuntime.health.propagation,
-      divergence: governanceRuntime.health.divergence,
-      traceability: governanceRuntime.health.traceability,
-    });
+      warnings: [
+        "traceability_assets_empty",
+      ],
+    };
   }
 
-  const warnings = uniqueWarnings(
-    invalidCount > 0
-      ? [`traceability_invalid_count:${invalidCount}`]
-      : [],
-    partialCount > 0
-      ? [`traceability_partial_count:${partialCount}`]
-      : [],
-    !governanceRuntime.ok
-      ? [`governance_runtime_${governanceRuntime.status.toLowerCase()}`]
-      : [],
-    governanceRuntime.warnings,
-  );
+  const snapshotVersion =
+    normalizeRequiredString(
+      input.snapshot_version,
+    );
+
+  if (snapshotVersion === null) {
+    return {
+      ok:
+        false,
+
+      status:
+        "invalid",
+
+      count:
+        input.assets.length,
+
+      recorded_count:
+        0,
+
+      partial_count:
+        0,
+
+      invalid_count:
+        input.assets.length,
+
+      items:
+        [],
+
+      warnings: [
+        "traceability_snapshot_version_invalid",
+      ],
+    };
+  }
+
+  /* --------------------------------------------------------------------------
+   * STAGE 1
+   * Canonical metadata preparation
+   * ----------------------------------------------------------------------- */
+
+  const preparation =
+    prepareTraceabilityAssets({
+      assets:
+        input.assets,
+
+      analytical_version:
+        input.analytical_version,
+
+      detected_at:
+        input.detected_at,
+    });
+
+  /* --------------------------------------------------------------------------
+   * STAGE 2
+   * Private store mutation
+   * ----------------------------------------------------------------------- */
+
+  const items =
+    preparation.prepared.map(
+      (preparedAsset) =>
+        recordTraceabilityItem({
+          ...preparedAsset,
+
+          snapshot_version:
+            snapshotVersion,
+        }),
+    );
+
+  const storeInvalidCount =
+    countInvalidItems(
+      items,
+    );
+
+  const partialCount =
+    countPartialItems(
+      items,
+    );
+
+  const recordedCount =
+    countRecordedItems(
+      items,
+    );
+
+  const preparationInvalidCount =
+    preparation.failures.length;
+
+  const invalidCount =
+    preparationInvalidCount +
+    storeInvalidCount;
+
+  /* --------------------------------------------------------------------------
+   * STAGE 3
+   * Runtime trace observation
+   *
+   * Only assets that crossed metadata validation are observed here.
+   * ----------------------------------------------------------------------- */
+
+  const internalRuntimeTraces =
+    buildRuntimeTracesFromAssets(
+      preparation.prepared.map(
+        (preparedAsset) =>
+          preparedAsset.asset,
+      ),
+    );
+
+  const suppliedRuntimeTraces =
+    Array.isArray(
+      input.runtime_traces,
+    )
+      ? input.runtime_traces
+      : [];
+
+  const runtimeTraces =
+    uniqueRuntimeTraces([
+      ...internalRuntimeTraces,
+      ...suppliedRuntimeTraces,
+    ]);
+
+  const governanceRuntime =
+    buildGovernanceRuntimeState({
+      traces:
+        runtimeTraces,
+
+      scope:
+        CANONICAL_SCAN_REBUILD_SCOPE,
+    });
+
+  /* --------------------------------------------------------------------------
+   * STAGE 4
+   * Final classification
+   * ----------------------------------------------------------------------- */
+
+  const status =
+    resolveWriteStatus({
+      input_count:
+        input.assets.length,
+
+      recorded_count:
+        recordedCount,
+
+      partial_count:
+        partialCount,
+
+      invalid_count:
+        invalidCount,
+
+      governance_runtime_ok:
+        governanceRuntime.ok,
+    });
+
+  const warnings =
+    uniqueWarnings(
+      buildPreparationWarnings(
+        preparation.failures,
+      ),
+
+      storeInvalidCount > 0
+        ? [
+            `traceability_store_invalid_count:${storeInvalidCount}`,
+          ]
+        : [],
+
+      partialCount > 0
+        ? [
+            `traceability_partial_count:${partialCount}`,
+          ]
+        : [],
+
+      recordedCount !==
+        input.assets.length
+        ? [
+            `traceability_unrecorded_count:${
+              input.assets.length -
+              recordedCount
+            }`,
+          ]
+        : [],
+
+      !governanceRuntime.ok
+        ? [
+            `governance_runtime_${governanceRuntime.status.toLowerCase()}`,
+          ]
+        : [],
+
+      governanceRuntime.warnings,
+    );
 
   return {
-    ok: invalidCount === 0,
-    status: resolveWriteStatus({
-      invalid_count: invalidCount,
-      partial_count: partialCount,
-      governance_runtime_ok: governanceRuntime.ok,
-    }),
-    count: items.length,
-    recorded_count: recordedCount,
-    partial_count: partialCount,
-    invalid_count: invalidCount,
+    ok:
+      status === "recorded",
+
+    status,
+
+    count:
+      input.assets.length,
+
+    recorded_count:
+      recordedCount,
+
+    partial_count:
+      partialCount,
+
+    invalid_count:
+      invalidCount,
+
     items,
+
     warnings,
   };
 }
-
