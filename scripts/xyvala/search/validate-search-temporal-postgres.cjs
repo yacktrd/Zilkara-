@@ -11,7 +11,7 @@
  * ========================================================================== */
 'use strict';
 
-const VERSION = '1.0.1';
+const VERSION = '1.0.3';
 const TABLE = 'public.xyvala_search_temporal_observations';
 const MIGRATION = '004_xyvala_search_temporal_observations';
 const TIMEOUT = 10000;
@@ -316,24 +316,55 @@ async function main() {
   let testRun;
   try {
     const local = loader.local;
+    adapter = local('./lib/xyvala/runtime/postgres/postgres-adapter.ts');
+    const runtimeTransactionProviderAvailable =
+      typeof adapter.withPostgresTransaction === 'function';
+    const storage = local('./lib/xyvala/search/storage/search-temporal-observation-postgres-repository.ts');
+    const contract = local('./lib/xyvala/search/contracts/search-temporal-observation-store-contract.ts');
+    const transactionPort = local('./lib/xyvala/search/contracts/search-temporal-postgres-transaction-port-contract.ts');
+    const identity = local('./lib/xyvala/search/temporal/search-temporal-document-series-identity.ts');
+    const boundary = local('./lib/xyvala/search/temporal/search-temporal-observation-record-boundary.ts');
+    requireTrue(storage.XYVALA_SEARCH_TEMPORAL_OBSERVATION_POSTGRES_REPOSITORY_MODULE_VERSION === '2.0.1'
+      && contract.XYVALA_SEARCH_TEMPORAL_OBSERVATION_STORE_CONTRACT.contract_version === '1.0.0'
+      && transactionPort.XYVALA_SEARCH_TEMPORAL_POSTGRES_TRANSACTION_PORT_CONTRACT_VERSION === '1.0.0'
+      && identity.XYVALA_SEARCH_TEMPORAL_DOCUMENT_SERIES_IDENTITY_MODULE_VERSION === '1.1.0'
+      && boundary.XYVALA_SEARCH_TEMPORAL_OBSERVATION_RECORD_BOUNDARY_MODULE_VERSION === '1.0.0',
+    'COMPONENT_VERSION_REVIEW_REQUIRED');
+    if (!runtimeTransactionProviderAvailable) {
+      if (!run) {
+        console.log(JSON.stringify({
+          ok: true,
+          mode: 'OBSERVE',
+          validator_version: VERSION,
+          run_id: null,
+          state: 'CONTRACT_VALIDATED_PROVIDER_UNAVAILABLE',
+          availability_state: 'UNAVAILABLE',
+          unavailability_reason:
+            'POSTGRES_TRANSACTION_PROVIDER_NOT_BOUND_ON_BASE',
+          passed_checks: passed,
+          write_tests_started: false,
+          automatic_retry: false,
+          schema_migration_executed: false,
+          runtime_binding_validated: false
+        }, null, 2));
+        return;
+      }
+
+      requireTrue(
+        runtimeTransactionProviderAvailable,
+        'POSTGRES_TRANSACTION_PROVIDER_UNAVAILABLE'
+      );
+    }
+
     const configuration = local('./lib/xyvala/infrastructure/postgres/postgres-configuration.ts')
       .getPostgresConfiguration();
     const expected = target(configuration, process.env);
     testRun = expected.run;
-    adapter = local('./lib/xyvala/runtime/postgres/postgres-adapter.ts');
-    const storage = local('./lib/xyvala/search/storage/search-temporal-observation-postgres-repository.ts');
-    const contract = local('./lib/xyvala/search/contracts/search-temporal-observation-store-contract.ts');
-    const identity = local('./lib/xyvala/search/temporal/search-temporal-document-series-identity.ts');
-    const boundary = local('./lib/xyvala/search/temporal/search-temporal-observation-record-boundary.ts');
-    requireTrue(adapter.POSTGRES_TRANSACTION_TLS_VERIFICATION_VERSION === '1.0.0'
-      && storage.XYVALA_SEARCH_TEMPORAL_OBSERVATION_POSTGRES_REPOSITORY_MODULE_VERSION === '2.0.0'
-      && contract.XYVALA_SEARCH_TEMPORAL_OBSERVATION_STORE_CONTRACT.contract_version === '1.0.0'
-      && identity.XYVALA_SEARCH_TEMPORAL_DOCUMENT_SERIES_IDENTITY_MODULE_VERSION === '1.1.0'
-      && boundary.XYVALA_SEARCH_TEMPORAL_OBSERVATION_RECORD_BOUNDARY_MODULE_VERSION === '1.0.0',
-    'COMPONENT_VERSION_REVIEW_REQUIRED');
+
     const fixture = fixtures(testRun, identity.buildSearchTemporalDocumentSeriesId,
       boundary.validateAndCopySearchTemporalObservationRecord);
     let preflightError;
+
     const before = await adapter.withPostgresTransaction(async (tx) => {
       try {
       const identityResult = await tx.query(`SELECT current_database() = $1 AS database_matches,

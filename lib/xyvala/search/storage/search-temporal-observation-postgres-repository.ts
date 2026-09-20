@@ -3,7 +3,7 @@
  * PostgreSQL persistence for explicit Search temporal observation records.
  * Requires search-temporal-observation-schema.sql, installed separately.
  *
- * Inject the canonical withPostgresTransaction operation and a statement timeout.
+ * Inject the Search transaction port capability and a statement timeout.
  * The PostgreSQL adapter owns configuration, connections and transaction lifecycle.
  * Writes use READ COMMITTED and a table lock before inspecting existing truth.
  * This initial version serializes writers; it makes no throughput claim.
@@ -14,9 +14,9 @@
  * ========================================================================== */
 import { isDeepStrictEqual } from "node:util";
 import type {
-  PostgresTransactionContext,
-  withPostgresTransaction,
-} from "../../runtime/postgres/postgres-adapter";
+  SearchTemporalPostgresTransactionClient,
+  SearchTemporalPostgresWithTransaction,
+} from "../contracts/search-temporal-postgres-transaction-port-contract";
 import type {
   SearchTemporalObservationRecord as RecordValue,
   SearchTemporalObservationReadInput as ReadInput,
@@ -31,9 +31,9 @@ import {
 } from "../temporal/search-temporal-observation-record-boundary";
 import { assertSearchTemporalDocumentSeriesId } from "../temporal/search-temporal-document-series-identity";
 export const XYVALA_SEARCH_TEMPORAL_OBSERVATION_POSTGRES_REPOSITORY_MODULE_VERSION =
-  "2.0.0" as const;
+  "2.0.1" as const;
 export interface SearchTemporalPostgresDependencies {
-  readonly with_transaction: typeof withPostgresTransaction;
+  readonly with_transaction: SearchTemporalPostgresWithTransaction;
   readonly statement_timeout_ms: number;
 }
 
@@ -124,7 +124,7 @@ export function createSearchTemporalObservationPostgresRepository(
   const timeout = String(dependencies.statement_timeout_ms);
   async function transaction<T>(
     write: boolean,
-    operation: (client: PostgresTransactionContext) => Promise<T>,
+    operation: (client: SearchTemporalPostgresTransactionClient) => Promise<T>,
   ): Promise<T | Failure> {
     let invalidRecord = false;
     try {
@@ -135,7 +135,7 @@ export function createSearchTemporalObservationPostgresRepository(
           return await operation(client);
         } catch (error) {
           invalidRecord = error instanceof InvalidStoredRecord;
-          // The canonical adapter must roll back before this becomes INVALID.
+          // The bound transaction provider must roll back before this becomes INVALID.
           throw error;
         }
       }, write ? "READ_COMMITTED" : "REPEATABLE_READ_READ_ONLY");
