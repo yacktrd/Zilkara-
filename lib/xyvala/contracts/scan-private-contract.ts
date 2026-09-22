@@ -216,9 +216,18 @@ export type PrivateImpulseTransitionState =
   | "PRESSURE_BUILDING"
   | "RELEASE"
   | "EXHAUSTION"
-  | "NEUTRAL";
+  | "NEUTRAL"
+  | "UNAVAILABLE";
+
+export type PrivateImpulseStatus =
+  | "computed"
+  | "partial"
+  | "unavailable";
 
 export type PrivateImpulseLayer = {
+  impulse_compression_score:
+    number | null;
+
   impulse_pressure_score: number | null;
   impulse_acceleration_score: number | null;
   impulse_alignment_score: number | null;
@@ -228,7 +237,7 @@ export type PrivateImpulseLayer = {
 
   impulse_directional_bias: PrivateImpulseDirectionalBias;
   impulse_transition_state: PrivateImpulseTransitionState;
-  impulse_status: PrivateScanStatus;
+  impulse_status: PrivateImpulseStatus;
 };
 
 /* ============================================================================
