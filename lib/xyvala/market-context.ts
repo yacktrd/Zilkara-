@@ -165,6 +165,7 @@ function countByImpulse(
       RELEASE: 0,
       EXHAUSTION: 0,
       NEUTRAL: 0,
+      UNAVAILABLE: 0,
     },
   );
 }

@@ -53,6 +53,7 @@ import type {
   PrivateScanRegime,
   PrivateScanStatus,
   PrivateTripleLayerState,
+  PrivateImpulseStatus,
 } from "@/lib/xyvala/contracts/scan-private-contract";
 
 /* ============================================================================
@@ -115,6 +116,7 @@ export type BuildPrivateScanAssetInput = {
   core_status?: unknown;
   decay_status?: unknown;
 
+  impulse_compression_score?: unknown;
   impulse_pressure_score?: unknown;
   impulse_acceleration_score?: unknown;
   impulse_alignment_score?: unknown;
@@ -321,6 +323,54 @@ function normalizeImpulseTransitionState(
   return "NEUTRAL";
 }
 
+function normalizePrivateImpulseStatus(
+
+  value: unknown,
+
+): PrivateImpulseStatus {
+
+  if (
+
+    value === undefined ||
+
+    value === null
+
+  ) {
+
+    return "unavailable";
+
+  }
+
+  switch (
+
+    value
+
+  ) {
+
+    case "computed":
+
+      return "computed";
+
+    case "partial":
+
+      return "partial";
+
+    case "unavailable":
+
+      return "unavailable";
+
+    default:
+
+      throw new Error(
+
+        "scan_asset_factory_impulse_status_invalid",
+
+      );
+
+  }
+
+}
+
 function normalizeNeutralizationReason(
   value: unknown,
 ): PrivateNeutralizationReason {
@@ -470,6 +520,11 @@ export function buildPrivateScanAsset(
   const corePatternScore = normalizeScore(input.core_pattern_score);
   const decayScore = normalizeScore(input.decay_score);
 
+  const impulseCompressionScore =
+    normalizeScore(
+      input.impulse_compression_score,
+    );
+
   const impulsePressureScore = normalizeScore(input.impulse_pressure_score);
   const impulseAccelerationScore = normalizeScore(
     input.impulse_acceleration_score,
@@ -539,6 +594,7 @@ decay_score: decayScore,
 growth_status: normalizeScanStatus(input.growth_status, growthScore),
 core_status: normalizeScanStatus(input.core_status, corePatternScore),
 decay_status: normalizeScanStatus(input.decay_status, decayScore),
+    impulse_compression_score: impulseCompressionScore,
     impulse_pressure_score: impulsePressureScore,
     impulse_acceleration_score: impulseAccelerationScore,
     impulse_alignment_score: impulseAlignmentScore,
@@ -551,10 +607,10 @@ decay_status: normalizeScanStatus(input.decay_status, decayScore),
     impulse_transition_state: normalizeImpulseTransitionState(
       input.impulse_transition_state,
     ),
-    impulse_status: normalizeScanStatus(
-      input.impulse_status,
-      impulsePressureScore,
-    ),
+    impulse_status:
+      normalizePrivateImpulseStatus(
+        input.impulse_status,
+      ),
 
     neutralized: input.neutralized === true,
     neutralization_reason: normalizeNeutralizationReason(

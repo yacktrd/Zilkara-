@@ -45,6 +45,7 @@ import type {
   PrivateScanAsset,
   PrivateScanRegime,
   PrivateScanStatus,
+  PrivateImpulseStatus,
 } from "@/lib/xyvala/contracts/scan-private-contract";
 
 import type { ImpulseAdaptivePolicy } from "@/lib/xyvala/calibration/impulse-adaptive-thresholds";
@@ -324,7 +325,7 @@ function buildAggregatedContext(input: {
 }
 
 function buildNeutralImpulse(
-  status: PrivateScanStatus,
+  status: PrivateImpulseStatus,
 ): Pick<
   PrivateScanAsset,
   | "impulse_pressure_score"
@@ -504,7 +505,7 @@ export function applyRFS(
         continuity_probability: null,
         confidence_score: null,
         confidence_status: "degraded",
-        ...buildNeutralImpulse("degraded"),
+        ...buildNeutralImpulse("unavailable"),
         governance: {
           ...asset.governance,
           warnings: [...asset.governance.warnings, "scan_engine_rfs_failed"],
